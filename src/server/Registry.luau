@@ -12,8 +12,12 @@
 --   * In-game DataStore "TypeTorch" for what game servers write themselves (no Open Cloud scope needed):
 --       head/<branch>              { assetId, artifactId, seq, commit, channel, deployedAt }  (from deploy messages;
 --                                  the fallback registry when ConfigService isn't written; higher seq wins)
---       private/<PrivateServerId>  { branch, setBy, setAt }   (private and reserved servers' branch)
---       events                     { list }                   (automatic and server-local rollbacks)
+--       private/<PrivateServerId>  { branch, setBy, setAt, pin? }   (private and reserved servers' branch; `pin` =
+--                                  { assetId, artifactId, seq, commit, channel, branch, headSeq } boots that artifact
+--                                  until the branch gets a deploy newer than headSeq)
+--       deployments                { list }                   (newest first, at most 100: { seq, branch, channel,
+--                                  artifactId, assetId, commit, at, rollback? } from deploy messages and known heads)
+--       events                     { list }                   (automatic and server-local rollbacks, pins)
 --
 -- Studio without published configs: ServerStorage.TypeTorchDev may carry a "Registry" JSON attribute (same shape) or a
 -- "BootAssetId" number attribute; see Registry.studioOverride.
@@ -225,25 +229,209 @@ end
 
 -- In-game DataStore (game-written data) ---------------------------------------------------------------------------
 
-function Registry.privateBranch(privateServerId: string): (string?, string?)
+-- A private or reserved server's stored choice: { branch, setBy, setAt, pin? } or nil.
+function Registry.privateOverride(privateServerId: string): (any, string?)
 	local ok, value = pcall(function()
 		return getStore():GetAsync("private/" .. privateServerId)
 	end)
 	if not ok then
 		return nil, tostring(value)
 	end
-	return if typeof(value) == "table" and typeof(value.branch) == "string" then value.branch else nil, nil
+	if typeof(value) ~= "table" or typeof(value.branch) ~= "string" then
+		return nil, nil
+	end
+	if typeof(value.pin) ~= "table" or typeof(value.pin.assetId) ~= "number" then
+		value.pin = nil
+	end
+	return value, nil
 end
 
-function Registry.setPrivateBranch(privateServerId: string, branch: string, userId: number): (boolean, string?)
+function Registry.privateBranch(privateServerId: string): (string?, string?)
+	local value, err = Registry.privateOverride(privateServerId)
+	return if value then value.branch else nil, err
+end
+
+-- `pin` (optional) makes the server boot that artifact instead of the branch head; see the header.
+function Registry.setPrivateBranch(privateServerId: string, branch: string, userId: number, pin: any?): (boolean, string?)
 	local ok, err = pcall(function()
 		getStore():SetAsync("private/" .. privateServerId, {
 			branch = branch,
 			setBy = userId,
 			setAt = DateTime.now():ToIsoDate(),
+			pin = pin,
 		})
 	end)
 	return ok, if ok then nil else tostring(err)
+end
+
+-- Deployment history (in-game DataStore key "deployments", merged with ConfigService `deployments`) -----------------
+-- Every server that hears a deploy message records it, so the dev menu can list and pin earlier artifacts without the
+-- CLI's registry. Entries are deduped by branch + seq (seq is global across branches); the newest 100 are kept.
+
+local storedDeployments: { any } = {}
+local deploymentsReadAt = -math.huge
+
+local function deploymentKey(entry): string
+	if typeof(entry.seq) == "number" then
+		return `{entry.branch}#{entry.seq}`
+	end
+	return `{entry.branch}@{entry.assetId}`
+end
+
+local function cleanDeployment(entry): any?
+	if typeof(entry) ~= "table" or typeof(entry.branch) ~= "string" or typeof(entry.assetId) ~= "number" then
+		return nil
+	end
+	return {
+		seq = if typeof(entry.seq) == "number" then entry.seq else nil,
+		branch = entry.branch,
+		channel = if entry.channel == "prod" or entry.channel == "dev" then entry.channel else nil,
+		artifactId = if typeof(entry.artifactId) == "string" then entry.artifactId else nil,
+		assetId = entry.assetId,
+		commit = if typeof(entry.commit) == "string" then entry.commit else nil,
+		at = if typeof(entry.at) == "string" then entry.at else nil,
+		rollback = if entry.rollback == true or entry.action == "rollback" then true else nil,
+	}
+end
+
+local function newestFirst(a, b): boolean
+	local seqA, seqB = a.seq or -1, b.seq or -1
+	if seqA ~= seqB then
+		return seqA > seqB
+	end
+	if (a.at or "") ~= (b.at or "") then
+		return (a.at or "") > (b.at or "")
+	end
+	return a.branch < b.branch
+end
+
+-- Merges lists (earlier lists win on duplicates), newest first, at most `limit` entries. An entry without a seq is
+-- dropped when the same branch already lists that asset with a seq.
+local function mergeDeployments(lists: { { any } }, limit: number): { any }
+	local byKey = {}
+	local merged = {}
+	local withSeq = {}
+	local pending = {}
+	for _, list in lists do
+		for _, raw in list do
+			local entry = cleanDeployment(raw)
+			if not entry then
+				continue
+			end
+			local key = deploymentKey(entry)
+			if byKey[key] then
+				continue
+			end
+			byKey[key] = true
+			if entry.seq then
+				withSeq[`{entry.branch}@{entry.assetId}`] = true
+				table.insert(merged, entry)
+			else
+				table.insert(pending, entry)
+			end
+		end
+	end
+	for _, entry in pending do
+		if not withSeq[`{entry.branch}@{entry.assetId}`] then
+			table.insert(merged, entry)
+		end
+	end
+	table.sort(merged, newestFirst)
+	while #merged > limit do
+		table.remove(merged)
+	end
+	return merged
+end
+
+local function storedList(value): { any }
+	return if typeof(value) == "table" and typeof(value.list) == "table" then value.list else {}
+end
+
+-- Re-reads the stored list (yields; at most once per `maxAge` seconds, default 10).
+function Registry.refreshDeployments(maxAge: number?)
+	if os.clock() - deploymentsReadAt < (maxAge or 10) then
+		return
+	end
+	local ok, value = pcall(function()
+		return getStore():GetAsync("deployments")
+	end)
+	if ok then
+		deploymentsReadAt = os.clock()
+		storedDeployments = mergeDeployments({ storedList(value) }, Constants.DEPLOYMENTS_KEPT)
+	end
+end
+
+-- Adds entries the stored list doesn't have yet (one UpdateAsync, cancelled when nothing is new). Non-blocking.
+function Registry.recordDeployments(entries: { any })
+	local missing = {}
+	local known = {}
+	for _, entry in storedDeployments do
+		known[deploymentKey(entry)] = true
+	end
+	for _, raw in entries do
+		local entry = cleanDeployment(raw)
+		if entry and not known[deploymentKey(entry)] then
+			table.insert(missing, entry)
+		end
+	end
+	if #missing == 0 then
+		return
+	end
+	storedDeployments = mergeDeployments({ storedDeployments, missing }, Constants.DEPLOYMENTS_KEPT)
+	task.spawn(function()
+		pcall(function()
+			getStore():UpdateAsync("deployments", function(existing)
+				local list = storedList(existing)
+				local have = {}
+				for _, entry in list do
+					local clean = cleanDeployment(entry)
+					if clean then
+						have[deploymentKey(clean)] = true
+					end
+				end
+				local added = false
+				for _, entry in missing do
+					if not have[deploymentKey(entry)] then
+						added = true
+					end
+				end
+				if not added then
+					return nil -- another server already wrote them
+				end
+				return { list = mergeDeployments({ list, missing }, Constants.DEPLOYMENTS_KEPT) }
+			end)
+		end)
+	end)
+end
+
+-- Every known deployment, newest first: ConfigService `deployments` (when readable), then the stored list, then
+-- `extra` (this server's own history), at most DEPLOYMENTS_KEPT plus any `keep` entries (branch heads) the cap cut.
+-- Plain tables; callers may add fields.
+function Registry.deployments(extra: { any }?, keep: { any }?): { any }
+	local lists = { Registry.state().deployments, storedDeployments, keep or {}, extra or {} }
+	local merged = mergeDeployments(lists, Constants.DEPLOYMENTS_KEPT)
+	if keep and #keep > 0 then
+		local listed = {}
+		for _, entry in merged do
+			listed[deploymentKey(entry)] = true
+		end
+		local all = mergeDeployments(lists, math.huge)
+		for _, raw in keep do
+			local entry = cleanDeployment(raw)
+			if entry and not listed[deploymentKey(entry)] then
+				-- Use the merged copy (registry fields win over the seed).
+				for _, candidate in all do
+					if deploymentKey(candidate) == deploymentKey(entry) then
+						table.insert(merged, candidate)
+						listed[deploymentKey(entry)] = true
+						break
+					end
+				end
+			end
+		end
+		table.sort(merged, newestFirst)
+	end
+	return merged
 end
 
 -- Automatic and server-local rollbacks, so `typetorch deployments` can show them later (backend phase).

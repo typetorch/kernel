@@ -55,6 +55,8 @@ local history = {} -- successful generations, oldest first
 local lastMessage = nil
 local registryError = nil
 local myBranch = nil
+local bootPin = nil -- a private/reserved server's stored pin (Registry private/<id>.pin), read at boot
+local storedPin = false -- whether this server's private/<id> record holds a pin (cleared by reload)
 
 local function serverType(): string
 	if RunService:IsStudio() then
@@ -125,6 +127,11 @@ local function mount(payload: Instance, head)
 		error(`asset {head.assetId} is artifact {artifactId}, expected {head.artifactId}`)
 	end
 	artifactId = artifactId or `asset-{head.assetId}`
+	-- Pins on public servers carry requireChannel = "prod": the payload's own Channel attribute must agree.
+	local payloadChannel = payload:GetAttribute("Channel")
+	if head.requireChannel and payloadChannel ~= nil and payloadChannel ~= head.requireChannel then
+		error(`artifact {artifactId} is {payloadChannel}-channel; this server only takes {head.requireChannel}`)
+	end
 	local needsApi = payload:GetAttribute("KernelApi") or 1
 	if needsApi > Constants.KERNEL_API then
 		error(`artifact {artifactId} needs kernel API {needsApi}; this kernel is {Constants.KERNEL_API}`)
@@ -151,7 +158,8 @@ local function mount(payload: Instance, head)
 	payload.include.Parent = serverTree
 	serverTree.Parent = serverGenerations
 
-	local artifactChannel = payload:GetAttribute("Channel")
+	-- A pinned head may come from another branch (head.branch); the payload's own Channel attribute wins.
+	local artifactChannel = payload:GetAttribute("Channel") or head.channel
 	local branch = myBranch
 	local generation = {
 		name = name,
@@ -159,14 +167,15 @@ local function mount(payload: Instance, head)
 		branch = branch,
 		channel = effectiveChannel(branch, artifactChannel),
 		head = head,
+		pinned = head.pinned == true,
 		startedAt = os.time(),
 		serverTree = serverTree,
 		clientTree = clientTree,
 		artifact = {
 			id = artifactId,
 			assetId = head.assetId,
-			channel = artifactChannel or Registry.channelOf(branch),
-			branch = branch,
+			channel = artifactChannel or Registry.channelOf(head.branch or branch),
+			branch = head.branch or branch,
 			commit = payload:GetAttribute("Commit") or head.commit,
 			commitHash = head.commitHash,
 			builtAt = payload:GetAttribute("BuiltAt"),
@@ -283,6 +292,7 @@ swapTo = function(head, reason: string)
 		table.insert(history, {
 			name = generation.name,
 			artifactId = generation.artifact.id,
+			branch = generation.artifact.branch,
 			head = head,
 			at = DateTime.now():ToIsoDate(),
 			reason = reason,
@@ -319,9 +329,11 @@ local function chooseBranch(): string
 	local state = Registry.state()
 	local kind = serverType()
 	if kind == "private" or kind == "reserved" then
-		local branch = Registry.privateBranch(game.PrivateServerId)
-		if branch then
-			return branch
+		local override = Registry.privateOverride(game.PrivateServerId)
+		if override then
+			bootPin = override.pin
+			storedPin = override.pin ~= nil
+			return override.branch
 		end
 	elseif kind == "studio" then
 		local dev = ServerStorage:FindFirstChild("TypeTorchDev")
@@ -378,12 +390,45 @@ local function onDeployMessage(message)
 	if typeof(data.b) ~= "string" or typeof(data.a) ~= "number" then
 		return
 	end
+	local seq = tonumber(data.s)
+	local channel = if data.ch == "prod" or data.ch == "dev" then data.ch else nil
+	local timeOk, sentAt = pcall(DateTime.fromUnixTimestampMillis, if typeof(data.t) == "number" then data.t else nil)
+	if not timeOk then
+		sentAt = DateTime.now()
+	end
+	-- Deployment history: this deploy plus the head it replaces (so heads from before 0.2.0 stay listed).
+	local previous = Registry.branchHead(data.b)
+	local entries = {
+		{
+			seq = seq,
+			branch = data.b,
+			channel = channel,
+			artifactId = data.i,
+			assetId = data.a,
+			commit = data.c,
+			at = sentAt:ToIsoDate(),
+			rollback = data.r and true or nil,
+		},
+	}
+	if previous and typeof(previous.assetId) == "number" then
+		table.insert(entries, {
+			seq = previous.seq,
+			branch = data.b,
+			channel = previous.channel,
+			artifactId = previous.artifactId,
+			assetId = previous.assetId,
+			commit = previous.commit,
+			at = previous.deployedAt,
+			rollback = previous.rollback,
+		})
+	end
+	Registry.recordDeployments(entries)
 	Registry.saveHead(data.b, {
 		assetId = data.a,
 		artifactId = data.i,
-		seq = tonumber(data.s) or 0,
+		seq = seq or 0,
 		commit = data.c,
-		channel = if data.ch == "prod" or data.ch == "dev" then data.ch else nil,
+		channel = channel,
 		deployedAt = DateTime.now():ToIsoDate(),
 		rollback = data.r and true or nil,
 	})
@@ -391,16 +436,20 @@ local function onDeployMessage(message)
 		return
 	end
 	if current and data.i == current.artifact.id then
-		appliedSeq = math.max(appliedSeq, tonumber(data.s) or appliedSeq)
+		appliedSeq = math.max(appliedSeq, seq or appliedSeq)
+		return
+	end
+	-- A pin holds until a newer deploy seq for this branch arrives (late or repeated messages don't undo it).
+	if current and current.pinned and seq and seq <= appliedSeq then
 		return
 	end
 	print(`[TypeTorch] {if data.r then "rollback" else "deploy"} message for {data.b}: {data.i}`)
-	appliedSeq = math.max(appliedSeq, tonumber(data.s) or appliedSeq)
+	appliedSeq = math.max(appliedSeq, seq or appliedSeq)
 	if serverType() == "public" then
 		task.wait(math.random() * Constants.PUBLIC_JITTER_SECONDS)
 	end
 	swapTo(
-		{ assetId = data.a, artifactId = data.i, seq = data.s, commit = data.c, channel = data.ch },
+		{ assetId = data.a, artifactId = data.i, seq = seq, commit = data.c, channel = channel, branch = data.b, deployedAt = sentAt:ToIsoDate() },
 		if data.r then "rollback" else "deploy"
 	)
 end
@@ -414,6 +463,131 @@ local function requireDev(player: Player?): (boolean, string?)
 	return true, nil
 end
 
+-- Known branch names (registry + stored heads); refreshes the stored heads it finds. Yields.
+local function knownBranches(): { string }
+	local names = {}
+	for name in Registry.state().branches do
+		names[name] = true
+	end
+	for _, name in Registry.storedBranches() do
+		if not names[name] then
+			Registry.refreshStoredHead(name)
+			names[name] = true
+		end
+	end
+	if myBranch then
+		names[myBranch] = true
+	end
+	local list = {}
+	for name in names do
+		table.insert(list, name)
+	end
+	table.sort(list)
+	return list
+end
+
+-- Same artifact: same asset, and the same deploy seq when both sides know it.
+local function sameDeploy(a, entry): boolean
+	if not a or a.assetId ~= entry.assetId then
+		return false
+	end
+	return typeof(a.seq) ~= "number" or typeof(entry.seq) ~= "number" or a.seq == entry.seq
+end
+
+-- Every known deployment, newest first (Registry.deployments + known heads + this server's history). Yields.
+local function deploymentEntries()
+	local names = knownBranches()
+	Registry.refreshDeployments()
+	local heads = {}
+	for _, name in names do
+		local head = Registry.branchHead(name)
+		if head and typeof(head.assetId) == "number" then
+			table.insert(heads, {
+				seq = head.seq,
+				branch = name,
+				channel = head.channel or Registry.channelOf(name),
+				artifactId = head.artifactId,
+				assetId = head.assetId,
+				commit = head.commit,
+				at = head.deployedAt,
+				rollback = head.rollback,
+			})
+		end
+	end
+	-- Heads from before kernel 0.2.0 (or from missed messages) become permanent entries.
+	Registry.recordDeployments(heads)
+	local extra = {}
+	local keep = table.clone(heads)
+	for index, entry in history do
+		local head = entry.head
+		if head and typeof(head.assetId) == "number" then
+			local seed = {
+				seq = head.seq,
+				branch = head.branch or entry.branch or myBranch,
+				channel = head.channel,
+				artifactId = head.artifactId,
+				assetId = head.assetId,
+				commit = head.commit,
+				at = head.deployedAt,
+			}
+			table.insert(extra, seed)
+			if index == #history then
+				table.insert(keep, seed) -- the running generation is always listed
+			end
+		end
+	end
+	return Registry.deployments(extra, keep)
+end
+
+-- The artifact picker list: deployments newest first, each with `live` (its branch's current head) and `running`
+-- (this server's current generation).
+local function artifacts()
+	local list = deploymentEntries()
+	for _, entry in list do
+		entry.channel = entry.channel or Registry.channelOf(entry.branch)
+		entry.live = sameDeploy(Registry.branchHead(entry.branch), entry)
+		entry.running = current ~= nil and sameDeploy(current.artifact, entry)
+	end
+	return list
+end
+
+-- A known deployment of `assetId` (arbitrary ids are refused), preferring `branch`.
+local function findArtifact(assetId: number, branch: string?)
+	local found = nil
+	for _, entry in deploymentEntries() do
+		if entry.assetId == assetId then
+			if entry.branch == branch then
+				return entry
+			end
+			found = found or entry
+		end
+	end
+	return found
+end
+
+local function pinHead(entry)
+	return {
+		assetId = entry.assetId,
+		artifactId = entry.artifactId,
+		seq = entry.seq,
+		commit = entry.commit,
+		channel = entry.channel or Registry.channelOf(entry.branch),
+		branch = entry.branch,
+		deployedAt = entry.at,
+		pinned = true,
+	}
+end
+
+-- The seq a pin on `branch` must stay at: the branch head's seq (or the pinned deploy's, if it's newer on that branch).
+local function pinSeq(branch: string, entry): number
+	local head = Registry.branchHead(branch)
+	local seq = if head and typeof(head.seq) == "number" then head.seq else 0
+	if entry.branch == branch and typeof(entry.seq) == "number" then
+		seq = math.max(seq, entry.seq)
+	end
+	return seq
+end
+
 local function reload(player: Player?)
 	local allowed, why = requireDev(player)
 	if not allowed then
@@ -422,6 +596,13 @@ local function reload(player: Player?)
 	local head = Registry.branchHead(myBranch)
 	if not head then
 		return { ok = false, error = `branch {myBranch} has no artifact` }
+	end
+	local kind = serverType()
+	if storedPin and (kind == "private" or kind == "reserved") then
+		-- Back to the branch head for good: drop the stored pin (keeps the branch).
+		if Registry.setPrivateBranch(game.PrivateServerId, myBranch, if player then player.UserId else 0) then
+			storedPin = false
+		end
 	end
 	appliedSeq = head.seq or appliedSeq
 	return swapTo(head, "reload")
@@ -445,6 +626,69 @@ local function rollback(player: Player?)
 	return { ok = false, error = "no earlier artifact on this server" }
 end
 
+-- Swaps THIS server to a known artifact and holds it there until a newer deploy seq for this server's branch arrives.
+-- Devs on private/reserved/studio servers; on public servers only owner/admin, and only prod-channel artifacts.
+local function pinArtifact(player: Player?, assetId: number)
+	local allowed, why = requireDev(player)
+	if not allowed then
+		return { ok = false, error = why }
+	end
+	if typeof(assetId) ~= "number" then
+		return { ok = false, error = "bad asset id" }
+	end
+	local kind = serverType()
+	if kind == "public" and player and not Access.isAdmin(player) then
+		return { ok = false, error = "only the owner or admins can pin a public server" }
+	end
+	Registry.refreshStoredHead(myBranch)
+	local entry = findArtifact(assetId, myBranch)
+	if not entry then
+		return { ok = false, error = `asset {assetId} is not a known deployment` }
+	end
+	local channel = entry.channel or Registry.channelOf(entry.branch)
+	if kind == "public" and channel ~= "prod" then
+		return { ok = false, error = "dev-channel artifacts never run on public servers" }
+	end
+	local head = pinHead(entry)
+	if kind == "public" then
+		head.requireChannel = "prod"
+	end
+	local seq = pinSeq(myBranch, entry)
+	if kind == "private" or kind == "reserved" then
+		-- The pin survives a restart of this private server (until the branch gets a newer deploy).
+		local pin = table.clone(head)
+		pin.pinned = nil
+		pin.deployedAt = nil
+		pin.headSeq = seq
+		local saved, err = Registry.setPrivateBranch(game.PrivateServerId, myBranch, if player then player.UserId else 0, pin)
+		if not saved then
+			return { ok = false, error = `could not save the pin: {err}` }
+		end
+		storedPin = true
+	end
+	-- Deploy messages and the poll only move this server past `seq` (a newer deploy of its branch).
+	appliedSeq = math.max(appliedSeq, seq)
+	Registry.logEvent({
+		action = "pin",
+		from = current and current.artifact.id,
+		to = entry.artifactId or `asset-{assetId}`,
+		assetId = assetId,
+		branch = myBranch,
+		serverType = kind,
+		by = player and player.UserId,
+		job = game.JobId,
+	})
+	if current and sameDeploy(current.artifact, entry) then
+		-- Already running it: just hold it here.
+		current.pinned = true
+		current.head.pinned = true
+		return { ok = true, generation = current.name, assetId = assetId, artifactId = current.artifact.id, pinned = true }
+	end
+	local report = swapTo(head, "pin")
+	report.pinned = report.ok or nil
+	return report
+end
+
 local function switchBranch(player: Player?, branch: string)
 	local allowed, why = requireDev(player)
 	if not allowed then
@@ -464,19 +708,38 @@ local function switchBranch(player: Player?, branch: string)
 		if not saved then
 			return { ok = false, error = `could not save the branch: {err}` }
 		end
+		storedPin = false
 	end
 	myBranch = branch
 	appliedSeq = head.seq or 0
 	return swapTo(head, "branch")
 end
 
-local function newServer(player: Player, branch: string)
+-- Reserves a server on `branch` and teleports the player there. With `assetId` (a known deployment), the new server
+-- boots pinned to that artifact.
+local function newServer(player: Player, branch: string, assetId: number?)
 	local allowed, why = requireDev(player)
 	if not allowed then
 		return { ok = false, error = why }
 	end
+	if typeof(branch) ~= "string" or branch == "" then
+		return { ok = false, error = "bad branch" }
+	end
+	if assetId ~= nil and typeof(assetId) ~= "number" then
+		return { ok = false, error = "bad asset id" }
+	end
 	Registry.refreshStoredHead(branch)
-	if not Registry.branchHead(branch) then
+	local pin = nil
+	if assetId ~= nil then
+		local entry = findArtifact(assetId, branch)
+		if not entry then
+			return { ok = false, error = `asset {assetId} is not a known deployment` }
+		end
+		pin = pinHead(entry)
+		pin.pinned = nil
+		pin.deployedAt = nil
+		pin.headSeq = pinSeq(branch, entry)
+	elseif not Registry.branchHead(branch) then
 		return { ok = false, error = `no artifact on branch {branch}` }
 	end
 	if RunService:IsStudio() then
@@ -486,29 +749,22 @@ local function newServer(player: Player, branch: string)
 	if not ok then
 		return { ok = false, error = tostring(code) }
 	end
-	local saved, err = Registry.setPrivateBranch(privateServerId, branch, player.UserId)
+	local saved, err = Registry.setPrivateBranch(privateServerId, branch, player.UserId, pin)
 	if not saved then
 		return { ok = false, error = `could not save the branch: {err}` }
+	end
+	if pin then
+		Registry.logEvent({ action = "pin_server", to = pin.artifactId or `asset-{assetId}`, assetId = assetId, branch = branch, by = player.UserId, job = game.JobId })
 	end
 	local options = Instance.new("TeleportOptions")
 	options.ReservedServerAccessCode = code
 	local teleported, teleportError = pcall(TeleportService.TeleportAsync, TeleportService, game.PlaceId, { player }, options)
-	return { ok = teleported, error = if teleported then nil else tostring(teleportError), branch = branch }
+	return { ok = teleported, error = if teleported then nil else tostring(teleportError), branch = branch, assetId = assetId }
 end
 
 local function branchList()
-	local names = {}
-	for name in Registry.state().branches do
-		names[name] = true
-	end
-	for _, name in Registry.storedBranches() do
-		if not names[name] then
-			Registry.refreshStoredHead(name)
-			names[name] = true
-		end
-	end
 	local list = {}
-	for name in names do
+	for _, name in knownBranches() do
 		local head = Registry.branchHead(name)
 		if not head then
 			continue
@@ -517,15 +773,13 @@ local function branchList()
 			name = name,
 			channel = Registry.channelOf(name),
 			artifactId = head.artifactId,
+			assetId = head.assetId,
 			commit = head.commit,
 			seq = head.seq,
 			deployedAt = head.deployedAt,
 			by = head.by,
 		})
 	end
-	table.sort(list, function(a, b)
-		return a.name < b.name
-	end)
 	return list
 end
 
@@ -541,6 +795,7 @@ local function status()
 		serverType = serverType(),
 		branch = myBranch,
 		channel = current and current.channel,
+		pinned = current ~= nil and current.pinned == true,
 		startedAt = startedAt,
 		uptime = os.time() - startedAt,
 		generation = current and {
@@ -572,15 +827,17 @@ Api.init({
 	serverType = serverType,
 	status = status,
 	branchList = branchList,
+	artifacts = artifacts,
 	reload = reload,
 	rollback = rollback,
 	switchBranch = switchBranch,
+	pinArtifact = pinArtifact,
 	newServer = newServer,
 })
 
 -- /tt chat commands (TextChatCommand), the fallback when a generation is broken --------------------------------------
 
-local HELP = "/tt status | branch <name> | new <branch> | reload | rollback | dev"
+local HELP = "/tt status | branch <name> | new <branch> [assetId] | pin <assetId> | reload | rollback | dev"
 
 local function describe(report): string
 	if report.ok then
@@ -600,14 +857,18 @@ local function runCommand(player: Player, text: string)
 		notice(player, HELP)
 	elseif command == "status" then
 		local s = status()
-		notice(player, `{s.serverType} server, branch {s.branch} ({s.channel or "?"}), {if s.generation then s.generation.name else "no generation"}, up {s.uptime}s`)
+		local pinned = if s.pinned then ", pinned" else ""
+		notice(player, `{s.serverType} server, branch {s.branch} ({s.channel or "?"}), {if s.generation then s.generation.name else "no generation"}{pinned}, up {s.uptime}s`)
 	elseif command == "branch" and argument then
 		notice(player, describe(switchBranch(player, argument)))
 	elseif command == "new" and argument then
-		local report = newServer(player, argument)
+		local assetId = tonumber(words[3])
+		local report = newServer(player, argument, assetId)
 		if not report.ok then
 			notice(player, `failed: {report.error}`)
 		end
+	elseif command == "pin" and tonumber(argument) then
+		notice(player, describe(pinArtifact(player, tonumber(argument) :: number)))
 	elseif command == "reload" then
 		notice(player, describe(reload(player)))
 	elseif command == "rollback" then
@@ -652,7 +913,19 @@ task.spawn(function()
 end)
 
 Registry.refreshStoredHead(myBranch)
-if Registry.branchHead(myBranch) then
+-- A stored pin (newServer with an artifact, or a pin on this private server) wins until the branch moves past it.
+local bootHead = Registry.branchHead(myBranch)
+if bootPin and (not bootHead or (bootHead.seq or 0) <= (bootPin.headSeq or 0)) then
+	appliedSeq = math.max(bootPin.headSeq or 0, if bootPin.branch == myBranch then bootPin.seq or 0 else 0)
+	local head = table.clone(bootPin)
+	head.headSeq = nil
+	head.pinned = true
+	print(`[TypeTorch] booting pinned artifact {bootPin.artifactId or bootPin.assetId}`)
+	swapTo(head, "pin")
+	if not current and bootHead then
+		followHead("boot", false) -- the pinned artifact failed to start: fall back to the branch head
+	end
+elseif bootHead then
 	followHead("boot", false)
 else
 	warn(`[TypeTorch] branch {myBranch} has no artifact yet{if err then ` (registry: {err})` else ""}; waiting for a deploy`)

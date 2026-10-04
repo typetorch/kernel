@@ -8,7 +8,8 @@ local Api = {}
 
 local persistStore: { [string]: any } = {}
 local entries: { [Script]: any } = {}
-local services = nil -- set by the kernel: { Access, Transport, Logs, Registry, status, reload, rollback, switchBranch, newServer }
+local services = nil -- set by the kernel: { Access, Transport, Logs, status, branchList, artifacts, reload, rollback,
+-- switchBranch, pinArtifact, newServer }
 
 function Api.init(kernelServices)
 	services = kernelServices
@@ -90,8 +91,16 @@ function Api.forEntry(entry: Script)
 	function api:switchBranch(player: Player, branch: string)
 		return services.switchBranch(player, branch)
 	end
-	function api:newServer(player: Player, branch: string)
-		return services.newServer(player, branch)
+	-- Kernel 0.2.0+ (additive; the framework feature-detects them, KERNEL_API stays 1).
+	function api:artifacts()
+		return services.artifacts()
+	end
+	function api:pinArtifact(player: Player, assetId: number)
+		return services.pinArtifact(player, assetId)
+	end
+	-- `assetId` (0.2.0+): the reserved server boots pinned to that known artifact.
+	function api:newServer(player: Player, branch: string, assetId: number?)
+		return services.newServer(player, branch, assetId)
 	end
 
 	-- Entry-only (not on the TS interface).
