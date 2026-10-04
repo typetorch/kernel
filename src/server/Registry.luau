@@ -498,6 +498,7 @@ local function cleanDeployment(entry): any?
 		-- 0.3: what the signatures cover (t) and the signatures, so prod servers can check an entry before a pin, and
 		-- the dev menu can show verified badges.
 		t = if typeof(entry.t) == "number" then entry.t else nil,
+		r = if entry.r == 1 or entry.r == "resign" then entry.r else nil,
 		sig = if typeof(entry.sig) == "string" and #entry.sig <= 100 then entry.sig else nil,
 		sigF = if typeof(entry.sigF) == "string" and #entry.sigF <= 100 then entry.sigF else nil,
 	}

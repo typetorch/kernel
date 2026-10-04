@@ -1,5 +1,6 @@
 -- Smoke test for the whole server kernel (from kernel/): `lune run scripts/smoke-kernel.luau`, then again with
--- `--fallback` (the key asset never loads), `--dev` (a reserved dev-branch server) and `--vip` (a non-dev's private server).
+-- `--fallback` (the key asset never loads), `--dev` (a reserved dev-branch server), `--vip` (a non-dev's private server),
+-- `--bootstrap`, `--bootstrap-only` and `--nothing` (BootstrapHeads and the no-trusted-head case).
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore, ConfigService unavailable), then drives it:
 -- signed / unsigned / dev-channel / replayed deploy messages, a payload holding a Script (S-L4), a payload that fails to
@@ -669,9 +670,21 @@ local FIELDS = {
 	M7 = { b = "prod", a = 1002, i = "bbbbbbb-222222", s = 16, c = "bbbbbbb", ch = "prod", t = 1759580150000, r = 1 },
 	M8 = { b = "prod", a = 1006, i = "fffffff-666666", s = 17, c = "fffffff", ch = "prod", t = 1759580160000 },
 	M9 = { b = "prod", a = 1001, i = "aaaaaaa-111111", s = 18, c = "aaaaaaa", ch = "prod", t = 1759580170000 },
+	-- The CLI re-signs the running head after `keys rotate`: same asset, new seq, r = "resign".
+	M10 = { b = "prod", a = 1006, i = "fffffff-666666", s = 19, c = "fffffff", ch = "prod", t = 1759580180000, r = "resign" },
 	P2 = { j = { "smoke-job-0001" }, a = 1001, b = "prod", by = 1, t = 1759580200000 },
 	P3 = { j = { "smoke-job-0001" }, b = "prod", by = 1, t = 1759580200000, unpin = true },
 }
+
+-- `--bootstrap`: only an UNSIGNED 0.2-style prod head in the stores, matching the stamped BootstrapHeads.
+-- `--bootstrap-only`: no stored heads at all; the server boots the BootstrapHeads entry itself.
+-- `--nothing`: unsigned prod heads only and no BootstrapHeads: no trusted head, nothing runs, status says so.
+local BOOTSTRAP_MODE = table.find(process.args, "--bootstrap") ~= nil
+local BOOTSTRAP_ONLY_MODE = table.find(process.args, "--bootstrap-only") ~= nil
+local NOTHING_MODE = table.find(process.args, "--nothing") ~= nil
+if BOOTSTRAP_MODE or BOOTSTRAP_ONLY_MODE then
+	kernelFolder:SetAttribute("BootstrapHeads", '{"prod":{"a":1001,"s":10,"i":"aaaaaaa-111111"}}')
+end
 
 local function publish(topic: string, data)
 	local handler = topics[topic] or error(`smoke: nothing subscribed to {topic}`)
@@ -688,6 +701,13 @@ memoryStore.data.heads = {
 	-- An unsigned dev-branch head (dev deploys stay unsigned).
 	dev = { assetId = 1004, artifactId = "ddddddd-444444", seq = 5, commit = "ddddddd", channel = "dev", t = 1759580000000, deployedAt = "2026-10-04T00:00:00Z" },
 }
+if BOOTSTRAP_MODE or NOTHING_MODE then
+	-- H1 as a 0.2 kernel stored it: no t, no signatures.
+	dataStore.data.heads = { prod = { assetId = h1.a, artifactId = h1.i, seq = h1.s, commit = h1.c, channel = h1.ch, deployedAt = "2026-10-04T00:00:00Z" } }
+elseif BOOTSTRAP_ONLY_MODE then
+	dataStore.data.heads = {}
+	memoryStore.data.heads = {}
+end
 
 -- Boot ---------------------------------------------------------------------------------------------------------------
 
@@ -751,7 +771,8 @@ local function finish()
 			end
 		end
 	end
-	print(`{passes} passed, {failures} failed ({if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" else "public server"})`)
+	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif NOTHING_MODE then "--nothing" else "public server"
+	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
 
@@ -770,6 +791,40 @@ if VIP_MODE then
 	check("vip: a non-dev's private server ignores its stored dev branch and boots signed prod", waitFor("boot", function()
 		return running() == "aaaaaaa-111111"
 	end) and status().branch == "prod" and status().signedOnly == true and rejected("private-branch") == 1)
+	finish()
+end
+if BOOTSTRAP_MODE or BOOTSTRAP_ONLY_MODE then
+	local label = if BOOTSTRAP_MODE then "the unsigned stored head matching BootstrapHeads" else "the BootstrapHeads entry itself"
+	check(`bootstrap: boots {label}`, waitFor("boot", function()
+		return running() == "aaaaaaa-111111"
+	end) and status().appliedSeq == 10 and status().noTrustedHead == nil)
+	check("bootstrap: no verified badge (unsigned)", status().generation.artifact.verified == nil)
+	check("bootstrap: keys() lists it", SMOKE.kernel:keys().bootstrap.prod ~= nil and SMOKE.kernel:keys().bootstrap.prod.seq == 10)
+	publish("TypeTorch/deploy", deployMessage(nil, FIELDS.M4))
+	check("bootstrap: anything newer must be signed (unsigned refused)", waitFor("refusal", function()
+		return rejected("deploy") == 1
+	end) and running() == "aaaaaaa-111111")
+	publish("TypeTorch/deploy", deployMessage("M2", FIELDS.M2, { "sig" }))
+	check("bootstrap: a signed deploy swaps", waitFor("swap to B", function()
+		return running() == "bbbbbbb-222222" and status().appliedSeq == 11
+	end))
+	finish()
+end
+if NOTHING_MODE then
+	task.wait(1)
+	local s0 = SMOKE.kernel and status()
+	check("nothing: no trusted head, nothing runs", SMOKE.kernel == nil)
+	-- No generation, so no kernel API from a payload: read the warning instead, then send a signed deploy.
+	local warned = false
+	for _, line in output do
+		warned = warned or string.find(line.text, "no trusted prod head", 1, true) ~= nil
+	end
+	check("nothing: warned 'no trusted prod head'", warned and s0 == nil)
+	publish("TypeTorch/deploy", deployMessage("M2", FIELDS.M2, { "sig" }))
+	check("nothing: the next signed deploy boots", waitFor("boot B", function()
+		return SMOKE.kernel ~= nil and running() == "bbbbbbb-222222"
+	end))
+	check("nothing: status no longer flags it", status().noTrustedHead == nil)
 	finish()
 end
 
@@ -895,6 +950,24 @@ publish("TypeTorch/deploy", deployMessage("M9", FIELDS.M9, { "sig", "sigF" }))
 check("deploy signed with the revoked key refused (sigF ignored once the key asset loaded)", waitFor("refusal", function()
 	return rejected("deploy") == 4
 end) and running() == "fffffff-666666")
+
+-- A re-signed head (r = "resign", same asset as running): the head and appliedSeq move, no swap.
+local bootsBefore = #SMOKE.boots
+publish("TypeTorch/deploy", deployMessage("M10", FIELDS.M10, { "sigR" }))
+check("re-signed head: appliedSeq moves, no swap", waitFor("resign", function()
+	return status().appliedSeq == 19
+end) and running() == "fffffff-666666" and #SMOKE.boots == bootsBefore)
+check("re-signed head: the stored head carries r = resign and verifies", (function()
+	local head = memoryStore.data.heads.prod
+	return head ~= nil and head.seq == 19 and head.r == "resign" and head.sig ~= nil
+end)())
+
+-- Dev menu pins on a prod server: refused (only signed remote pins work there).
+local owner = newInstance("Player", "Owner")
+owner.UserId = 1
+local pinReport = SMOKE.kernel:pinArtifact(owner, 1002)
+local experimentReport = SMOKE.kernel:pinArtifact(owner, 1002, { experiment = true })
+check("dev menu pins refused on a prod server", pinReport.ok == false and string.find(pinReport.error, "typetorch pin", 1, true) ~= nil and experimentReport.ok == false and running() == "fffffff-666666")
 
 -- Dev-facing data.
 local keys = SMOKE.kernel:keys()

@@ -31,13 +31,16 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   take a deploy message, a stored head or a remote pin only with a valid Ed25519 signature (`sig` from a key in the
   group-owned key asset's `PublicKeys` minus `RevokedKeys`; `sigF` from the baked `FallbackPublicKey` until the key
   asset has loaded), the payload `Channel` attribute exactly `"prod"`, and a seq newer than the applied one.
-  Payloads there may hold only Folders and ModuleScripts. Dev servers stay unsigned. `KeyAssetId` and
-  `FallbackPublicKey` are attributes on `ServerScriptService.TypeTorchKernel`, stamped by `typetorch kernel deploy`
-  and read once at boot. `api:keys()` shows the trust state; `api:artifacts()` and `status()` carry `verified =
-  {main, fallback}`. Format: `../plans/03-artifact.md` "Signed prod messages"; rules: `../plans/01-kernel.md`.
+  Payloads there may hold only Folders and ModuleScripts. The only unsigned head a prod server takes is the one in
+  `BootstrapHeads` (exact branch, asset and seq). A re-signed head (`r = "resign"`, same asset) moves the head without
+  a swap. Pins there must be signed too (dev menu pins are refused: use `typetorch pin`). Dev servers stay unsigned.
+  `KeyAssetId`, `FallbackPublicKey` and `BootstrapHeads` are attributes on `ServerScriptService.TypeTorchKernel`,
+  stamped by `typetorch kernel deploy` and read once at boot. `api:keys()` shows the trust state; `api:artifacts()`
+  and `status()` carry `verified = {main, fallback}`. Format: `../plans/03-artifact.md` "Signed prod messages";
+  rules: `../plans/01-kernel.md`.
 - Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
-  `--dev`, `--vip`).
+  `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--nothing`).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.
 

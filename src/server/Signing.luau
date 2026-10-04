@@ -7,16 +7,20 @@
 --     public keys. Re-read on a rekey hint, about every 10 minutes and once after a failed signature (rate-limited);
 --     the last good lists stay in memory, and a failed read keeps them.
 --   * FallbackPublicKey: one base64 Ed25519 public key baked into the place.
--- The rule (user decision 2026-10-04):
+--   * BootstrapHeads: JSON {"<branch>": {"a": assetId, "s": seq, "i": "artifactId"}}, the prod heads at the time of the
+--     kernel deploy. A prod server trusts an UNSIGNED head only when it matches one exactly (branch, asset, seq), and
+--     boots the bootstrap head itself when it has no verified one; anything newer must be signed.
+-- The rule (user decision 2026-10-04, strict):
 --   * once the key asset has loaded on this server, only `sig` counts, checked against PublicKeys minus RevokedKeys
 --     (`sigF` is ignored);
 --   * until then, only `sigF` counts, checked against FallbackPublicKey (the key asset, once readable, can revoke it,
 --     and from then on `sig` is required anyway).
 -- Signatures are base64 of the 64-byte Ed25519 signature of a canonical string (UTF-8, fields joined by "\n"):
 --   deploy messages and branch heads: tt1 \n b \n a \n i \n s \n c \n ch \n t \n r
---   pin messages (TypeTorch/pin):     ttpin1 \n j \n pct \n a \n b \n by \n t \n unpin
--- Integers in base 10 (no sign, exponent, leading zeros or fraction); `r` and `unpin` are "1" or ""; absent optional
--- fields are ""; `j` is the job ids joined by "," in message order.
+--   pin messages (TypeTorch/pin):     tt1pin \n b \n a \n jobs \n pct \n by \n t \n unpin
+-- Integers in base 10 (string.format("%d"): no sign, exponent, leading zeros or fraction); `r` is "1" (rollback),
+-- "resign" (the CLI re-signed the head after `keys rotate`: same asset, new seq) or ""; `unpin` is "1" or ""; absent
+-- optional fields are ""; `jobs` is the job ids joined by "," in message order.
 --
 -- The Roblox parts (attributes, InsertService) are injected through Signing.init / Signing.configure, so the pure
 -- parts run under Lune: scripts/test-ed25519.luau and scripts/test-signing.luau.
@@ -27,7 +31,7 @@ local SHA256 = require("./vendor/ed25519/SHA256")
 local Signing = {}
 
 local DEPLOY_TAG = "tt1"
-local PIN_TAG = "ttpin1"
+local PIN_TAG = "tt1pin"
 
 -- Minimum seconds between two key asset reads, by reason. Rekey hints are unsigned (anyone in the universe can send
 -- one) and failed signatures can be provoked, so both are rate-limited; a hint inside the window is not lost (the
@@ -102,7 +106,8 @@ function Signing.deployCanonical(fields): (string?, string?)
 	if not (b and a and i and s and c and ch and t) then
 		return nil, "missing or bad signed field (b, a, i, s, c, ch, t)"
 	end
-	local r = if fields.r == 1 or fields.r == true then "1" elseif fields.r == nil then "" else nil
+	-- `r`: 1 for a rollback, "resign" for a head the CLI re-signed after `keys rotate` (same asset, new seq), else absent.
+	local r = if fields.r == "resign" then "resign" elseif fields.r == 1 or fields.r == true then "1" elseif fields.r == nil then "" else nil
 	if not r then
 		return nil, "bad r"
 	end
@@ -119,7 +124,7 @@ function Signing.headFields(branch: string, head)
 		c = head.commit,
 		ch = head.channel,
 		t = head.t,
-		r = if head.rollback == true then 1 else nil,
+		r = if head.r == "resign" then "resign" elseif head.r == 1 or head.rollback == true then 1 else nil,
 	}
 end
 
@@ -146,7 +151,8 @@ function Signing.pinCanonical(fields): (string?, string?)
 	if not (pct and a and b and by and t and unpin) then
 		return nil, "missing or bad signed field (pct, a, b, by, t, unpin)"
 	end
-	return table.concat({ PIN_TAG, jobs, pct, a, b, by, t, unpin }, "\n"), nil
+	-- The user's format (2026-10-04): tt1pin \n b \n a \n jobs \n pct \n by \n t \n unpin.
+	return table.concat({ PIN_TAG, b, a, jobs, pct, by, t, unpin }, "\n"), nil
 end
 
 -- A key's short fingerprint: the first 8 hex digits of the SHA-256 of its raw 32 bytes (the CLI prints the same).
@@ -211,9 +217,37 @@ function Signing.configure(overrides)
 	end
 end
 
+-- BootstrapHeads, parsed: branch -> { assetId, seq, artifactId? }.
+local bootstrapHeads: { [string]: { assetId: number, seq: number, artifactId: string? } } = {}
+
+local function wholeNumber(value): boolean
+	return typeof(value) == "number" and value == value and value >= 0 and value % 1 == 0 and value <= 2 ^ 53
+end
+
 -- Reads the trust roots from the kernel folder's attributes. Call once, at boot, before any payload runs.
--- `folder` is anything with GetAttribute (a table in tests).
-function Signing.init(folder)
+-- `folder` is anything with GetAttribute (a table in tests); `decodeJson` parses BootstrapHeads (HttpService in Roblox).
+function Signing.init(folder, decodeJson: ((string) -> any)?)
+	bootstrapHeads = {}
+	local rawBootstrap = folder:GetAttribute("BootstrapHeads")
+	local bootstrapError = nil
+	if typeof(rawBootstrap) == "string" and rawBootstrap ~= "" and decodeJson then
+		local ok, decoded = pcall(decodeJson, rawBootstrap)
+		if ok and typeof(decoded) == "table" then
+			for branch, entry in decoded do
+				if typeof(branch) == "string" and typeof(entry) == "table" and wholeNumber(entry.a) and entry.a > 0 and wholeNumber(entry.s) then
+					bootstrapHeads[branch] = {
+						assetId = entry.a,
+						seq = entry.s,
+						artifactId = if typeof(entry.i) == "string" then entry.i else nil,
+					}
+				else
+					bootstrapError = `BootstrapHeads entry {tostring(branch)} is not {"{"}a, s, i{"}"}`
+				end
+			end
+		else
+			bootstrapError = "BootstrapHeads is not JSON"
+		end
+	end
 	local rawId = folder:GetAttribute("KeyAssetId")
 	local id = if typeof(rawId) == "number" then rawId elseif typeof(rawId) == "string" and rawId ~= "" then tonumber(rawId) else nil
 	if id ~= nil and (id <= 0 or id % 1 ~= 0) then
@@ -236,7 +270,22 @@ function Signing.init(folder)
 	if rawId ~= nil and rawId ~= "" and not keyAssetId then
 		configError = (if configError then configError .. "; " else "") .. "KeyAssetId is not an asset id"
 	end
+	if bootstrapError then
+		configError = (if configError then configError .. "; " else "") .. bootstrapError
+	end
 	return keyAssetId, fallbackText
+end
+
+-- The bootstrap head of `branch` ({ assetId, seq, artifactId? }, a copy) or nil.
+function Signing.bootstrapHead(branch: string)
+	local entry = bootstrapHeads[branch]
+	return if entry then table.clone(entry) else nil
+end
+
+-- Whether `head` is exactly `branch`'s bootstrap head (same asset and seq): the only unsigned head a prod server takes.
+function Signing.matchesBootstrap(branch: string, head): boolean
+	local entry = bootstrapHeads[branch]
+	return entry ~= nil and typeof(head) == "table" and head.assetId == entry.assetId and head.seq == entry.seq
 end
 
 -- Parses "k1, k2,k3" into (keys {bytes,text}, invalid texts).
@@ -643,6 +692,14 @@ function Signing.keys()
 			then { key = fallbackText, fingerprint = fingerprints[fallbackText] or "?", revoked = fallbackRevoked }
 			else nil,
 		lastHintAt = lastHintAt,
+		-- BootstrapHeads as stamped: { [branch] = { assetId, seq, artifactId? } }.
+		bootstrap = (function()
+			local copy = {}
+			for branch, entry in bootstrapHeads do
+				copy[branch] = table.clone(entry)
+			end
+			return copy
+		end)(),
 		lastChange = if #changes > 0 then deepClone(changes[#changes]) else nil, -- { at, reason, hinted, before, after, ... }
 		changes = #changes,
 	}
@@ -670,6 +727,7 @@ function Signing._reset()
 	reads, changes, invalidKeys, fallbackRevoked, hintPending = 0, {}, {}, false, false
 	lastReadErrorAt, lastHintAt = nil, nil
 	table.clear(fingerprints)
+	bootstrapHeads = {}
 	table.clear(verdicts)
 	table.clear(badgeCache)
 	badgeCount = 0

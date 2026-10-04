@@ -33,15 +33,21 @@ local VECTORS = {
 	},
 	pinRandom = {
 		fields = { pct = 10, a = 134192491895548, b = "prod", by = 12345, t = 1759580000000 },
-		canonical = "ttpin1\n\n10\n134192491895548\nprod\n12345\n1759580000000\n",
-		sig = "MijytIjeJVoxwHEpyHoRL5eXYkK5mITqTq7qJ68Drmr99UTChkPtqMjwlw/ZDSPgpaVScRT7X7+X0CFx1kIFDw==",
-		sigF = "WnO6qvIK2ZJe0gXL8kL34mEzOC7El0aKUfTNK7UlAWQOxvcGKXssCMKueDR1a8Yf1JnrvWT6TKJ1kTkpvtN1AQ==",
+		canonical = "tt1pin\nprod\n134192491895548\n\n10\n12345\n1759580000000\n",
+		sig = "Vbr7YSmWuWG/OIhUDlYJatHEemFnQo0MFbVWIRpWgplMGYyqP+5fxJvgSXCUSr6XpV4hrozN0wMPQxv+O2gHCQ==",
+		sigF = "FyqmF2+suPUaPyINGtoaGfxO2JBB0+hgur2SPFM3pzDe0T9iqUbYRBvqRJTLvr1FaZlCLU1aVqUmxHTIXN0SBQ==",
 	},
 	unpinJobs = {
 		fields = { j = { "abc-1", "def-2" }, b = "prod", by = 12345, t = 1759580000000, unpin = true },
-		canonical = "ttpin1\nabc-1,def-2\n\n\nprod\n12345\n1759580000000\n1",
-		sig = "gf0acP9eFaccZjjZ+rhVD83evswOjg+bNEuwD0Zp5Od9m5XOntm7xEIj2vgHfcM2zbGaAg3ttmFvPPAPEMGLDA==",
-		sigF = "U+0euzxvLWtaWValUrOAz+6wv0XmsQIsWx09zTK33/Dl2zd4Uf+57nFE00ffytdvThNmeGJpOUJp6LLDXGKxDw==",
+		canonical = "tt1pin\nprod\n\nabc-1,def-2\n\n12345\n1759580000000\n1",
+		sig = "WQtaQvTf+SWqkFmU/uVK64YDlWoVH9uPFcGZXfsX5lqjp1GnSpeIkmFsc+NdypJ7TaQqkR8bXQx9VdT3cinGCw==",
+		sigF = "KZ9wjqB/hOte47FJtJH6Pr/qFybcJ1b/hWQO044HC0mgA0MudJv1b6hgcIjCWkb3mND9aR0/OC/lE53UdIT7DA==",
+	},
+	resign = { -- a head the CLI re-signed after `keys rotate`: same asset, new seq, r = "resign"
+		fields = { b = "prod", a = 138576381221184, i = "12b63b9-8be210", s = 20, c = "12b63b9", ch = "prod", t = 1759580180000, r = "resign" },
+		canonical = "tt1\nprod\n138576381221184\n12b63b9-8be210\n20\n12b63b9\nprod\n1759580180000\nresign",
+		sig = "HHni5U92bF9gQOYzm4/yPHi2fw0d6kqEt/zem9XHGOBcdfDnh9ty8Djl1NDPVuzlNx9xr60dzQNogtNyoa+pAw==",
+		sigF = "YTwE+4JbN9R63AxJCSjmfp/rNKCqV6ORZjvcr5lYB9Zv7FLg09jofDDYodkKjyYfKLCurS1G9oRlKPPDqMIoAw==",
 	},
 }
 
@@ -262,6 +268,49 @@ return function(check: (string, boolean) -> (), helpers)
 	check("vector 3 with main revoked: refused (sigF no longer counts once the key asset loaded)", not (Signing.verifyDeploy(prod.fields, prod.sig, prod.sigF)))
 	local sigs = Signing.signatures(prod.canonical, prod.sig, prod.sigF)
 	check("vector 3 badges with main revoked: fallback only", sigs ~= nil and not sigs.main and sigs.fallback)
+
+	-- Re-signed heads (r = "resign", user decision 2026-10-04).
+	local resign = VECTORS.resign
+	check("resign canonical", Signing.deployCanonical(resign.fields) == resign.canonical)
+	check("resign head fields", Signing.deployCanonical(Signing.headFields("prod", {
+		assetId = 138576381221184,
+		artifactId = "12b63b9-8be210",
+		seq = 20,
+		commit = "12b63b9",
+		channel = "prod",
+		t = 1759580180000,
+		r = "resign",
+	})) == resign.canonical)
+	local badR = table.clone(resign.fields)
+	badR.r = "later"
+	check("unknown r refused", Signing.deployCanonical(badR) == nil)
+	Signing._reset()
+	Signing.init(folder({ KeyAssetId = 99, FallbackPublicKey = FALLBACK }))
+	clock += 1000
+	nextRead = { publicKeys = MAIN, revokedKeys = "", version = 1 }
+	Signing.refresh("boot")
+	check("resign: sig verifies", (Signing.verifyDeploy(resign.fields, resign.sig, nil)))
+	local asRollback = table.clone(resign.fields)
+	asRollback.r = 1
+	check("resign signature is not a rollback signature", not (Signing.verifyDeploy(asRollback, resign.sig, nil)))
+
+	-- BootstrapHeads (user decision 2026-10-04): the only unsigned heads a prod server takes.
+	local serde = require("@lune/serde")
+	local decodeJson = function(text)
+		return serde.decode("json", text)
+	end
+	Signing._reset()
+	Signing.init(folder({ KeyAssetId = 99, BootstrapHeads = '{"prod":{"a":1001,"s":10,"i":"aaaaaaa-111111"},"bad":{"a":"x"}}' }), decodeJson)
+	local boot = Signing.bootstrapHead("prod")
+	check("bootstrap parsed", boot ~= nil and boot.assetId == 1001 and boot.seq == 10 and boot.artifactId == "aaaaaaa-111111")
+	check("bootstrap: a bad entry is reported, the good one kept", Signing.keys().configError ~= nil and Signing.keys().bootstrap.prod ~= nil and Signing.keys().bootstrap.bad == nil)
+	check("bootstrap match (branch, asset, seq)", Signing.matchesBootstrap("prod", { assetId = 1001, seq = 10 }))
+	check("bootstrap: another seq doesn't match", not Signing.matchesBootstrap("prod", { assetId = 1001, seq = 11 }))
+	check("bootstrap: another asset doesn't match", not Signing.matchesBootstrap("prod", { assetId = 1002, seq = 10 }))
+	check("bootstrap: another branch doesn't match", not Signing.matchesBootstrap("dev", { assetId = 1001, seq = 10 }))
+	Signing._reset()
+	Signing.init(folder({ BootstrapHeads = "not json" }), decodeJson)
+	check("bootstrap: bad JSON is reported", Signing.keys().configError ~= nil and Signing.bootstrapHead("prod") == nil)
 
 	-- Dev menu badges: each signature on its own.
 	Signing._reset()

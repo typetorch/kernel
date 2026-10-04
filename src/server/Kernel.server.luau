@@ -29,7 +29,9 @@ local Signing = require(script.Parent.Signing)
 -- 0.3: the trust roots and the build identity, read ONCE from this folder's attributes (stamped by `typetorch kernel
 -- deploy`) before anything else runs, so no payload can change them for this server's lifetime.
 local kernelFolder = script.Parent
-Signing.init(kernelFolder)
+Signing.init(kernelFolder, function(text)
+	return HttpService:JSONDecode(text)
+end)
 local KERNEL_BUILD = kernelFolder:GetAttribute("KernelCommit") -- P-V1: short commit ("abc1234", "*" = dirty)
 local KERNEL_HASH = kernelFolder:GetAttribute("KernelHash")
 KERNEL_BUILD = if typeof(KERNEL_BUILD) == "string" and KERNEL_BUILD ~= "" then KERNEL_BUILD else nil
@@ -95,8 +97,15 @@ local function signedProd(branch: string, head): boolean
 	return ok
 end
 
--- A branch's channel from sources game code can't write: ConfigService's `channels`, the default branch (prod), or a
--- signed prod head of that branch. Unsigned stored heads don't count (game code can write them).
+-- A head a prod server may follow: signed for prod, or exactly the BootstrapHeads entry kernel deploy stamped for
+-- `branch` (the unsigned prod head of the 0.2 days; anything newer must be signed).
+local function trustedProd(branch: string, head): boolean
+	return signedProd(branch, head) or Signing.matchesBootstrap(branch, head)
+end
+
+-- A branch's channel from sources game code can't write: ConfigService's `channels`, the default branch (prod), a
+-- BootstrapHeads entry, or a signed prod head of that branch. Unsigned stored heads don't count (game code can write
+-- them).
 local function trustedChannelOf(branch: string?): string
 	if typeof(branch) ~= "string" then
 		return "dev"
@@ -106,7 +115,7 @@ local function trustedChannelOf(branch: string?): string
 	if configured == "prod" or configured == "dev" then
 		return configured
 	end
-	if branch == state.defaultBranch then
+	if branch == state.defaultBranch or Signing.bootstrapHead(branch) ~= nil then
 		return "prod"
 	end
 	local fromConfig, fromStore = Registry.headCandidates(branch)
@@ -141,7 +150,7 @@ local function effectiveChannel(branch: string, artifactChannel: string?): strin
 end
 
 -- Heads a prod server may swap to, by table identity (fields can't fake it): "signed" (a verified deploy message or
--- head), "pin" (a signed remote pin), "admin" (a dev menu or /tt pin by the owner/an admin in this server).
+-- head), "bootstrap" (the stamped BootstrapHeads entry, or a stored head matching it), "pin" (a signed remote pin).
 local admitted: { [any]: string } = setmetatable({}, { __mode = "k" }) :: any
 
 local function admit(head, how: string)
@@ -156,12 +165,32 @@ local function cloneHead(head)
 	return copy
 end
 
--- The newest signed prod head of `branch` (ConfigService or stored), admitted, or nil.
+-- The bootstrap head of `branch` as a head table (one per branch, so its admission sticks), or nil.
+local bootstrapTables: { [string]: any } = {}
+local function bootstrapFor(branch: string)
+	local cached = bootstrapTables[branch]
+	if cached then
+		return cached
+	end
+	local entry = Signing.bootstrapHead(branch)
+	if not entry then
+		return nil
+	end
+	local head = { assetId = entry.assetId, artifactId = entry.artifactId, seq = entry.seq, channel = "prod", branch = branch, bootstrap = true }
+	bootstrapTables[branch] = admit(head, "bootstrap")
+	return head
+end
+
+-- What a prod server follows on `branch` (user decision 2026-10-04): the newest trusted head (signed, or matching
+-- BootstrapHeads exactly) from ConfigService or the stores; else the bootstrap head itself; else nil. Admitted.
 local function signedHead(branch: string)
 	local head = Registry.branchHead(branch, function(candidate)
-		return signedProd(branch, candidate)
+		return trustedProd(branch, candidate)
 	end)
-	return if head then admit(head, "signed") else nil
+	if head then
+		return admit(head, if signedProd(branch, head) then "signed" else "bootstrap")
+	end
+	return bootstrapFor(branch)
 end
 
 -- The head this server should follow on `branch`: signed only when this server requires signatures.
@@ -294,12 +323,12 @@ Signing.configure({
 
 -- Registry merges: a signed prod head is never pushed out of the stores' copies by an unsigned one.
 Registry.setTrust(function(branch: string, head)
-	if signedProd(branch, head) then
+	if trustedProd(branch, head) then
 		return "trusted"
 	end
 	local state = Registry.state()
 	local configured = state.channels[branch]
-	if configured == "prod" or (configured == nil and branch == state.defaultBranch) then
+	if configured == "prod" or (configured == nil and (branch == state.defaultBranch or Signing.bootstrapHead(branch) ~= nil)) then
 		return "untrusted"
 	end
 	return nil
@@ -650,11 +679,11 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		local payload = loadPayload(head.assetId)
 		report.loadSeconds = os.clock() - loadStarted
 		report.stage = "mount"
-		-- Signed deploys and heads on prod servers: Channel exactly "prod"; admin pins keep their own rule
-		-- (head.requireChannel); experiments (signed remote pins, owner/admin pins) may be any channel.
+		-- Signed deploys and heads (and bootstrap heads) on prod servers: Channel exactly "prod"; pins keep their own rule
+		-- (head.requireChannel); experiments (signed remote pins) may be any channel.
 		local how = admitted[head]
 		local generation = mount(payload, head, {
-			requireChannel = if signedOnly and how == "signed" then "prod" else nil,
+			requireChannel = if signedOnly and (how == "signed" or how == "bootstrap") then "prod" else nil,
 			modulesOnly = signedOnly,
 		})
 		-- 0.2.2: how this generation starts, for api.start (the kernel adds stopSeconds and swapSeconds below).
@@ -858,7 +887,7 @@ runWorker = function()
 			end
 			continue
 		end
-		if current and head.artifactId and head.artifactId == current.artifact.id then
+		if current and ((head.artifactId and head.artifactId == current.artifact.id) or head.assetId == current.artifact.assetId) then
 			appliedSeq = math.max(appliedSeq, if typeof(seq) == "number" then seq else appliedSeq)
 			continue
 		end
@@ -927,7 +956,7 @@ local function followHead(reason: string, jitter: boolean?)
 	end
 	-- `ro` is unsigned: prod servers ignore it (plans/03 "Fields outside the signature").
 	local rollout = if requiresSignatures(myBranch) then nil else head.rollout
-	if current and head.artifactId and head.artifactId == current.artifact.id then
+	if current and ((head.artifactId and head.artifactId == current.artifact.id) or head.assetId == current.artifact.assetId) then
 		if current.pinned and inRollout(rollout) then
 			setHold(false, nil) -- the pinned artifact is the head now (seq > appliedSeq here)
 		end
@@ -993,6 +1022,8 @@ local function onDeployMessage(message)
 	local t = if typeof(data.t) == "number" then data.t else nil
 	local sig = if typeof(data.sig) == "string" and #data.sig <= 100 then data.sig else nil
 	local sigF = if typeof(data.sigF) == "string" and #data.sigF <= 100 then data.sigF else nil
+	-- `r`: 1 = rollback; "resign" (0.3) = the CLI re-signed the running head after `keys rotate` (same asset, new seq).
+	local r = if data.r == 1 or data.r == "resign" then data.r else nil
 	-- Deployment history: this deploy plus the head it replaces (so heads from before 0.2.0 stay listed).
 	local previous = Registry.branchHead(data.b)
 	local entries = {
@@ -1004,7 +1035,8 @@ local function onDeployMessage(message)
 			assetId = data.a,
 			commit = data.c,
 			at = sentAt:ToIsoDate(),
-			rollback = data.r and true or nil,
+			rollback = if data.r == 1 then true else nil,
+			r = r,
 			rollout = rollout,
 			t = t,
 			sig = sig,
@@ -1021,6 +1053,7 @@ local function onDeployMessage(message)
 			commit = previous.commit,
 			at = previous.deployedAt,
 			rollback = previous.rollback,
+			r = previous.r,
 			t = previous.t,
 			sig = previous.sig,
 			sigF = previous.sigF,
@@ -1034,7 +1067,8 @@ local function onDeployMessage(message)
 		commit = data.c,
 		channel = channel,
 		deployedAt = DateTime.now():ToIsoDate(),
-		rollback = data.r and true or nil,
+		rollback = if data.r == 1 then true else nil,
+		r = r,
 		rollout = rollout,
 		t = t,
 		sig = sig,
@@ -1065,10 +1099,14 @@ local function onDeployMessage(message)
 			return
 		end
 	end
-	if current and data.i == current.artifact.id then
-		-- Already running it. A newer deploy of the pinned (or experiment) artifact ends the hold: it is the head now.
+	if current and (data.i == current.artifact.id or data.a == current.artifact.assetId) then
+		-- Already running it (also a re-signed head, r = "resign": the stored head and appliedSeq move, no swap). A newer
+		-- deploy of the pinned (or experiment) artifact ends the hold: it is the head now.
 		if current.pinned and seq and seq > appliedSeq and inRollout(rollout) then
 			setHold(false, nil)
+		end
+		if seq and seq > appliedSeq and r == "resign" then
+			print(`[TypeTorch] re-signed head for {data.b}: {data.i} #{seq} (no swap)`)
 		end
 		appliedSeq = math.max(appliedSeq, seq or appliedSeq)
 		return
@@ -1082,7 +1120,7 @@ local function onDeployMessage(message)
 		print(`[TypeTorch] deploy {data.i} for {data.b} rolled out to {rollout}%; this server (bucket {jobBucket(game.JobId)}) keeps {current.artifact.id}`)
 		return
 	end
-	print(`[TypeTorch] {if data.r then "rollback" else "deploy"} message for {data.b}: {data.i}{if rollout then ` ({rollout}% rollout)` else ""}{if signedOnly then " (signed)" else ""}`)
+	print(`[TypeTorch] {if r == 1 then "rollback" elseif r == "resign" then "re-signed head" else "deploy"} message for {data.b}: {data.i}{if rollout then ` ({rollout}% rollout)` else ""}{if signedOnly then " (signed)" else ""}`)
 	local head = {
 		assetId = data.a,
 		artifactId = data.i,
@@ -1092,7 +1130,8 @@ local function onDeployMessage(message)
 		branch = data.b,
 		deployedAt = sentAt:ToIsoDate(),
 		rollout = rollout,
-		rollback = data.r and true or nil,
+		rollback = if data.r == 1 then true else nil,
+		r = r,
 		t = t,
 		sig = sig,
 		sigF = sigF,
@@ -1101,7 +1140,7 @@ local function onDeployMessage(message)
 		admit(head, "signed")
 	end
 	failing = nil -- a new deploy message: its own retries
-	want(head, if data.r then "rollback" else "deploy", true)
+	want(head, if r == 1 then "rollback" else "deploy", true)
 end
 
 -- Control (dev menu, /tt) ------------------------------------------------------------------------------------------
@@ -1158,6 +1197,7 @@ local function deploymentEntries()
 				commit = head.commit,
 				at = head.deployedAt,
 				rollback = head.rollback,
+				r = head.r,
 				rollout = head.rollout,
 				t = head.t,
 				sig = head.sig,
@@ -1181,6 +1221,7 @@ local function deploymentEntries()
 				commit = head.commit,
 				at = head.deployedAt,
 				rollback = head.rollback,
+				r = head.r,
 				t = head.t,
 				sig = head.sig,
 				sigF = head.sigF,
@@ -1235,6 +1276,7 @@ local function pinHead(entry)
 		pinned = true,
 		-- 0.3: the deploy's signatures, so a stored pin can be checked when a prod private server boots it.
 		rollback = entry.rollback,
+		r = entry.r,
 		t = entry.t,
 		sig = entry.sig,
 		sigF = entry.sigF,
@@ -1298,10 +1340,18 @@ end
 -- also on public servers. The effective channel stays "prod" there (public), so devtools stay read-only. It holds until
 -- the next deploy of this server's branch (that reaches this server), an unpin, or the server closing; it is never
 -- stored. `options.by` / `options.remote` come only from pin messages (Api.luau passes `experiment` alone).
+-- 0.3: on prod servers (public; private on a prod branch) only signed remote pins (`options.signed`, set by
+-- onPinMessage after it verified them) work; dev menu and /tt pins there are refused ("use the CLI: typetorch pin").
+local PROD_PIN_ERROR = "prod servers take only signed pins: use the CLI (typetorch pin)"
+
 local function pinArtifact(player: Player?, assetId: number, options)
 	local allowed, why = requireDev(player)
 	if not allowed then
 		return { ok = false, error = why }
+	end
+	-- 0.3: say so before any lookup (the check below admits only signed pins on prod servers).
+	if player and requiresSignatures(myBranch) then
+		return { ok = false, error = PROD_PIN_ERROR }
 	end
 	if typeof(assetId) ~= "number" then
 		return { ok = false, error = "bad asset id" }
@@ -1328,16 +1378,15 @@ local function pinArtifact(player: Player?, assetId: number, options)
 	if kind == "public" and not experiment then
 		head.requireChannel = "prod"
 	end
-	-- 0.3: on prod servers a pin is a way in too: a signed remote pin (onPinMessage checked it), or a dev/admin in this
-	-- server (checked above, Roblox-authenticated). Nothing else.
+	-- 0.3 (user decision): on prod servers only a signed remote pin (onPinMessage checked it) is a way in.
 	if requiresSignatures(myBranch) then
 		if typeof(options) == "table" and options.signed == true then
 			admit(head, "pin")
-		elseif player then
-			admit(head, "admin")
 		else
-			refuse("pin", "an unsigned pin on a prod server", { assetId = assetId, by = by })
-			return { ok = false, error = "refused: prod servers take only signed pins" }
+			if not player then
+				refuse("pin", "an unsigned pin on a prod server", { assetId = assetId, by = by })
+			end
+			return { ok = false, error = PROD_PIN_ERROR }
 		end
 	end
 	local seq = pinSeq(myBranch, entry)
@@ -1586,6 +1635,9 @@ local function status()
 		kernelHash = KERNEL_HASH,
 		-- 0.3: signatures. `signedOnly`: this server takes only signed prod artifacts. Full trust state: api:keys().
 		signedOnly = requiresSignatures(myBranch),
+		-- 0.3: a signed-only server with no trusted head for its branch (no verified head, no bootstrap head): it runs
+		-- nothing new until a signed deploy arrives (it keeps polling and re-reading the keys on the normal schedule).
+		noTrustedHead = if requiresSignatures(myBranch) and myBranch and not headFor(myBranch) then true else nil,
 		signing = Signing.summary(),
 		rejected = rejectedInfo(),
 	}
@@ -1596,6 +1648,7 @@ end
 local function keysInfo()
 	local info = Signing.keys()
 	info.signedOnly = requiresSignatures(myBranch)
+	info.noTrustedHead = if info.signedOnly and myBranch and not headFor(myBranch) then true else nil
 	info.rejected = rejectedInfo()
 	info.refusals = table.clone(refusals)
 	return info
@@ -1920,7 +1973,7 @@ if bootPin and (not bootHead or (bootHead.seq or 0) <= (bootPin.headSeq or 0)) t
 elseif bootHead then
 	followHead("boot", false)
 else
-	local why = if signedBoot then "no signed prod artifact" else "no artifact"
+	local why = if signedBoot then "no trusted prod head (no verified head, no bootstrap head)" else "no artifact"
 	warn(`[TypeTorch] branch {myBranch} has {why} yet{if err then ` (registry: {err})` else ""}; waiting for a deploy`)
 	if signedBoot then
 		followHead("boot", false) -- reports a newer unsigned head, if there is one
