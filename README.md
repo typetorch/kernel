@@ -20,6 +20,13 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   (a swap is coming, with an ETA; also broadcast to clients), `api:onDevChanged`, `api:pinned()` and
   `api:requestReload(player)` (owner and admins). Clients get the full artifact identity, the server type and their
   own `start`.
+- A/B experiments and rollouts (0.2.3): `api:pinArtifact(player, assetId, { experiment = true })` lets the owner or
+  an admin run ANY known artifact (dev channel too) on a public server, which stays "prod" (read-only devtools);
+  it holds until the next deploy of the branch, `api:unpin(player)` / `/tt unpin`, or the server closing.
+  `api:experiment()` and `status().experiment` report it. Remote pins arrive on topic `TypeTorch/pin` (`{j?, pct?,
+  a, b, by, t, unpin?}`, by JobId list or by `jobBucket(JobId) < pct`), and deploy messages may carry `ro` (1-99):
+  only servers whose bucket (djb2 of the JobId, mod 100) is below it swap; the others keep their artifact, and new
+  servers boot the head. Both topics are unsigned (see `../plans/12-audit.md`, S-C2).
 
 Contract with payloads: `Server.boot.boot(kernel)` / `Client.boot.boot(kernel)` return a stop function (0.2.2 passes
 it what replaces the generation). The typed view

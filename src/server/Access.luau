@@ -90,4 +90,51 @@ function Access.isAdmin(player: Player): boolean
 	return dev and (role == "owner" or role == "admin")
 end
 
+-- userId -> owns the experience, for users who may not be in this server (group owners: GroupService, cached).
+local ownerIdCache: { [number]: boolean } = {}
+
+-- 0.2.3: whether `userId` is the owner or an admin, for messages from other servers (pin messages carry `by`). The
+-- player is usually elsewhere: the registry's members, the user-owned creator, or rank 255 in the owning group (a web
+-- call, cached; a failure counts as "no" and is retried next time). Revoked users never are.
+function Access.isAdminUserId(userId: number): boolean
+	if typeof(userId) ~= "number" or userId <= 0 or userId % 1 ~= 0 then
+		return false
+	end
+	local key = tostring(userId)
+	if config.revoked[key] then
+		return false
+	end
+	if RunService:IsStudio() then
+		return true
+	end
+	local role = config.members[key]
+	if role == "owner" or role == "admin" then
+		return true
+	end
+	local player = game:GetService("Players"):GetPlayerByUserId(userId)
+	if player then
+		return isOwner(player)
+	end
+	if game.CreatorType == Enum.CreatorType.User then
+		return userId == game.CreatorId
+	end
+	local cached = ownerIdCache[userId]
+	if cached ~= nil then
+		return cached
+	end
+	local ok, groups = pcall(game:GetService("GroupService").GetGroupsAsync, game:GetService("GroupService"), userId)
+	if not ok or typeof(groups) ~= "table" then
+		return false
+	end
+	local owner = false
+	for _, group in groups do
+		if typeof(group) == "table" and group.Id == game.CreatorId then
+			owner = group.Rank == 255
+			break
+		end
+	end
+	ownerIdCache[userId] = owner
+	return owner
+end
+
 return Access

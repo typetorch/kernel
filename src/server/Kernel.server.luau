@@ -57,6 +57,7 @@ local registryError = nil
 local myBranch = nil
 local bootPin = nil -- a private/reserved server's stored pin (Registry private/<id>.pin), read at boot
 local storedPin = false -- whether this server's private/<id> record holds a pin (cleared by reload)
+local lastPin = nil -- 0.2.3: the last pin message this server acted on (status().lastPin)
 
 local function serverType(): string
 	if RunService:IsStudio() then
@@ -77,6 +78,25 @@ local function effectiveChannel(branch: string, artifactChannel: string?): strin
 		return "prod"
 	end
 	return "dev"
+end
+
+-- 0.2.3: a stable bucket 0..99 per server (djb2 over the JobId, mod 2^32, mod 100). Rollouts (`ro` on deploy
+-- messages) and random A/B pins (`pct` on pin messages) both pick "bucket < percent", so the same servers come first
+-- in both. The framework's devtools/ab.ts has the same function.
+local function jobBucket(jobId: string): number
+	local hash = 5381
+	for index = 1, #jobId do
+		hash = (hash * 33 + string.byte(jobId, index)) % 4294967296
+	end
+	return hash % 100
+end
+
+-- Whether this server takes a deploy rolled out to `percent` of servers (nil = everyone). Studio always does.
+local function inRollout(percent: number?): boolean
+	if typeof(percent) ~= "number" or percent >= 100 or serverType() == "studio" then
+		return true
+	end
+	return jobBucket(game.JobId) < percent
 end
 
 local function notice(player: Player, text: string)
@@ -271,11 +291,28 @@ local function publishActive(generation)
 	-- 0.2.2: why it started, whether it is pinned, and the server type, for the client API.
 	replicatedRoot:SetAttribute("Reason", generation.reason)
 	replicatedRoot:SetAttribute("Pinned", generation.pinned == true)
+	-- 0.2.3: this server runs an A/B experiment pin (its artifact id), or nil.
+	replicatedRoot:SetAttribute("Experiment", if generation.head.experiment then generation.artifact.id else nil)
 	replicatedRoot:SetAttribute("ServerType", serverType())
 	replicatedRoot:SetAttribute("ArtifactId", generation.artifact.id)
 	replicatedRoot:SetAttribute("Branch", generation.branch)
 	replicatedRoot:SetAttribute("Channel", generation.channel)
 	replicatedRoot:SetAttribute("ActiveGeneration", generation.name)
+end
+
+-- 0.2.3: holds the running generation where it is (a pin, optionally an A/B experiment) or releases it, without a
+-- swap. `experiment` = { artifactId, assetId, by, since } or nil.
+local function setHold(pinned: boolean, experiment)
+	if not current then
+		return
+	end
+	current.pinned = pinned
+	-- A copy: the running head may be the registry's own table (Registry.branchHead), which must never carry pins.
+	current.head = table.clone(current.head)
+	current.head.pinned = if pinned then true else nil
+	current.head.experiment = experiment
+	replicatedRoot:SetAttribute("Pinned", pinned)
+	replicatedRoot:SetAttribute("Experiment", if experiment then current.artifact.id else nil)
 end
 
 -- Swap reasons as game code sees them (api.start.reason, the stop info, pending notices). Registry and poll moves are
@@ -476,7 +513,15 @@ local function followHead(reason: string, jitter: boolean?)
 		return
 	end
 	if current and head.artifactId and head.artifactId == current.artifact.id then
+		if current.pinned and inRollout(head.rollout) then
+			setHold(false, nil) -- the pinned artifact is the head now (seq > appliedSeq here)
+		end
 		appliedSeq = seq
+		return
+	end
+	-- 0.2.3: a deploy rolled out to some servers only (`ro`). The others keep what they run (appliedSeq stays, so a
+	-- wider rollout of the same deploy, or the next deploy, still reaches them); new servers boot it (no `current`).
+	if current and not inRollout(head.rollout) then
 		return
 	end
 	appliedSeq = seq
@@ -501,8 +546,9 @@ Registry.onChange(function(state)
 end)
 
 -- Deploy messages: {b = branch, a = assetId, i = artifactId, s = seq, c = commit, ch = channel, t = sent ms,
--- r = rollback?}. Every server records the head (any branch) so servers started later boot it even without a
--- ConfigService registry.
+-- r = rollback?, ro = rollout % (0.2.3, 1-99)?}. Every server records the head (any branch) so servers started later
+-- boot it even without a ConfigService registry. With `ro`, only servers whose jobBucket is below it swap; the others
+-- keep their current artifact (plans/12 P-R1).
 local function onDeployMessage(message)
 	local ok, data = pcall(HttpService.JSONDecode, HttpService, message.Data)
 	if not ok or typeof(data) ~= "table" then
@@ -515,6 +561,15 @@ local function onDeployMessage(message)
 	}
 	if typeof(data.b) ~= "string" or typeof(data.a) ~= "number" then
 		return
+	end
+	-- 0.2.3: `ro` must be a whole percent; 100 means everyone. Anything else is a malformed message: ignore all of it.
+	local rollout = nil
+	if data.ro ~= nil then
+		if typeof(data.ro) ~= "number" or data.ro % 1 ~= 0 or data.ro < 1 or data.ro > 100 then
+			warn(`[TypeTorch] deploy message for {data.b} ignored: bad rollout {tostring(data.ro)}`)
+			return
+		end
+		rollout = if data.ro < 100 then data.ro else nil
 	end
 	local seq = tonumber(data.s)
 	local channel = if data.ch == "prod" or data.ch == "dev" then data.ch else nil
@@ -534,6 +589,7 @@ local function onDeployMessage(message)
 			commit = data.c,
 			at = sentAt:ToIsoDate(),
 			rollback = data.r and true or nil,
+			rollout = rollout,
 		},
 	}
 	if previous and typeof(previous.assetId) == "number" then
@@ -557,11 +613,17 @@ local function onDeployMessage(message)
 		channel = channel,
 		deployedAt = DateTime.now():ToIsoDate(),
 		rollback = data.r and true or nil,
+		rollout = rollout,
+		t = if typeof(data.t) == "number" then data.t else nil,
 	})
 	if data.b ~= myBranch then
 		return
 	end
 	if current and data.i == current.artifact.id then
+		-- Already running it. A newer deploy of the pinned (or experiment) artifact ends the hold: it is the head now.
+		if current.pinned and seq and seq > appliedSeq and inRollout(rollout) then
+			setHold(false, nil)
+		end
 		appliedSeq = math.max(appliedSeq, seq or appliedSeq)
 		return
 	end
@@ -569,9 +631,14 @@ local function onDeployMessage(message)
 	if current and current.pinned and seq and seq <= appliedSeq then
 		return
 	end
-	print(`[TypeTorch] {if data.r then "rollback" else "deploy"} message for {data.b}: {data.i}`)
+	-- Outside a partial rollout: keep the current artifact (pinned or not). appliedSeq stays, see followHead.
+	if current and not inRollout(rollout) then
+		print(`[TypeTorch] deploy {data.i} for {data.b} rolled out to {rollout}%; this server (bucket {jobBucket(game.JobId)}) keeps {current.artifact.id}`)
+		return
+	end
+	print(`[TypeTorch] {if data.r then "rollback" else "deploy"} message for {data.b}: {data.i}{if rollout then ` ({rollout}% rollout)` else ""}`)
 	appliedSeq = math.max(appliedSeq, seq or appliedSeq)
-	local head = { assetId = data.a, artifactId = data.i, seq = seq, commit = data.c, channel = channel, branch = data.b, deployedAt = sentAt:ToIsoDate() }
+	local head = { assetId = data.a, artifactId = data.i, seq = seq, commit = data.c, channel = channel, branch = data.b, deployedAt = sentAt:ToIsoDate(), rollout = rollout }
 	local reason = if data.r then "rollback" else "deploy"
 	local announced = false
 	if serverType() == "public" then
@@ -639,6 +706,7 @@ local function deploymentEntries()
 				commit = head.commit,
 				at = head.deployedAt,
 				rollback = head.rollback,
+				rollout = head.rollout,
 			})
 		end
 	end
@@ -756,7 +824,11 @@ end
 
 -- Swaps THIS server to a known artifact and holds it there until a newer deploy seq for this server's branch arrives.
 -- Devs on private/reserved/studio servers; on public servers only owner/admin, and only prod-channel artifacts.
-local function pinArtifact(player: Player?, assetId: number)
+-- 0.2.3: `options.experiment = true` is an A/B experiment pin (owner/admin only): ANY known artifact, any channel,
+-- also on public servers. The effective channel stays "prod" there (public), so devtools stay read-only. It holds until
+-- the next deploy of this server's branch (that reaches this server), an unpin, or the server closing; it is never
+-- stored. `options.by` / `options.remote` come only from pin messages (Api.luau passes `experiment` alone).
+local function pinArtifact(player: Player?, assetId: number, options)
 	local allowed, why = requireDev(player)
 	if not allowed then
 		return { ok = false, error = why }
@@ -764,7 +836,12 @@ local function pinArtifact(player: Player?, assetId: number)
 	if typeof(assetId) ~= "number" then
 		return { ok = false, error = "bad asset id" }
 	end
+	local experiment = typeof(options) == "table" and options.experiment == true
+	local by = if player then player.UserId elseif typeof(options) == "table" and typeof(options.by) == "number" then options.by else nil
 	local kind = serverType()
+	if experiment and player and not Access.isAdmin(player) then
+		return { ok = false, error = "only the owner or admins can start an experiment" }
+	end
 	if kind == "public" and player and not Access.isAdmin(player) then
 		return { ok = false, error = "only the owner or admins can pin a public server" }
 	end
@@ -774,15 +851,17 @@ local function pinArtifact(player: Player?, assetId: number)
 		return { ok = false, error = `asset {assetId} is not a known deployment` }
 	end
 	local channel = entry.channel or Registry.channelOf(entry.branch)
-	if kind == "public" and channel ~= "prod" then
-		return { ok = false, error = "dev-channel artifacts never run on public servers" }
+	if kind == "public" and channel ~= "prod" and not experiment then
+		return { ok = false, error = "dev-channel artifacts run on public servers only as an experiment" }
 	end
 	local head = pinHead(entry)
-	if kind == "public" then
+	if kind == "public" and not experiment then
 		head.requireChannel = "prod"
 	end
 	local seq = pinSeq(myBranch, entry)
-	if kind == "private" or kind == "reserved" then
+	if experiment then
+		head.experiment = { artifactId = entry.artifactId or `asset-{assetId}`, assetId = assetId, by = by, since = os.time() }
+	elseif kind == "private" or kind == "reserved" then
 		-- The pin survives a restart of this private server (until the branch gets a newer deploy).
 		local pin = table.clone(head)
 		pin.pinned = nil
@@ -798,24 +877,60 @@ local function pinArtifact(player: Player?, assetId: number)
 	appliedSeq = math.max(appliedSeq, seq)
 	Registry.logEvent({
 		action = "pin",
+		experiment = experiment or nil,
+		remote = (typeof(options) == "table" and options.remote == true) or nil,
 		from = current and current.artifact.id,
 		to = entry.artifactId or `asset-{assetId}`,
 		assetId = assetId,
 		branch = myBranch,
+		channel = channel,
 		serverType = kind,
-		by = player and player.UserId,
+		by = by,
 		job = game.JobId,
 	})
+	if experiment then
+		print(`[TypeTorch] experiment pin: {entry.artifactId or assetId} ({channel}) on this {kind} server, by {by or "?"}`)
+	end
 	if current and sameDeploy(current.artifact, entry) then
 		-- Already running it: just hold it here.
-		current.pinned = true
-		current.head.pinned = true
-		replicatedRoot:SetAttribute("Pinned", true)
-		return { ok = true, generation = current.name, assetId = assetId, artifactId = current.artifact.id, pinned = true }
+		setHold(true, head.experiment)
+		return { ok = true, generation = current.name, assetId = assetId, artifactId = current.artifact.id, pinned = true, experiment = experiment or nil }
 	end
-	local report = swapTo(head, "pin", if player then player.UserId else nil)
+	local report = swapTo(head, "pin", by)
 	report.pinned = report.ok or nil
+	report.experiment = (report.ok and experiment) or nil
 	return report
+end
+
+-- 0.2.3: ends this server's A/B experiment: back to its branch head (the server may then run a newer artifact than
+-- before the experiment, e.g. one it skipped as outside a partial rollout). Remote unpins pass `assetId` to end only
+-- that experiment. Owner/admin on public servers, any dev elsewhere; `player` nil = a pin message (checked there).
+local function unpin(player: Player?, by: number?, assetId: number?)
+	local allowed, why = requireDev(player)
+	if not allowed then
+		return { ok = false, error = why }
+	end
+	if player and serverType() == "public" and not Access.isAdmin(player) then
+		return { ok = false, error = "only the owner or admins can unpin a public server" }
+	end
+	local experiment = current and current.head.experiment
+	if not experiment then
+		return { ok = false, error = "no experiment on this server" }
+	end
+	if assetId ~= nil and experiment.assetId ~= assetId then
+		return { ok = false, error = "another experiment runs here" }
+	end
+	by = if player then player.UserId else by
+	Registry.logEvent({ action = "unpin", experiment = true, from = current.artifact.id, branch = myBranch, serverType = serverType(), by = by, job = game.JobId })
+	print(`[TypeTorch] experiment {current.artifact.id} ended by {by or "?"}`)
+	Registry.refreshStoredHead(myBranch, 3)
+	local head = Registry.branchHead(myBranch)
+	if not head or typeof(head.assetId) ~= "number" or sameDeploy(current.artifact, head) then
+		setHold(false, nil) -- nothing else to run: just stop holding
+		return { ok = true, generation = current.name, artifactId = current.artifact.id }
+	end
+	appliedSeq = math.max(appliedSeq, head.seq or 0)
+	return swapTo(head, "reload", by)
 end
 
 local function switchBranch(player: Player?, branch: string)
@@ -965,7 +1080,128 @@ local function status()
 		memoryMb = Stats:GetTotalMemoryUsageMb(),
 		luaHeapKb = collectgarbage("count"),
 		appliedSeq = appliedSeq,
+		-- 0.2.3: { artifactId, assetId, by, since } while this server runs an A/B experiment pin.
+		experiment = if current and current.head.experiment then table.clone(current.head.experiment) else nil,
+		-- 0.2.3: this server's bucket (0-99) for rollouts and random A/B pins: it takes `ro`/`pct` above it.
+		rolloutBucket = if game.JobId ~= "" then jobBucket(game.JobId) else nil,
+		lastPin = lastPin,
 	}
+end
+
+-- 0.2.3: the running A/B experiment ({ artifactId, assetId, by, since }) or nil. Also the framework's feature test.
+local function experimentInfo()
+	return if current and current.head.experiment then table.clone(current.head.experiment) else nil
+end
+
+-- Remote pins (A/B), 0.2.3 --------------------------------------------------------------------------------------------
+-- Topic TypeTorch/pin: { j = { jobId... }?, pct = 1-100?, a = assetId (absent only for unpin), b = branch, by = userId,
+-- t = sent ms, unpin = true? }. A server acts when it is on branch `b` (any server type but Studio) and its JobId is in
+-- `j`, or `pct` is set and its jobBucket is below it. Pins are experiment pins (pinArtifact with experiment = true;
+-- the artifact must be a known deployment); `unpin` ends an experiment (only one on asset `a`, if given).
+-- TRUST: unsigned, like deploy messages (plans/12 S-C2 stays open): anything that can publish to this universe's
+-- MessagingService (any server's code, an Open Cloud key) can send one. Defense in depth only: strict fields, a
+-- 120 s freshness window, and `by` must be the owner or an admin by the registry. The framework's Admin > Servers
+-- publishes them (admin.ab, owner/admin only, rate-limited).
+
+local JOB_ID_PATTERN = "^[%w%-]+$"
+
+local function wholeNumber(value, low: number, high: number): boolean
+	return typeof(value) == "number" and value == value and value % 1 == 0 and value >= low and value <= high
+end
+
+-- Returns (ok, why).
+local function checkPinMessage(data): (boolean, string?)
+	if typeof(data.b) ~= "string" or #data.b == 0 or #data.b > 64 or string.find(data.b, "%c") then
+		return false, "bad branch"
+	end
+	if not wholeNumber(data.by, 1, 2 ^ 53) then
+		return false, "bad by"
+	end
+	if typeof(data.t) ~= "number" or math.abs(DateTime.now().UnixTimestampMillis - data.t) > Constants.PIN_MAX_AGE * 1000 then
+		return false, "stale or bad t"
+	end
+	if data.unpin ~= nil and typeof(data.unpin) ~= "boolean" then
+		return false, "bad unpin"
+	end
+	if data.a ~= nil or data.unpin ~= true then
+		if not wholeNumber(data.a, 1, 2 ^ 53) then
+			return false, "bad asset id"
+		end
+	end
+	if data.pct ~= nil and not wholeNumber(data.pct, 1, 100) then
+		return false, "bad pct"
+	end
+	if data.j ~= nil then
+		if typeof(data.j) ~= "table" then
+			return false, "bad j"
+		end
+		local count = 0
+		for key, jobId in data.j do
+			count += 1
+			if typeof(key) ~= "number" or typeof(jobId) ~= "string" or #jobId == 0 or #jobId > 64 or not string.match(jobId, JOB_ID_PATTERN) then
+				return false, "bad job id"
+			end
+		end
+		if count == 0 or count ~= #data.j or count > 100 then
+			return false, "bad j"
+		end
+	end
+	if data.j == nil and data.pct == nil then
+		return false, "no target"
+	end
+	return true, nil
+end
+
+local function onPinMessage(message)
+	local ok, data = pcall(HttpService.JSONDecode, HttpService, message.Data)
+	if not ok or typeof(data) ~= "table" then
+		return
+	end
+	local valid, why = checkPinMessage(data)
+	if not valid then
+		warn(`[TypeTorch] pin message ignored: {why}`)
+		return
+	end
+	local kind = serverType()
+	if data.b ~= myBranch or kind == "studio" or game.JobId == "" then
+		return
+	end
+	local listed = false
+	for _, jobId in data.j or {} do
+		if jobId == game.JobId then
+			listed = true
+			break
+		end
+	end
+	if not listed and not (data.pct ~= nil and jobBucket(game.JobId) < data.pct) then
+		return
+	end
+	if not Access.isAdminUserId(data.by) then
+		warn(`[TypeTorch] pin message ignored: {data.by} is not the owner or an admin`)
+		return
+	end
+	lastPin = {
+		assetId = data.a,
+		unpin = data.unpin or nil,
+		by = data.by,
+		pct = data.pct,
+		listed = listed,
+		receivedMs = DateTime.now().UnixTimestampMillis,
+		sentMs = data.t,
+	}
+	local report
+	if data.unpin then
+		report = unpin(nil, data.by, data.a)
+	else
+		-- Random picks across many public servers: spread the loads like deploys do.
+		if not listed and kind == "public" then
+			task.wait(math.random() * Constants.PUBLIC_JITTER_SECONDS)
+		end
+		report = pinArtifact(nil, data.a, { experiment = true, by = data.by, remote = true })
+	end
+	lastPin.ok = report.ok
+	lastPin.error = report.error
+	print("[TypeTorch] pin message " .. HttpService:JSONEncode(report))
 end
 
 Api.init({
@@ -984,11 +1220,13 @@ Api.init({
 	pinArtifact = pinArtifact,
 	newServer = newServer,
 	requestReload = requestReload,
+	unpin = unpin,
+	experiment = experimentInfo,
 })
 
 -- /tt chat commands (TextChatCommand), the fallback when a generation is broken --------------------------------------
 
-local HELP = "/tt status | branch <name> | new <branch> [assetId] | pin <assetId> | reload | rollback | dev"
+local HELP = "/tt status | branch <name> | new <branch> [assetId] | pin <assetId> | unpin | reload | rollback | dev"
 
 local function describe(report): string
 	if report.ok then
@@ -1008,7 +1246,7 @@ local function runCommand(player: Player, text: string)
 		notice(player, HELP)
 	elseif command == "status" then
 		local s = status()
-		local pinned = if s.pinned then ", pinned" else ""
+		local pinned = if s.experiment then ", A/B experiment" elseif s.pinned then ", pinned" else ""
 		notice(player, `{s.serverType} server, branch {s.branch} ({s.channel or "?"}), {if s.generation then s.generation.name else "no generation"}{pinned}, up {s.uptime}s`)
 	elseif command == "branch" and argument then
 		notice(player, describe(switchBranch(player, argument)))
@@ -1020,6 +1258,8 @@ local function runCommand(player: Player, text: string)
 		end
 	elseif command == "pin" and tonumber(argument) then
 		notice(player, describe(pinArtifact(player, tonumber(argument) :: number)))
+	elseif command == "unpin" then
+		notice(player, describe(unpin(player)))
 	elseif command == "reload" then
 		notice(player, describe(reload(player)))
 	elseif command == "rollback" then
@@ -1063,6 +1303,14 @@ task.spawn(function()
 	end)
 	if not ok then
 		warn(`[TypeTorch] deploy messages unavailable: {subscribeError}`)
+	end
+end)
+task.spawn(function()
+	local ok, subscribeError = pcall(function()
+		MessagingService:SubscribeAsync(Constants.PIN_TOPIC, onPinMessage)
+	end)
+	if not ok then
+		warn(`[TypeTorch] pin messages unavailable: {subscribeError}`)
 	end
 end)
 

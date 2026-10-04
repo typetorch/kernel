@@ -10,14 +10,15 @@
 --         branches = { [name] = { artifactId, assetId, channel, commit, commitHash, seq, deployedAt, by } },
 --         deployments = { newest last, at most 25 } }
 --   * In-game DataStore "TypeTorch" for what game servers write themselves (no Open Cloud scope needed):
---       heads                      { [branch] = { assetId, artifactId, seq, commit, channel, deployedAt } } (from deploy
+--       heads                      { [branch] = { assetId, artifactId, seq, commit, channel, deployedAt, rollout? } } (from deploy
 --                                  messages; the fallback registry when ConfigService isn't written; higher seq wins;
 --                                  mirrored in MemoryStore HashMap "TypeTorch" for polling; see "Branch heads" below)
 --       private/<PrivateServerId>  { branch, setBy, setAt, pin? }   (private and reserved servers' branch; `pin` =
 --                                  { assetId, artifactId, seq, commit, channel, branch, headSeq } boots that artifact
 --                                  until the branch gets a deploy newer than headSeq)
 --       deployments                { list }                   (newest first, at most 100: { seq, branch, channel,
---                                  artifactId, assetId, commit, at, rollback? } from deploy messages and known heads)
+--                                  artifactId, assetId, commit, at, rollback?, rollout? } from deploy messages and
+--                                  known heads; rollout = the deploy's `ro` %, 0.2.3)
 --       events                     { list }                   (automatic and server-local rollbacks, pins)
 --
 -- Studio without published configs: ServerStorage.TypeTorchDev may carry a "Registry" JSON attribute (same shape) or a
@@ -206,6 +207,24 @@ local function isHead(value): boolean
 	return typeof(value) == "table" and typeof(value.assetId) == "number"
 end
 
+-- Whether `head` should replace `stored`: a newer seq, or (0.2.3) the same deploy re-sent later (its message's `t`,
+-- sent ms) with another rollout %, so a wider or narrower rollout of one deploy reaches the stored copies too.
+local function replaces(stored, head): boolean
+	if not isHead(stored) then
+		return true
+	end
+	local storedSeq, seq = stored.seq or 0, head.seq or 0
+	if seq ~= storedSeq then
+		return seq > storedSeq
+	end
+	if stored.assetId ~= head.assetId or stored.rollout == head.rollout then
+		return false
+	end
+	local storedAt = if typeof(stored.t) == "number" then stored.t else 0
+	local at = if typeof(head.t) == "number" then head.t else 0
+	return at > storedAt
+end
+
 -- Keeps the newer head per branch (by seq) from a { [branch] = head } table.
 local function mergeHeads(into: { [string]: any }, from: any): boolean
 	if typeof(from) ~= "table" then
@@ -215,7 +234,7 @@ local function mergeHeads(into: { [string]: any }, from: any): boolean
 	for branch, head in from do
 		if typeof(branch) == "string" and isHead(head) then
 			local current = into[branch]
-			if not current or (head.seq or 0) > (current.seq or 0) then
+			if not current or replaces(current, head) then
 				into[branch] = head
 				changed = true
 			end
@@ -266,7 +285,7 @@ end
 
 function Registry.saveHead(branch: string, head)
 	local current = storedHeads[branch]
-	if current and (current.seq or 0) >= (head.seq or 0) then
+	if current and not replaces(current, head) then
 		return
 	end
 	storedHeads[branch] = head
@@ -276,7 +295,7 @@ function Registry.saveHead(branch: string, head)
 			getMemory():UpdateAsync(HEADS_KEY, function(existing)
 				local heads = if typeof(existing) == "table" then existing else {}
 				local stored = heads[branch]
-				if isHead(stored) and (stored.seq or 0) >= (head.seq or 0) then
+				if not replaces(stored, head) then
 					won = false
 					return nil -- another server already stored this deploy (or a newer one)
 				end
@@ -293,7 +312,7 @@ function Registry.saveHead(branch: string, head)
 			getStore():UpdateAsync(HEADS_KEY, function(existing)
 				local heads = if typeof(existing) == "table" then existing else {}
 				local stored = heads[branch]
-				if isHead(stored) and (stored.seq or 0) >= (head.seq or 0) then
+				if not replaces(stored, head) then
 					return nil
 				end
 				heads[branch] = head
@@ -317,7 +336,10 @@ function Registry.branchHead(name: string)
 	local fromConfig = Registry.state().branches[name]
 	local fromStore = storedHeads[name]
 	if fromConfig and fromStore then
-		return if (fromStore.seq or 0) > (fromConfig.seq or 0) then fromStore else fromConfig
+		local storeSeq, configSeq = fromStore.seq or 0, fromConfig.seq or 0
+		-- 0.2.3: the same deploy from a message carries its rollout %; a config head without one would undo it.
+		local sameWithRollout = storeSeq == configSeq and fromStore.assetId == fromConfig.assetId and fromStore.rollout ~= nil and fromConfig.rollout == nil
+		return if storeSeq > configSeq or sameWithRollout then fromStore else fromConfig
 	end
 	return fromConfig or fromStore
 end
@@ -392,6 +414,7 @@ local function cleanDeployment(entry): any?
 		commit = if typeof(entry.commit) == "string" then entry.commit else nil,
 		at = if typeof(entry.at) == "string" then entry.at else nil,
 		rollback = if entry.rollback == true or entry.action == "rollback" then true else nil,
+		rollout = if typeof(entry.rollout) == "number" and entry.rollout >= 1 and entry.rollout < 100 then entry.rollout else nil,
 	}
 end
 

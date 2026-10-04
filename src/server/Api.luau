@@ -9,7 +9,7 @@ local Api = {}
 local persistStore: { [string]: any } = {}
 local entries: { [Script]: any } = {}
 local services = nil -- set by the kernel: { Access, Transport, Logs, status, branchList, artifacts, reload, rollback,
--- switchBranch, pinArtifact, newServer, requestReload }
+-- switchBranch, pinArtifact, newServer, requestReload, unpin, experiment }
 
 function Api.init(kernelServices)
 	services = kernelServices
@@ -98,8 +98,17 @@ function Api.forEntry(entry: Script)
 	function api:artifacts()
 		return services.artifacts()
 	end
-	function api:pinArtifact(player: Player, assetId: number)
-		return services.pinArtifact(player, assetId)
+	-- 0.2.3: `options` = { experiment = true } pins as an A/B experiment (owner/admin; any channel, public servers
+	-- too). Only `experiment` is read: who asked is always `player` here.
+	function api:pinArtifact(player: Player, assetId: number, options: any?)
+		local experiment = typeof(options) == "table" and options.experiment == true
+		if not experiment then
+			return services.pinArtifact(player, assetId)
+		end
+		if typeof(player) ~= "Instance" or not player:IsA("Player") then
+			return { ok = false, error = "bad player" }
+		end
+		return services.pinArtifact(player, assetId, { experiment = true })
 	end
 	-- `assetId` (0.2.0+): the reserved server boots pinned to that known artifact.
 	function api:newServer(player: Player, branch: string, assetId: number?)
@@ -123,6 +132,19 @@ function Api.forEntry(entry: Script)
 	-- ({ok, queued}); the swap runs on a kernel thread, so it survives this generation's hard stop.
 	function api:requestReload(player: Player)
 		return services.requestReload(player)
+	end
+
+	-- Kernel 0.2.3+ (additive): A/B experiments.
+	-- The running experiment pin ({ artifactId, assetId, by, since }) or nil. Its presence marks a 0.2.3 kernel.
+	function api:experiment()
+		return services.experiment()
+	end
+	-- Ends this server's experiment (back to the branch head). Owner/admin on public servers, devs elsewhere.
+	function api:unpin(player: Player)
+		if typeof(player) ~= "Instance" or not player:IsA("Player") then
+			return { ok = false, error = "bad player" }
+		end
+		return services.unpin(player)
 	end
 
 	-- Entry-only (not on the TS interface).
