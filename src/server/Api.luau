@@ -9,7 +9,7 @@ local Api = {}
 local persistStore: { [string]: any } = {}
 local entries: { [Script]: any } = {}
 local services = nil -- set by the kernel: { Access, Transport, Logs, status, branchList, artifacts, reload, rollback,
--- switchBranch, pinArtifact, newServer, requestReload, unpin, experiment }
+-- switchBranch, pinArtifact, newServer, requestReload, unpin, experiment, KERNEL_BUILD, keys }
 
 function Api.init(kernelServices)
 	services = kernelServices
@@ -29,6 +29,8 @@ function Api.forEntry(entry: Script)
 	local api = {
 		kernelApi = services.KERNEL_API,
 		kernelVersion = services.KERNEL_VERSION,
+		-- 0.3 (P-V1): the kernel build (short commit, "*" = dirty) stamped by `typetorch kernel deploy`, or nil.
+		kernelBuild = services.KERNEL_BUILD,
 		artifact = table.clone(generation.artifact),
 		generation = generation.number,
 		branch = generation.branch,
@@ -145,6 +147,17 @@ function Api.forEntry(entry: Script)
 			return { ok = false, error = "bad player" }
 		end
 		return services.unpin(player)
+	end
+
+	-- Kernel 0.3+ (additive): signed prod deploys.
+	-- The trust state, for devs only (the framework checks the asking player): { keyAssetId, loaded, mode = "key asset" |
+	-- "fallback only" | "none", version, loadedAt, lastReadOk, lastError, lastErrorAt, reads, configError,
+	-- publicKeys = { { key, fingerprint, revoked? } }, revokedKeys = { { key, fingerprint } }, trusted, invalid?,
+	-- fallback = { key, fingerprint, revoked }?, lastHintAt, lastChange = { at, reason, hinted, version,
+	-- previousVersion, added, removed, revokedAdded, revokedRemoved, before, after }?, changes, signedOnly,
+	-- rejected = { total, byKind, last }, refusals }. Its presence marks a 0.3 kernel. Public keys aren't secret.
+	function api:keys()
+		return services.keys()
 	end
 
 	-- Entry-only (not on the TS interface).

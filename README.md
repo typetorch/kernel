@@ -26,7 +26,20 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   `api:experiment()` and `status().experiment` report it. Remote pins arrive on topic `TypeTorch/pin` (`{j?, pct?,
   a, b, by, t, unpin?}`, by JobId list or by `jobBucket(JobId) < pct`), and deploy messages may carry `ro` (1-99):
   only servers whose bucket (djb2 of the JobId, mod 100) is below it swap; the others keep their artifact, and new
-  servers boot the head. Both topics are unsigned (see `../plans/12-audit.md`, S-C2).
+  servers boot the head. In 0.2.x both topics are unsigned (see `../plans/12-audit.md`, S-C2).
+- Signed prod deploys (0.3.0): prod servers (every public server, and private/reserved servers on a prod branch)
+  take a deploy message, a stored head or a remote pin only with a valid Ed25519 signature (`sig` from a key in the
+  group-owned key asset's `PublicKeys` minus `RevokedKeys`; `sigF` from the baked `FallbackPublicKey` until the key
+  asset has loaded), the payload `Channel` attribute exactly `"prod"`, and a seq newer than the applied one.
+  Payloads there may hold only Folders and ModuleScripts. Dev servers stay unsigned. `KeyAssetId` and
+  `FallbackPublicKey` are attributes on `ServerScriptService.TypeTorchKernel`, stamped by `typetorch kernel deploy`
+  and read once at boot. `api:keys()` shows the trust state; `api:artifacts()` and `status()` carry `verified =
+  {main, fallback}`. Format: `../plans/03-artifact.md` "Signed prod messages"; rules: `../plans/01-kernel.md`.
+- Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
+  `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
+  `--dev`, `--vip`).
+- `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
+  [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.
 
 Contract with payloads: `Server.boot.boot(kernel)` / `Client.boot.boot(kernel)` return a stop function (0.2.2 passes
 it what replaces the generation). The typed view

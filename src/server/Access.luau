@@ -137,4 +137,20 @@ function Access.isAdminUserId(userId: number): boolean
 	return owner
 end
 
+-- 0.3: whether `userId` is a dev (owner, admin, member or dev-badge holder, not revoked), for users who may not be in
+-- this server. Used at boot to decide whether a player-owned private server may follow its stored (game-written)
+-- branch choice. A failed web call counts as "no".
+function Access.isDevUserId(userId: number): boolean
+	if typeof(userId) ~= "number" or userId <= 0 or userId % 1 ~= 0 then
+		return false
+	end
+	if config.revoked[tostring(userId)] then
+		return false
+	end
+	if typeof(config.members[tostring(userId)]) == "string" or Access.isAdminUserId(userId) then
+		return true
+	end
+	return hasBadge(userId)
+end
+
 return Access

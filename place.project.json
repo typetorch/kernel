@@ -40,12 +40,18 @@
 			"$properties": { "LoadStringEnabled": true },
 			"TypeTorchKernel": {
 				"$className": "Folder",
+				"$attributes": {
+					"KeyAssetId": "",
+					"FallbackPublicKey": ""
+				},
 				"Kernel": { "$path": "src/server/Kernel.server.luau" },
 				"Api": { "$path": "src/server/Api.luau" },
 				"Access": { "$path": "src/server/Access.luau" },
 				"Logs": { "$path": "src/server/Logs.luau" },
 				"Registry": { "$path": "src/server/Registry.luau" },
 				"Transport": { "$path": "src/server/Transport.luau" },
+				"Signing": { "$path": "src/server/Signing.luau" },
+				"vendor": { "$path": "src/server/vendor" },
 				"Entry": { "$path": "src/server/Entry.server.luau", "$properties": { "Disabled": true } }
 			}
 		},

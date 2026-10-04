@@ -165,6 +165,16 @@ for length = 0, 300 do
 	end
 end
 check(`SHA-512 matches Lune for lengths 0..300{if shaMismatch then ` (first mismatch at {shaMismatch})` else ""}`, shaMismatch == nil)
+local SHA256 = require("../src/server/vendor/ed25519/SHA256")
+local sha256Mismatch = nil
+for length = 0, 200 do
+	local text = string.rep("\x5att", length // 3 + 1):sub(1, length)
+	if (SHA256(buffer.fromstring(text))) ~= serde.hash("sha256", text) then
+		sha256Mismatch = length
+		break
+	end
+end
+check(`SHA-256 (key fingerprints) matches Lune for lengths 0..200{if sha256Mismatch then ` (first mismatch at {sha256Mismatch})` else ""}`, sha256Mismatch == nil)
 check(
 	"SHA-512('abc')",
 	toHex(Ed25519.sha512(buffer.fromstring("abc"))) == "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"

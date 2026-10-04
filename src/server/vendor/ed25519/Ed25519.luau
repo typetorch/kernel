@@ -5,7 +5,8 @@
 --
 -- Vendored from Luau Cryptography (rbx-cryptography) by daily3014 and Xoifail, MIT License (see ./LICENSE):
 --   https://github.com/daily3014/rbx-cryptography, version 3.1.4, commit 6147c4702726ab59c4b31ed9304dbe8bb843f05f,
---   src/Verification/EdDSA/{FieldPrime,FieldQuadratic,MultiPrecision,Edwards25519,SHA512}.luau, unmodified.
+--   src/Verification/EdDSA/{FieldPrime,FieldQuadratic,MultiPrecision,Edwards25519,SHA512}.luau, unmodified, and
+--   src/Hashing/SHA2/SHA256.luau (unmodified; the kernel's key fingerprints).
 -- This file is adapted from that release's src/Verification/EdDSA/init.luau (EDDSA.Verify): the same checks and math,
 -- but bad input returns false instead of throwing, and the CSPRNG/X25519/signing parts are left out (the kernel only
 -- verifies, and the CSPRNG gathers entropy when it is required).
@@ -14,6 +15,25 @@
 -- Added here (like libsodium): small-order public keys and R are refused. Without it an all-zero key and signature
 -- "verify" any message (cofactored verification accepts small-order points).
 -- Kernel tests: kernel/scripts/test-ed25519.luau (RFC 8032 section 7.1 and plans/03 vectors).
+--
+-- The vendored files' license (copied here so it ships inside the place; the LICENSE file next to them is the same):
+--   MIT License
+--
+--   Copyright (c) 2026 daily3014
+--
+--   Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+--   documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+--   the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+--   permit persons to whom the Software is furnished to do so, subject to the following conditions:
+--
+--   The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+--   the Software.
+--
+--   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+--   THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+--   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+--   CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+--   IN THE SOFTWARE.
 
 local FieldQuadratic = require("./FieldQuadratic")
 local FieldPrime = require("./FieldPrime")

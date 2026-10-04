@@ -25,6 +25,12 @@ local VECTORS = {
 		sig = "h4D9wxKwyj9ZiZEgEeje5bLXd62iH1Zqqbi6UCzNnGBu1SAPQq38g1zFWizogRTVumLr3OTz4T2hlSx/6fl9AQ==",
 		sigF = "SJG++3eiXGCYmu35ADj79qI7M0n/NxlRS61uZXqa6V2ahdN0pMZHBc2OB31r//ve87pKEY8AUvTH/lbz4fx7Bw==",
 	},
+	prodDeploy = { -- plans/03 vector 3
+		fields = { b = "prod", a = 138576381221184, i = "12b63b9-8be210", s = 19, c = "12b63b9", ch = "prod", t = 1759580120000 },
+		canonical = "tt1\nprod\n138576381221184\n12b63b9-8be210\n19\n12b63b9\nprod\n1759580120000\n",
+		sig = "phgDB7FGF1wuRZolNMKItmsUYwJzqFmvIFVOmlmWOxyDRG4lpk06KBQbBUkhczHktk+a7lUGGZjjy83liqK7Dw==",
+		sigF = "ozGBMMk3xtBREeQkcP596zVthaJNtkdbjE+AlG9pD80kxNn6GzGNowGmyzwMtwpZ8SkXr+g/LBR9X5bPkaeSBQ==",
+	},
 	pinRandom = {
 		fields = { pct = 10, a = 134192491895548, b = "prod", by = 12345, t = 1759580000000 },
 		canonical = "ttpin1\n\n10\n134192491895548\nprod\n12345\n1759580000000\n",
@@ -181,14 +187,17 @@ return function(check: (string, boolean) -> (), helpers)
 	read, changed = Signing.refresh("hint")
 	check("hint after 30 s: read and changed", read and changed)
 	check("hint no longer due", Signing.hintDue() == nil)
-	check("change logged", #events == 1 and events[1].action == "keys_changed" and events[1].added[1] == ROTATED and events[1].revokedAdded[1] == MAIN)
+	local change = Signing.keys().lastChange
+	check("change logged", #events == 1 and events[1].action == "keys_changed" and events[1].hinted == false)
+	check("change recorded", change ~= nil and change.added[1] == ROTATED and change.revokedAdded[1] == MAIN and change.reason == "hint")
+	check("change fingerprints", change ~= nil and change.before.publicKeys[1] == "dfe5449d" and #change.after.publicKeys == 2 and change.after.revokedKeys[1] == "dfe5449d")
 	check("change warned", string.find(warnings[#warnings] or "", "CHANGED", 1, true) ~= nil)
 	ok = verifyDeploy(deploy.sig, nil)
 	check("revoked main key refused", not ok)
 	ok = verifyDeploy(deploy.sigR, nil)
 	check("rotated key accepted", ok)
-	local status = Signing.status()
-	check("status: 2 public, 1 revoked, 1 trusted", #status.publicKeys == 2 and #status.revokedKeys == 1 and status.trusted == 1 and status.version == 8 and #status.changes == 1)
+	local status = Signing.keys()
+	check("status: 2 public, 1 revoked, 1 trusted", #status.publicKeys == 2 and #status.revokedKeys == 1 and status.trusted == 1 and status.version == 8 and status.changes == 1 and status.mode == "key asset")
 
 	-- A failed read keeps the last good keys.
 	clock += 61
@@ -198,7 +207,7 @@ return function(check: (string, boolean) -> (), helpers)
 	read, changed = Signing.refresh("failure")
 	check("failed read: attempted, no change", read and not changed)
 	ok = verifyDeploy(deploy.sigR, nil)
-	check("failed read keeps the keys", ok and Signing.status().lastReadOk == false)
+	check("failed read keeps the keys", ok and Signing.keys().lastReadOk == false)
 
 	-- A read without the PublicKeys attribute is a failed read too.
 	clock += 301
@@ -211,24 +220,70 @@ return function(check: (string, boolean) -> (), helpers)
 	clock += 301
 	nextRead = { unchanged = true, version = 8 }
 	read, changed = Signing.refresh("periodic")
-	check("unchanged version: read, no change", read and not changed and Signing.status().lastReadOk == true)
+	check("unchanged version: read, no change", read and not changed and Signing.keys().lastReadOk == true)
 
 	-- Garbage entries are skipped; the fallback key can be revoked.
 	clock += 301
 	nextRead = { publicKeys = `not-a-key, {ROTATED}`, revokedKeys = `{MAIN},{FALLBACK}`, version = 9 }
 	Signing.refresh("periodic")
-	status = Signing.status()
+	status = Signing.keys()
 	check("garbage key skipped", status.trusted == 1 and status.invalid and status.invalid[1] == "not-a-key")
-	check("fallback revoked shows in status", status.fallbackRevoked == true)
+	check("fallback revoked shows in keys()", status.fallback ~= nil and status.fallback.revoked == true and status.fallback.fingerprint == "43f1e550")
 	ok = verifyDeploy(nil, deploy.sigF)
 	check("revoked fallback: sigF refused", not ok)
 
-	-- An empty key list refuses everything (fail closed).
+	check("periodic change without a hint", Signing.keys().lastChange.hinted == false and Signing.keys().lastChange.reason == "periodic")
+	check("keys() rows: fingerprint and revoked flag", status.publicKeys[1].fingerprint == "fe58a9a8" and status.publicKeys[1].revoked == nil and status.revokedKeys[1].key == MAIN and status.revokedKeys[2].key == FALLBACK)
+
+	-- An empty key list refuses everything (fail closed). A rekey hint just before marks the change as hinted.
 	clock += 301
+	Signing.noteHint()
 	nextRead = { publicKeys = "", revokedKeys = "", version = 10 }
 	Signing.refresh("periodic")
 	ok, why = verifyDeploy(deploy.sigR, deploy.sigF)
 	check("empty PublicKeys: refused", not ok and string.find(why or "", "no usable", 1, true) ~= nil)
+	check("change after a hint is hinted", Signing.keys().lastChange.hinted == true and Signing.keys().changes == 3)
+
+	-- plans/03 vector 3 (prod deploy), under the kernel's rule (user decision 2026-10-04): sigF counts only until the
+	-- key asset loads. NOTE: plans/03 "The rule" (CLI side) also accepts sigF afterwards; the kernel does not.
+	local prod = VECTORS.prodDeploy
+	check("vector 3 canonical", Signing.deployCanonical(prod.fields) == prod.canonical)
+	Signing._reset()
+	Signing.init(folder({ KeyAssetId = 99, FallbackPublicKey = FALLBACK }))
+	check("vector 3: sigF before the key asset loads", (Signing.verifyDeploy(prod.fields, nil, prod.sigF)))
+	check("vector 3: sig alone before the key asset loads is refused", not (Signing.verifyDeploy(prod.fields, prod.sig, nil)))
+	clock += 1000
+	nextRead = { publicKeys = MAIN, revokedKeys = "", version = 1 }
+	Signing.refresh("boot")
+	check("vector 3: sig after load", (Signing.verifyDeploy(prod.fields, prod.sig, prod.sigF)))
+	clock += 1000
+	nextRead = { publicKeys = MAIN, revokedKeys = MAIN, version = 2 }
+	Signing.refresh("periodic")
+	check("vector 3 with main revoked: refused (sigF no longer counts once the key asset loaded)", not (Signing.verifyDeploy(prod.fields, prod.sig, prod.sigF)))
+	local sigs = Signing.signatures(prod.canonical, prod.sig, prod.sigF)
+	check("vector 3 badges with main revoked: fallback only", sigs ~= nil and not sigs.main and sigs.fallback)
+
+	-- Dev menu badges: each signature on its own.
+	Signing._reset()
+	Signing.init(folder({ KeyAssetId = 99, FallbackPublicKey = FALLBACK }))
+	local function badges(sig, sigF)
+		return Signing.signatures(Signing.deployCanonical(deploy.fields), sig, sigF)
+	end
+	check("badges: unsigned -> nil", badges(nil, nil) == nil)
+	local before = badges(deploy.sig, deploy.sigF)
+	check("badges before the key asset loads: fallback only", before ~= nil and before.main == false and before.fallback == true)
+	clock += 1000
+	nextRead = { publicKeys = MAIN, revokedKeys = "", version = 1 }
+	Signing.refresh("boot")
+	local both = badges(deploy.sig, deploy.sigF)
+	check("badges after load: both", both ~= nil and both.main and both.fallback)
+	local mainOnly = badges(deploy.sig, nil)
+	check("badges: main only", mainOnly ~= nil and mainOnly.main and not mainOnly.fallback)
+	local wrong = badges(deploy.sigR, VECTORS.rollback.sigF)
+	check("badges: wrong signatures -> none verified", wrong ~= nil and not wrong.main and not wrong.fallback)
+	local head = Signing.headSignatures("dev", { assetId = 134192491895548, artifactId = "12b63b9-3fa91c", seq = 17, commit = "12b63b9", channel = "dev", t = 1759580000000, sig = deploy.sig, sigF = deploy.sigF })
+	check("headSignatures", head ~= nil and head.main and head.fallback)
+	check("fingerprint", Signing.fingerprint(Signing.base64Decode(MAIN) :: buffer) == "dfe5449d")
 
 	-- KeyAssetId set but never loaded, no fallback: refused.
 	Signing._reset()
@@ -237,7 +292,7 @@ return function(check: (string, boolean) -> (), helpers)
 	check("no fallback and no load yet: refused", not ok and string.find(why or "", "not loaded", 1, true) ~= nil)
 	Signing._reset()
 	Signing.init(folder({ KeyAssetId = "x", FallbackPublicKey = "AAAA" }))
-	check("bad attributes reported", Signing.status().configError ~= nil and not Signing.configured())
+	check("bad attributes reported", Signing.keys().configError ~= nil and not Signing.configured())
 
 	-- Pins.
 	Signing._reset()

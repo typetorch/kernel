@@ -10,15 +10,18 @@
 --         branches = { [name] = { artifactId, assetId, channel, commit, commitHash, seq, deployedAt, by } },
 --         deployments = { newest last, at most 25 } }
 --   * In-game DataStore "TypeTorch" for what game servers write themselves (no Open Cloud scope needed):
---       heads                      { [branch] = { assetId, artifactId, seq, commit, channel, deployedAt, rollout? } } (from deploy
---                                  messages; the fallback registry when ConfigService isn't written; higher seq wins;
---                                  mirrored in MemoryStore HashMap "TypeTorch" for polling; see "Branch heads" below)
+--       heads                      { [branch] = { assetId, artifactId, seq, commit, channel, deployedAt, rollout?, t?,
+--                                  rollback?, sig?, sigF? } } (from deploy messages; the fallback registry when
+--                                  ConfigService isn't written; higher seq wins, but a signed prod head (0.3) is never
+--                                  replaced by an unsigned one; mirrored in MemoryStore HashMap "TypeTorch" for
+--                                  polling; see "Branch heads" below). Game code can write these stores, so prod
+--                                  servers (0.3) only follow heads whose signatures check out (Signing.luau).
 --       private/<PrivateServerId>  { branch, setBy, setAt, pin? }   (private and reserved servers' branch; `pin` =
 --                                  { assetId, artifactId, seq, commit, channel, branch, headSeq } boots that artifact
 --                                  until the branch gets a deploy newer than headSeq)
 --       deployments                { list }                   (newest first, at most 100: { seq, branch, channel,
---                                  artifactId, assetId, commit, at, rollback?, rollout? } from deploy messages and
---                                  known heads; rollout = the deploy's `ro` %, 0.2.3)
+--                                  artifactId, assetId, commit, at, rollback?, rollout?, t?, sig?, sigF? } from deploy
+--                                  messages and known heads; rollout = the deploy's `ro` %, 0.2.3; t/sig/sigF 0.3)
 --       events                     { list }                   (automatic and server-local rollbacks, pins)
 --
 -- Studio without published configs: ServerStorage.TypeTorchDev may carry a "Registry" JSON attribute (same shape) or a
@@ -107,30 +110,7 @@ local function changed()
 	end
 end
 
--- Loads the config (retrying with backoff) and keeps it fresh: UpdateAvailable plus a periodic Refresh as backup.
--- Returns (state, error). In Studio, a TypeTorchDev override wins.
-function Registry.start(): (any, string?)
-	local override = Registry.studioOverride()
-	if override then
-		state = override
-		return state, nil
-	end
-	local delay = 1
-	for attempt = 1, 6 do
-		local ok, result = pcall(ConfigService.GetConfigAsync, ConfigService)
-		if ok then
-			snapshot = result
-			break
-		end
-		warn(`[TypeTorch] ConfigService unavailable (attempt {attempt}): {result}`)
-		task.wait(delay)
-		delay = math.min(delay * 2, 30)
-	end
-	if not snapshot then
-		state = normalize(nil)
-		return state, "ConfigService unavailable"
-	end
-	state = normalize(read())
+local function watch()
 	snapshot.UpdateAvailable:Connect(function()
 		pcall(function()
 			snapshot:Refresh()
@@ -159,6 +139,50 @@ function Registry.start(): (any, string?)
 			end
 		end
 	end)
+end
+
+-- Loads the config and keeps it fresh: UpdateAvailable plus a periodic Refresh as backup. Returns (state, error). In
+-- Studio, a TypeTorchDev override wins.
+-- 0.3 (audit P-K5): ConfigService is off the boot path. The retries (with backoff, up to about 30 s) run on their own
+-- thread; boot waits at most `bootWait` seconds for the first snapshot and continues with an empty registry (the
+-- stored heads still work). A snapshot that arrives later fires the onChange listeners like any update.
+function Registry.start(bootWait: number?): (any, string?)
+	local override = Registry.studioOverride()
+	if override then
+		state = override
+		return state, nil
+	end
+	state = normalize(nil)
+	local finished = false
+	task.spawn(function()
+		local delay = 1
+		for attempt = 1, 6 do
+			local ok, result = pcall(ConfigService.GetConfigAsync, ConfigService)
+			if ok then
+				snapshot = result
+				break
+			end
+			warn(`[TypeTorch] ConfigService unavailable (attempt {attempt}): {result}`)
+			task.wait(delay)
+			delay = math.min(delay * 2, 30)
+		end
+		finished = true
+		if not snapshot then
+			return
+		end
+		local value = read()
+		watch()
+		if value ~= nil then
+			changed() -- also when boot already gave up waiting: listeners get the late snapshot
+		end
+	end)
+	local deadline = os.clock() + (bootWait or 3)
+	while not finished and os.clock() < deadline do
+		task.wait(0.05)
+	end
+	if not snapshot then
+		return state, if finished then "ConfigService unavailable" else "ConfigService slow (still retrying)"
+	end
 	return state, nil
 end
 
@@ -207,10 +231,33 @@ local function isHead(value): boolean
 	return typeof(value) == "table" and typeof(value.assetId) == "number"
 end
 
+-- 0.3: trust(branch, head) -> "trusted" (a signed prod head), "untrusted" (an unsigned head on a prod branch) or nil
+-- (no opinion: dev branches). Installed by the kernel (Signing). A trusted head is never replaced by one that isn't,
+-- whatever its seq, so a forged high-seq head (game code can write these stores) can't push a signed one out.
+local trust: ((string, any) -> string?)? = nil
+
+function Registry.setTrust(fn: (string, any) -> string?)
+	trust = fn
+end
+
+local function trustOf(branch: string?, head): string?
+	if not trust or branch == nil or not isHead(head) then
+		return nil
+	end
+	local ok, verdict = pcall(trust, branch, head)
+	return if ok then verdict else nil
+end
+
 -- Whether `head` should replace `stored`: a newer seq, or (0.2.3) the same deploy re-sent later (its message's `t`,
 -- sent ms) with another rollout %, so a wider or narrower rollout of one deploy reaches the stored copies too.
-local function replaces(stored, head): boolean
+local function replaces(stored, head, branch: string?): boolean
 	if not isHead(stored) then
+		return true
+	end
+	local storedTrust, headTrust = trustOf(branch, stored), trustOf(branch, head)
+	if storedTrust == "trusted" and headTrust ~= "trusted" then
+		return false
+	elseif headTrust == "trusted" and storedTrust ~= "trusted" then
 		return true
 	end
 	local storedSeq, seq = stored.seq or 0, head.seq or 0
@@ -234,13 +281,26 @@ local function mergeHeads(into: { [string]: any }, from: any): boolean
 	for branch, head in from do
 		if typeof(branch) == "string" and isHead(head) then
 			local current = into[branch]
-			if not current or replaces(current, head) then
+			if not current or replaces(current, head, branch) then
 				into[branch] = head
 				changed = true
 			end
 		end
 	end
 	return changed
+end
+
+-- 0.3: a prod branch whose MemoryStore head isn't signed (when we hold no signed one either): read the durable copy too.
+local function needsDurable(heads: any): boolean
+	if not trust or typeof(heads) ~= "table" then
+		return false
+	end
+	for branch, head in heads do
+		if typeof(branch) == "string" and trustOf(branch, head) == "untrusted" and trustOf(branch, storedHeads[branch]) ~= "trusted" then
+			return true
+		end
+	end
+	return false
 end
 
 -- Re-reads all heads (yields): MemoryStore, else DataStore. At most once per `maxAge` seconds (default 15).
@@ -253,8 +313,11 @@ function Registry.refreshHeads(maxAge: number?)
 		return getMemory():GetAsync(HEADS_KEY)
 	end)
 	if ok and typeof(value) == "table" then
+		local durableToo = needsDurable(value)
 		mergeHeads(storedHeads, value)
-		return
+		if not durableToo then
+			return
+		end
 	end
 	local durableOk, durable = pcall(function()
 		return getStore():GetAsync(HEADS_KEY)
@@ -285,7 +348,7 @@ end
 
 function Registry.saveHead(branch: string, head)
 	local current = storedHeads[branch]
-	if current and not replaces(current, head) then
+	if current and not replaces(current, head, branch) then
 		return
 	end
 	storedHeads[branch] = head
@@ -295,7 +358,7 @@ function Registry.saveHead(branch: string, head)
 			getMemory():UpdateAsync(HEADS_KEY, function(existing)
 				local heads = if typeof(existing) == "table" then existing else {}
 				local stored = heads[branch]
-				if not replaces(stored, head) then
+				if not replaces(stored, head, branch) then
 					won = false
 					return nil -- another server already stored this deploy (or a newer one)
 				end
@@ -312,7 +375,7 @@ function Registry.saveHead(branch: string, head)
 			getStore():UpdateAsync(HEADS_KEY, function(existing)
 				local heads = if typeof(existing) == "table" then existing else {}
 				local stored = heads[branch]
-				if not replaces(stored, head) then
+				if not replaces(stored, head, branch) then
 					return nil
 				end
 				heads[branch] = head
@@ -332,9 +395,19 @@ function Registry.storedBranches(): { string }
 	return names
 end
 
-function Registry.branchHead(name: string)
+-- The branch's head: the newer of the ConfigService head and the stored head. 0.3: with `accept`, only heads it
+-- accepts count (prod servers pass a check for signed prod heads).
+function Registry.branchHead(name: string, accept: ((any) -> boolean)?)
 	local fromConfig = Registry.state().branches[name]
 	local fromStore = storedHeads[name]
+	if accept then
+		if fromConfig and not (isHead(fromConfig) and accept(fromConfig)) then
+			fromConfig = nil
+		end
+		if fromStore and not (isHead(fromStore) and accept(fromStore)) then
+			fromStore = nil
+		end
+	end
 	if fromConfig and fromStore then
 		local storeSeq, configSeq = fromStore.seq or 0, fromConfig.seq or 0
 		-- 0.2.3: the same deploy from a message carries its rollout %; a config head without one would undo it.
@@ -342,6 +415,13 @@ function Registry.branchHead(name: string)
 		return if storeSeq > configSeq or sameWithRollout then fromStore else fromConfig
 	end
 	return fromConfig or fromStore
+end
+
+-- 0.3: both candidate heads of a branch (ConfigService, stored), either may be nil.
+function Registry.headCandidates(name: string): (any?, any?)
+	local fromConfig = Registry.state().branches[name]
+	local fromStore = storedHeads[name]
+	return if isHead(fromConfig) then fromConfig else nil, if isHead(fromStore) then fromStore else nil
 end
 
 function Registry.channelOf(branch: string): string
@@ -415,6 +495,11 @@ local function cleanDeployment(entry): any?
 		at = if typeof(entry.at) == "string" then entry.at else nil,
 		rollback = if entry.rollback == true or entry.action == "rollback" then true else nil,
 		rollout = if typeof(entry.rollout) == "number" and entry.rollout >= 1 and entry.rollout < 100 then entry.rollout else nil,
+		-- 0.3: what the signatures cover (t) and the signatures, so prod servers can check an entry before a pin, and
+		-- the dev menu can show verified badges.
+		t = if typeof(entry.t) == "number" then entry.t else nil,
+		sig = if typeof(entry.sig) == "string" and #entry.sig <= 100 then entry.sig else nil,
+		sigF = if typeof(entry.sigF) == "string" and #entry.sigF <= 100 then entry.sigF else nil,
 	}
 end
 

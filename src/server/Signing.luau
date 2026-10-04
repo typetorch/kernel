@@ -22,6 +22,7 @@
 -- parts run under Lune: scripts/test-ed25519.luau and scripts/test-signing.luau.
 
 local Ed25519 = require("./vendor/ed25519/Ed25519")
+local SHA256 = require("./vendor/ed25519/SHA256")
 
 local Signing = {}
 
@@ -148,6 +149,11 @@ function Signing.pinCanonical(fields): (string?, string?)
 	return table.concat({ PIN_TAG, jobs, pct, a, b, by, t, unpin }, "\n"), nil
 end
 
+-- A key's short fingerprint: the first 8 hex digits of the SHA-256 of its raw 32 bytes (the CLI prints the same).
+function Signing.fingerprint(key: buffer): string
+	return string.sub((SHA256(key)), 1, 8)
+end
+
 -- Trust roots and the key asset -------------------------------------------------------------------------------------
 
 local keyAssetId: number? = nil
@@ -165,15 +171,25 @@ local loadedAt: number? = nil -- unix seconds
 local lastReadAt = -math.huge -- clock of the last read attempt
 local lastReadOk: boolean? = nil
 local lastReadError: string? = nil
+local lastReadErrorAt: number? = nil -- unix seconds
+local lastHintAt: number? = nil -- unix seconds of the last rekey hint heard
 local reads = 0
 local changes: { any } = {} -- newest last, at most 10
 local invalidKeys: { string } = {}
 local fallbackRevoked = false
 local hintPending = false
+local fingerprints: { [string]: string } = {} -- base64 text -> fingerprint
+
+-- A rekey hint within this many seconds before a detected change marks it as "hinted" (likely the user's rotation:
+-- `typetorch keys rotate` sends one). Hints are unsigned, so this is a hint for people, not a security check.
+local HINT_WINDOW = 900
 
 -- Verify results by message, so re-checking the same stored head every poll costs nothing. Cleared on key changes.
 local verdicts: { [string]: { ok: boolean, why: string?, by: string? } } = {}
 local verdictCount = 0
+-- Signing.signatures results (dev menu badges), same lifetime as the verdicts.
+local badgeCache: { [string]: any } = {}
+local badgeCount = 0
 
 -- Injected for Lune tests; Roblox defaults in Signing.init.
 local hooks = {
@@ -212,6 +228,7 @@ function Signing.init(folder)
 		local decoded = Signing.base64Decode(text)
 		if decoded and buffer.len(decoded) == 32 then
 			fallbackKey, fallbackText = decoded, text
+			fingerprints[text] = Signing.fingerprint(decoded)
 		else
 			configError = "FallbackPublicKey is not base64 of a 32-byte key"
 		end
@@ -233,6 +250,7 @@ local function parseKeys(text: string)
 				local raw = buffer.tostring(decoded)
 				if not seen[raw] then
 					seen[raw] = true
+					fingerprints[trimmed] = fingerprints[trimmed] or Signing.fingerprint(decoded)
 					table.insert(keys, { bytes = decoded, text = trimmed })
 				end
 			else
@@ -278,7 +296,15 @@ local function sameList(a: { string }, b: { string }): boolean
 	return true
 end
 
-local function adopt(result)
+local function fingerprintsOf(texts: { string }): { string }
+	local list = {}
+	for index, text in texts do
+		list[index] = fingerprints[text] or "?"
+	end
+	return list
+end
+
+local function adopt(result, reason: string)
 	local publicKeys, invalidPublic = parseKeys(result.publicKeys or "")
 	local revoked, invalidRevoked = parseKeys(result.revokedKeys or "")
 	local newRevokedSet = {}
@@ -294,36 +320,44 @@ local function adopt(result)
 	local newPublic, newRevoked = textsOf(publicKeys), textsOf(revoked)
 	local changed = not loaded or not sameList(newPublic, publicTexts) or not sameList(newRevoked, revokedTexts)
 	if loaded and changed then
-		-- Detection (user decision 5): a rotation the user didn't do shows up here, in the events and in status().
+		-- Detection (user decision 5): a rotation the user didn't do shows up here, in the events and in keys().
+		local now = hooks.unixNow()
 		local change = {
-			at = hooks.unixNow(),
+			at = now,
+			reason = reason,
+			-- A rekey hint came shortly before (likely the user's own `typetorch keys rotate`).
+			hinted = lastHintAt ~= nil and now - lastHintAt <= HINT_WINDOW,
 			version = result.version,
 			previousVersion = loadedVersion,
 			added = difference(newPublic, publicTexts),
 			removed = difference(publicTexts, newPublic),
 			revokedAdded = difference(newRevoked, revokedTexts),
 			revokedRemoved = difference(revokedTexts, newRevoked),
+			before = { publicKeys = fingerprintsOf(publicTexts), revokedKeys = fingerprintsOf(revokedTexts) },
+			after = { publicKeys = fingerprintsOf(newPublic), revokedKeys = fingerprintsOf(newRevoked) },
 		}
 		table.insert(changes, change)
 		while #changes > 10 do
 			table.remove(changes, 1)
 		end
 		hooks.warn(
-			`[TypeTorch] the key asset {keyAssetId} CHANGED (version {loadedVersion or "?"} -> {result.version or "?"}): public keys +{#change.added} -{#change.removed}, revoked +{#change.revokedAdded} -{#change.revokedRemoved}. If you did not rotate keys, check who can edit asset {keyAssetId}.`
+			`[TypeTorch] the key asset {keyAssetId} CHANGED (version {loadedVersion or "?"} -> {result.version or "?"}{if change.hinted then ", after a rekey hint" else ", NO rekey hint"}): public keys [{table.concat(change.before.publicKeys, " ")}] -> [{table.concat(change.after.publicKeys, " ")}], revoked [{table.concat(change.before.revokedKeys, " ")}] -> [{table.concat(change.after.revokedKeys, " ")}]. If you did not rotate keys, check who can edit asset {keyAssetId}.`
 		)
 		hooks.logEvent({
 			action = "keys_changed",
 			keyAssetId = keyAssetId,
+			reason = reason,
+			hinted = change.hinted,
 			version = result.version,
 			previousVersion = loadedVersion,
-			added = change.added,
-			removed = change.removed,
-			revokedAdded = change.revokedAdded,
-			revokedRemoved = change.revokedRemoved,
+			before = change.before,
+			after = change.after,
 		})
 	end
 	if changed then
 		table.clear(verdicts)
+		table.clear(badgeCache)
+		badgeCount = 0
 		verdictCount = 0
 	end
 	activeKeys = active
@@ -378,12 +412,12 @@ function Signing.refresh(reason: string): (boolean, boolean)
 	end
 	if not ok then
 		lastReadOk = false
-		lastReadError = tostring(result)
+		lastReadError = string.sub(tostring(result), 1, 160)
+		lastReadErrorAt = hooks.unixNow()
 		hooks.warn(`[TypeTorch] key asset {keyAssetId} read failed ({reason}): {lastReadError}; keeping the {if loaded then "last good keys" else "fallback key"}`)
 		return true, false
 	end
 	lastReadOk = true
-	lastReadError = nil
 	if result.unchanged and loaded then
 		loadedAt = hooks.unixNow()
 		return true, false
@@ -391,10 +425,16 @@ function Signing.refresh(reason: string): (boolean, boolean)
 	if typeof(result.publicKeys) ~= "string" then
 		lastReadOk = false
 		lastReadError = "no PublicKeys attribute"
+		lastReadErrorAt = hooks.unixNow()
 		hooks.warn(`[TypeTorch] key asset {keyAssetId} has no PublicKeys attribute; keeping the {if loaded then "last good keys" else "fallback key"}`)
 		return true, false
 	end
-	return true, adopt(result)
+	return true, adopt(result, reason)
+end
+
+-- The kernel heard a rekey hint (TypeTorch/rekey). Remembered so a change right after it reads as a planned rotation.
+function Signing.noteHint()
+	lastHintAt = hooks.unixNow()
 end
 
 -- A rekey hint arrived inside the rate-limit window: the kernel should call refresh("hint") again once it opens.
@@ -461,6 +501,8 @@ function Signing.verify(canonical: string, sig: any, sigF: any): (boolean, strin
 	end
 	if verdictCount > 256 then
 		table.clear(verdicts)
+		table.clear(badgeCache)
+		badgeCount = 0
 		verdictCount = 0
 	end
 	verdicts[memoKey] = { ok = ok, why = why, by = by }
@@ -484,6 +526,58 @@ function Signing.verifyHead(branch: string, head): (boolean, string?, string?)
 	return Signing.verifyDeploy(Signing.headFields(branch, head), head.sig, head.sigF)
 end
 
+-- For the dev menu's verified badges (0.3): each signature checked on its own, whatever the acceptance rule above.
+-- `main`: `sig` against PublicKeys minus RevokedKeys (false until the key asset has loaded here); `fallback`: `sigF`
+-- against FallbackPublicKey (false without one, or when the key asset revokes it). nil when neither signature is
+-- there (dev deploys). Cached with the verify results.
+
+function Signing.signatures(canonical: string?, sig: any, sigF: any): { main: boolean, fallback: boolean }?
+	if sig == nil and sigF == nil then
+		return nil
+	end
+	if not canonical then
+		return { main = false, fallback = false }
+	end
+	local memoKey = `{canonical}\0{tostring(sig)}\0{tostring(sigF)}`
+	local cached = badgeCache[memoKey]
+	if cached then
+		return table.clone(cached)
+	end
+	local message = buffer.fromstring(canonical)
+	local main = false
+	local signature = if loaded then signatureBytes(sig) else nil
+	if signature then
+		for _, key in activeKeys do
+			if Ed25519.verify(message, key.bytes, signature) then
+				main = true
+				break
+			end
+		end
+	end
+	local fallback = false
+	local fallbackSignature = signatureBytes(sigF)
+	if fallbackKey and not fallbackRevoked and fallbackSignature then
+		fallback = Ed25519.verify(message, fallbackKey, fallbackSignature)
+	end
+	if badgeCount > 512 then
+		table.clear(badgeCache)
+		badgeCount = 0
+	end
+	local result = { main = main, fallback = fallback }
+	badgeCache[memoKey] = result
+	badgeCount += 1
+	return table.clone(result)
+end
+
+-- `verified` for a deployment entry or head on `branch` ({assetId, artifactId, seq, commit, channel, t, rollback?,
+-- sig?, sigF?}).
+function Signing.headSignatures(branch: string, head): { main: boolean, fallback: boolean }?
+	if typeof(head) ~= "table" then
+		return nil
+	end
+	return Signing.signatures((Signing.deployCanonical(Signing.headFields(branch, head))), head.sig, head.sigF)
+end
+
 function Signing.verifyPin(data): (boolean, string?, string?)
 	local canonical, why = Signing.pinCanonical(data)
 	if not canonical then
@@ -502,28 +596,69 @@ function Signing.loaded(): boolean
 end
 
 -- For status() and, later, heartbeats.
-function Signing.status()
-	local list = {}
-	for index, change in changes do
-		list[index] = table.clone(change)
+local function keyRows(texts: { string }, markRevoked: boolean)
+	local rows = {}
+	for index, text in texts do
+		local decoded = Signing.base64Decode(text)
+		rows[index] = {
+			key = text,
+			fingerprint = fingerprints[text] or "?",
+			revoked = if markRevoked and decoded and revokedSet[buffer.tostring(decoded)] then true else nil,
+		}
 	end
+	return rows
+end
+
+local function deepClone(value)
+	if typeof(value) ~= "table" then
+		return value
+	end
+	local copy = {}
+	for key, inner in value do
+		copy[key] = deepClone(inner)
+	end
+	return copy
+end
+
+-- The trust state for devs (api:keys(), the dev menu's Artifact > Signing). Public keys aren't secret.
+--   mode: "key asset" (sig against PublicKeys minus RevokedKeys), "fallback only" (sigF against the baked key, until
+--   the key asset loads) or "none" (no trust root: prod servers refuse everything).
+function Signing.keys()
 	return {
 		keyAssetId = keyAssetId,
-		fallbackPublicKey = fallbackText,
-		fallbackRevoked = fallbackRevoked or nil,
-		configError = configError,
 		loaded = loaded,
-		mode = if loaded then "sig" elseif fallbackKey then "sigF" else "none",
+		mode = if loaded then "key asset" elseif fallbackKey then "fallback only" else "none",
 		version = loadedVersion,
-		loadedAt = loadedAt,
-		publicKeys = table.clone(publicTexts),
-		revokedKeys = table.clone(revokedTexts),
+		loadedAt = loadedAt, -- last successful read (unix s)
+		lastReadOk = lastReadOk,
+		lastError = lastReadError, -- last failed read, short (kept after later successes; see lastErrorAt)
+		lastErrorAt = lastReadErrorAt,
+		reads = reads,
+		configError = configError,
+		publicKeys = keyRows(publicTexts, true), -- { key, fingerprint, revoked? }
+		revokedKeys = keyRows(revokedTexts, false),
 		trusted = #activeKeys,
 		invalid = if #invalidKeys > 0 then table.clone(invalidKeys) else nil,
-		reads = reads,
+		fallback = if fallbackText
+			then { key = fallbackText, fingerprint = fingerprints[fallbackText] or "?", revoked = fallbackRevoked }
+			else nil,
+		lastHintAt = lastHintAt,
+		lastChange = if #changes > 0 then deepClone(changes[#changes]) else nil, -- { at, reason, hinted, before, after, ... }
+		changes = #changes,
+	}
+end
+
+-- A small summary for status() (polled often by the dev menu).
+function Signing.summary()
+	local last = changes[#changes]
+	return {
+		mode = if loaded then "key asset" elseif fallbackKey then "fallback only" else "none",
+		loaded = loaded,
+		trusted = #activeKeys,
+		fallbackRevoked = fallbackRevoked or nil,
+		lastChangeAt = if last then last.at else nil,
+		lastChangeHinted = if last then last.hinted else nil,
 		lastReadOk = lastReadOk,
-		lastReadError = lastReadError,
-		changes = list,
 	}
 end
 
@@ -533,7 +668,11 @@ function Signing._reset()
 	loaded, activeKeys, publicTexts, revokedTexts, revokedSet = false, {}, {}, {}, {}
 	loadedVersion, loadedAt, lastReadAt, lastReadOk, lastReadError = nil, nil, -math.huge, nil, nil
 	reads, changes, invalidKeys, fallbackRevoked, hintPending = 0, {}, {}, false, false
+	lastReadErrorAt, lastHintAt = nil, nil
+	table.clear(fingerprints)
 	table.clear(verdicts)
+	table.clear(badgeCache)
+	badgeCount = 0
 	verdictCount = 0
 end
 
