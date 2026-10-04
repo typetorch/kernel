@@ -10,8 +10,9 @@
 --         branches = { [name] = { artifactId, assetId, channel, commit, commitHash, seq, deployedAt, by } },
 --         deployments = { newest last, at most 25 } }
 --   * In-game DataStore "TypeTorch" for what game servers write themselves (no Open Cloud scope needed):
---       head/<branch>              { assetId, artifactId, seq, commit, channel, deployedAt }  (from deploy messages;
---                                  the fallback registry when ConfigService isn't written; higher seq wins)
+--       heads                      { [branch] = { assetId, artifactId, seq, commit, channel, deployedAt } } (from deploy
+--                                  messages; the fallback registry when ConfigService isn't written; higher seq wins;
+--                                  mirrored in MemoryStore HashMap "TypeTorch" for polling; see "Branch heads" below)
 --       private/<PrivateServerId>  { branch, setBy, setAt, pin? }   (private and reserved servers' branch; `pin` =
 --                                  { assetId, artifactId, seq, commit, channel, branch, headSeq } boots that artifact
 --                                  until the branch gets a deploy newer than headSeq)
@@ -169,11 +170,23 @@ function Registry.onChange(fn)
 	table.insert(listeners, fn)
 end
 
--- Branch heads persisted by game servers from deploy messages (in-game DataStore, key "head/<branch>"). This keeps the
--- system working when the CLI can't write ConfigService (missing `universe:write` scope): every server that receives a
--- deploy message records the head, so servers started later still boot the right artifact. The head with the higher
--- seq wins between the two sources.
+-- Branch heads persisted by game servers from deploy messages. This keeps the system working when the CLI can't write
+-- ConfigService (missing `universe:write` scope): every server that receives a deploy message records the head, so
+-- servers started later still boot the right artifact. The head with the higher seq wins between the sources.
+--
+-- All heads live in ONE key, { [branch] = head }, so a read is one request and listing branches needs no ListKeysAsync
+-- (its budget is a few calls per minute per server; the dev menu used to hit it on every Branch tab load):
+--   * MemoryStore HashMap "TypeTorch", key "heads": the fast copy every server polls (universe-wide quota, cheap);
+--   * DataStore "TypeTorch", key "heads": the durable copy (MemoryStore entries expire), read when MemoryStore has
+--     nothing or fails. Kernel 0.2.0's per-branch "head/<branch>" keys are read once at boot as a migration fallback.
+-- Writes: the server whose MemoryStore update wins (seq newer than what's stored) also writes the DataStore copy, so a
+-- deploy costs one durable write however many servers hear the message.
 local storedHeads: { [string]: any } = {}
+local headsReadAt = -math.huge
+local HEADS_KEY = "heads"
+local HEADS_TTL = 45 * 24 * 3600 -- MemoryStore maximum
+
+local memoryHeads: MemoryStoreHashMap? = nil
 
 local function getStore(): DataStore
 	if not store then
@@ -182,13 +195,72 @@ local function getStore(): DataStore
 	return store :: DataStore
 end
 
-function Registry.refreshStoredHead(branch: string)
+local function getMemory(): MemoryStoreHashMap
+	if not memoryHeads then
+		memoryHeads = game:GetService("MemoryStoreService"):GetHashMap(Constants.DATASTORE)
+	end
+	return memoryHeads :: MemoryStoreHashMap
+end
+
+local function isHead(value): boolean
+	return typeof(value) == "table" and typeof(value.assetId) == "number"
+end
+
+-- Keeps the newer head per branch (by seq) from a { [branch] = head } table.
+local function mergeHeads(into: { [string]: any }, from: any): boolean
+	if typeof(from) ~= "table" then
+		return false
+	end
+	local changed = false
+	for branch, head in from do
+		if typeof(branch) == "string" and isHead(head) then
+			local current = into[branch]
+			if not current or (head.seq or 0) > (current.seq or 0) then
+				into[branch] = head
+				changed = true
+			end
+		end
+	end
+	return changed
+end
+
+-- Re-reads all heads (yields): MemoryStore, else DataStore. At most once per `maxAge` seconds (default 15).
+function Registry.refreshHeads(maxAge: number?)
+	if os.clock() - headsReadAt < (maxAge or 15) then
+		return
+	end
+	headsReadAt = os.clock()
+	local ok, value = pcall(function()
+		return getMemory():GetAsync(HEADS_KEY)
+	end)
+	if ok and typeof(value) == "table" then
+		mergeHeads(storedHeads, value)
+		return
+	end
+	local durableOk, durable = pcall(function()
+		return getStore():GetAsync(HEADS_KEY)
+	end)
+	if durableOk then
+		mergeHeads(storedHeads, durable)
+	end
+end
+
+-- Kernel 0.2.0 stored one key per branch; read this branch's old key once (boot only).
+function Registry.migrateLegacyHead(branch: string)
+	if storedHeads[branch] then
+		return
+	end
 	local ok, value = pcall(function()
 		return getStore():GetAsync("head/" .. branch)
 	end)
-	if ok and typeof(value) == "table" and typeof(value.assetId) == "number" then
+	if ok and isHead(value) then
 		storedHeads[branch] = value
 	end
+end
+
+-- The stored head of `branch`, refreshed when older than `maxAge` seconds (default 15). Yields when it refreshes.
+function Registry.refreshStoredHead(branch: string, maxAge: number?)
+	Registry.refreshHeads(maxAge)
 	return storedHeads[branch]
 end
 
@@ -199,32 +271,45 @@ function Registry.saveHead(branch: string, head)
 	end
 	storedHeads[branch] = head
 	task.spawn(function()
-		pcall(function()
-			getStore():UpdateAsync("head/" .. branch, function(existing)
-				if typeof(existing) == "table" and (existing.seq or 0) >= (head.seq or 0) then
-					return nil -- keep the newer one already stored
+		local won = false
+		local memoryOk = pcall(function()
+			getMemory():UpdateAsync(HEADS_KEY, function(existing)
+				local heads = if typeof(existing) == "table" then existing else {}
+				local stored = heads[branch]
+				if isHead(stored) and (stored.seq or 0) >= (head.seq or 0) then
+					won = false
+					return nil -- another server already stored this deploy (or a newer one)
 				end
-				return head
+				heads[branch] = head
+				won = true
+				return heads
+			end, HEADS_TTL)
+		end)
+		-- Lost the race: the winner writes the durable copy. MemoryStore down: write it ourselves.
+		if memoryOk and not won then
+			return
+		end
+		pcall(function()
+			getStore():UpdateAsync(HEADS_KEY, function(existing)
+				local heads = if typeof(existing) == "table" then existing else {}
+				local stored = heads[branch]
+				if isHead(stored) and (stored.seq or 0) >= (head.seq or 0) then
+					return nil
+				end
+				heads[branch] = head
+				return heads
 			end)
 		end)
 	end)
 end
 
--- Branch names with a stored head (ListKeysAsync over "head/"). Yields; for the dev menu.
+-- Branch names with a stored head. Yields when the cached heads are older than 30 s; for the dev menu.
 function Registry.storedBranches(): { string }
+	Registry.refreshHeads(30)
 	local names = {}
-	pcall(function()
-		local pages = getStore():ListKeysAsync("head/", 50)
-		while true do
-			for _, key in pages:GetCurrentPage() do
-				table.insert(names, string.sub(key.KeyName, 6))
-			end
-			if pages.IsFinished then
-				break
-			end
-			pages:AdvanceToNextPageAsync()
-		end
-	end)
+	for name in storedHeads do
+		table.insert(names, name)
+	end
 	return names
 end
 
@@ -363,9 +448,9 @@ local function storedList(value): { any }
 	return if typeof(value) == "table" and typeof(value.list) == "table" then value.list else {}
 end
 
--- Re-reads the stored list (yields; at most once per `maxAge` seconds, default 10).
+-- Re-reads the stored list (yields; at most once per `maxAge` seconds, default 30).
 function Registry.refreshDeployments(maxAge: number?)
-	if os.clock() - deploymentsReadAt < (maxAge or 10) then
+	if os.clock() - deploymentsReadAt < (maxAge or 30) then
 		return
 	end
 	local ok, value = pcall(function()

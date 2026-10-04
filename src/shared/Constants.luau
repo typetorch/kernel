@@ -4,7 +4,7 @@
 return {
 	-- Bump only when the kernel <-> framework contract changes (artifacts declare the API they need).
 	KERNEL_API = 1,
-	KERNEL_VERSION = "0.2.0",
+	KERNEL_VERSION = "0.2.1",
 
 	-- Interim registry (until the backend exists): a DataStore written by the CLI through Open Cloud.
 	DATASTORE = "TypeTorch",

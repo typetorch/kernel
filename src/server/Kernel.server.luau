@@ -463,17 +463,14 @@ local function requireDev(player: Player?): (boolean, string?)
 	return true, nil
 end
 
--- Known branch names (registry + stored heads); refreshes the stored heads it finds. Yields.
+-- Known branch names (registry + stored heads, cached for 30 s). Yields when the cache is stale.
 local function knownBranches(): { string }
 	local names = {}
 	for name in Registry.state().branches do
 		names[name] = true
 	end
 	for _, name in Registry.storedBranches() do
-		if not names[name] then
-			Registry.refreshStoredHead(name)
-			names[name] = true
-		end
+		names[name] = true
 	end
 	if myBranch then
 		names[myBranch] = true
@@ -640,7 +637,7 @@ local function pinArtifact(player: Player?, assetId: number)
 	if kind == "public" and player and not Access.isAdmin(player) then
 		return { ok = false, error = "only the owner or admins can pin a public server" }
 	end
-	Registry.refreshStoredHead(myBranch)
+	Registry.refreshStoredHead(myBranch, 3)
 	local entry = findArtifact(assetId, myBranch)
 	if not entry then
 		return { ok = false, error = `asset {assetId} is not a known deployment` }
@@ -698,7 +695,7 @@ local function switchBranch(player: Player?, branch: string)
 	if kind == "public" then
 		return { ok = false, error = "public servers always run the default branch; use /tt new <branch>" }
 	end
-	Registry.refreshStoredHead(branch)
+	Registry.refreshStoredHead(branch, 3)
 	local head = Registry.branchHead(branch)
 	if not head then
 		return { ok = false, error = `no artifact on branch {branch}` }
@@ -728,7 +725,7 @@ local function newServer(player: Player, branch: string, assetId: number?)
 	if assetId ~= nil and typeof(assetId) ~= "number" then
 		return { ok = false, error = "bad asset id" }
 	end
-	Registry.refreshStoredHead(branch)
+	Registry.refreshStoredHead(branch, 3)
 	local pin = nil
 	if assetId ~= nil then
 		local entry = findArtifact(assetId, branch)
@@ -912,7 +909,8 @@ task.spawn(function()
 	end
 end)
 
-Registry.refreshStoredHead(myBranch)
+Registry.refreshStoredHead(myBranch, 0)
+Registry.migrateLegacyHead(myBranch)
 -- A stored pin (newServer with an artifact, or a pin on this private server) wins until the branch moves past it.
 local bootHead = Registry.branchHead(myBranch)
 if bootPin and (not bootHead or (bootHead.seq or 0) <= (bootPin.headSeq or 0)) then
@@ -935,7 +933,7 @@ end
 task.spawn(function()
 	while true do
 		task.wait(Constants.POLL_SECONDS)
-		Registry.refreshStoredHead(myBranch)
+		Registry.refreshStoredHead(myBranch, 0)
 		followHead("poll", true)
 	end
 end)
