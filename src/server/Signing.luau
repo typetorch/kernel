@@ -282,10 +282,15 @@ function Signing.bootstrapHead(branch: string)
 	return if entry then table.clone(entry) else nil
 end
 
--- Whether `head` is exactly `branch`'s bootstrap head (same asset and seq): the only unsigned head a prod server takes.
+-- Whether `head` is exactly `branch`'s bootstrap head (same asset, seq and, when the entry has one, artifact id; plans/03
+-- "Bootstrap heads"): the only unsigned head a prod server takes.
 function Signing.matchesBootstrap(branch: string, head): boolean
 	local entry = bootstrapHeads[branch]
-	return entry ~= nil and typeof(head) == "table" and head.assetId == entry.assetId and head.seq == entry.seq
+	return entry ~= nil
+		and typeof(head) == "table"
+		and head.assetId == entry.assetId
+		and head.seq == entry.seq
+		and (entry.artifactId == nil or head.artifactId == entry.artifactId)
 end
 
 -- Parses "k1, k2,k3" into (keys {bytes,text}, invalid texts).

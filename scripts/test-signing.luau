@@ -304,13 +304,55 @@ return function(check: (string, boolean) -> (), helpers)
 	local boot = Signing.bootstrapHead("prod")
 	check("bootstrap parsed", boot ~= nil and boot.assetId == 1001 and boot.seq == 10 and boot.artifactId == "aaaaaaa-111111")
 	check("bootstrap: a bad entry is reported, the good one kept", Signing.keys().configError ~= nil and Signing.keys().bootstrap.prod ~= nil and Signing.keys().bootstrap.bad == nil)
-	check("bootstrap match (branch, asset, seq)", Signing.matchesBootstrap("prod", { assetId = 1001, seq = 10 }))
+	check("bootstrap match (branch, asset, seq, artifact)", Signing.matchesBootstrap("prod", { assetId = 1001, seq = 10, artifactId = "aaaaaaa-111111" }))
+	check("bootstrap: another artifact id doesn't match", not Signing.matchesBootstrap("prod", { assetId = 1001, seq = 10, artifactId = "zzz" }))
 	check("bootstrap: another seq doesn't match", not Signing.matchesBootstrap("prod", { assetId = 1001, seq = 11 }))
 	check("bootstrap: another asset doesn't match", not Signing.matchesBootstrap("prod", { assetId = 1002, seq = 10 }))
 	check("bootstrap: another branch doesn't match", not Signing.matchesBootstrap("dev", { assetId = 1001, seq = 10 }))
 	Signing._reset()
 	Signing.init(folder({ BootstrapHeads = "not json" }), decodeJson)
 	check("bootstrap: bad JSON is reported", Signing.keys().configError ~= nil and Signing.bootstrapHead("prod") == nil)
+
+	-- plans/03 "Pin test vectors" (written by the CLI agent from cli/src/signing.ts): an independent cross-check of the
+	-- tt1pin canonical string and the strict rule.
+	local cliPins = {
+		{
+			fields = { j = { "5f0c1a2b-0000-4000-8000-000000000001", "5f0c1a2b-0000-4000-8000-000000000002" }, a = 134192491895548, b = "prod", by = 12345, t = 1759580240000 },
+			canonical = "tt1pin\nprod\n134192491895548\n5f0c1a2b-0000-4000-8000-000000000001,5f0c1a2b-0000-4000-8000-000000000002\n\n12345\n1759580240000\n",
+			sig = "h3gbOZ3rrFWZA7u/7RdBf8VmwaPzahnR6r5E1Tx67MUWgbruDpZpER1iosmQdfvbfXwAfwPwfiUil9xTY2g+Cg==",
+			sigF = "4VDOk9Uvr2fA6gBZaBnR5cNdnSQCFm/eXlO6HPapckNEAu0RfdHLbG9/ppmhJowp7p9RMe3u0xAtljUjuIQrAQ==",
+		},
+		{
+			fields = { pct = 10, a = 134192491895548, b = "prod", by = 12345, t = 1759580300000 },
+			canonical = "tt1pin\nprod\n134192491895548\n\n10\n12345\n1759580300000\n",
+			sig = "/DY1Wv/FusH1mnlcPjCYR+ps4O5IvIRUyhpAjOO9WYbMYyZZMhHSBRw1fJjgmU/H+RdGJBHHtZ/BahrphqRuBw==",
+			sigF = "gkELYitaulVNd/oAVtLCfXAgJdTLwNTqlysNDU5iISPg61/6hDEnVRBqDOpzCx1SWuKWmH4yVZcKWLMrv5d7Cw==",
+		},
+		{
+			fields = { pct = 100, b = "prod", by = 12345, t = 1759580360000, unpin = true },
+			canonical = "tt1pin\nprod\n\n\n100\n12345\n1759580360000\n1",
+			sig = "ZQjBKNEzYxD4e6oms1hERX/C7KC5wG6oTk3Vu/WfWEOvrPAWeFhMyfLxNgh/ZJ2Zd7eJb6PkHvMFAE2BXoHqBg==",
+			sigF = "3eF+apTrzSXaxKfGkCVMUYPj5vkCwlA1JNf9MjZkVf4ivjTlmBiX7gZ0TIyNEBqCsbNMjnU9vfCzEFs2/5H1BQ==",
+		},
+	}
+	Signing._reset()
+	Signing.init(folder({ KeyAssetId = 99, FallbackPublicKey = FALLBACK }))
+	for index, vector in cliPins do
+		check(`CLI pin vector {index}: canonical`, Signing.pinCanonical(vector.fields) == vector.canonical)
+		local message = table.clone(vector.fields)
+		message.sigF = vector.sigF
+		check(`CLI pin vector {index}: sigF before the key asset loads`, (Signing.verifyPin(message)))
+	end
+	clock += 1000
+	nextRead = { publicKeys = MAIN, revokedKeys = "", version = 1 }
+	Signing.refresh("boot")
+	for index, vector in cliPins do
+		local message = table.clone(vector.fields)
+		message.sig = vector.sig
+		check(`CLI pin vector {index}: sig after load`, (Signing.verifyPin(message)))
+		message.sig, message.sigF = nil, vector.sigF
+		check(`CLI pin vector {index}: sigF alone after load refused`, not (Signing.verifyPin(message)))
+	end
 
 	-- Dev menu badges: each signature on its own.
 	Signing._reset()
