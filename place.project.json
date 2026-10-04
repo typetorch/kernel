@@ -42,7 +42,8 @@
 				"$className": "Folder",
 				"$attributes": {
 					"KeyAssetId": "",
-					"FallbackPublicKey": ""
+					"FallbackPublicKey": "",
+					"BootstrapHeads": ""
 				},
 				"Kernel": { "$path": "src/server/Kernel.server.luau" },
 				"Api": { "$path": "src/server/Api.luau" },
