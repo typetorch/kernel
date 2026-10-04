@@ -1,6 +1,6 @@
 {
 	"name": "@typetorch/kernel",
-	"version": "0.2.0",
+	"version": "0.2.2",
 	"description": "TypeTorch kernel: the small Luau loader baked into the place (boot, branches, hot swaps, stable remotes, /tt).",
 	"license": "MIT",
 	"repository": {
@@ -10,7 +10,7 @@
 	"publishConfig": {
 		"access": "public"
 	},
-	"files": ["src", "place.project.json", "README.md", "LICENSE"],
+	"files": ["src", "scripts", "place.project.json", "rokit.toml", "README.md", "LICENSE"],
 	"typetorch": {
 		"kernelApi": 1,
 		"placeProject": "place.project.json"
