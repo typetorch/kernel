@@ -100,4 +100,8 @@ function Transport.kernelSend(player: Player, channel: string, ...)
 	net:FireClient(player, "*", channel, ...)
 end
 
+function Transport.kernelBroadcast(channel: string, ...)
+	net:FireAllClients("*", channel, ...)
+end
+
 return Transport

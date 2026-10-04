@@ -9,7 +9,7 @@ local Api = {}
 local persistStore: { [string]: any } = {}
 local entries: { [Script]: any } = {}
 local services = nil -- set by the kernel: { Access, Transport, Logs, status, branchList, artifacts, reload, rollback,
--- switchBranch, pinArtifact, newServer }
+-- switchBranch, pinArtifact, newServer, requestReload }
 
 function Api.init(kernelServices)
 	services = kernelServices
@@ -34,6 +34,9 @@ function Api.forEntry(entry: Script)
 		branch = generation.branch,
 		channel = generation.channel,
 		serverType = services.serverType(),
+		-- 0.2.2: { kind, reason, requestedBy?, previous?, branchChanged, startedAt, loadSeconds, stopSeconds?,
+		-- swapSeconds? }. The kernel's own table: it adds swapSeconds once the swap finished.
+		start = generation.start,
 	}
 
 	-- State that survives swaps. Plain data or kernel-owned handles only.
@@ -101,6 +104,25 @@ function Api.forEntry(entry: Script)
 	-- `assetId` (0.2.0+): the reserved server boots pinned to that known artifact.
 	function api:newServer(player: Player, branch: string, assetId: number?)
 		return services.newServer(player, branch, assetId)
+	end
+
+	-- Kernel 0.2.2+ (additive). One handler each per generation; the framework installs them and fans out.
+	-- Whether this generation is pinned now (a pin on the running artifact sets it without a swap).
+	function api:pinned(): boolean
+		return generation.pinned == true
+	end
+	-- fn({reason, branch, artifactId?, commit?, eta, cancelled?}): a swap is coming in about `eta` s, or was called off.
+	function api:onPending(fn)
+		generation.pendingHandler = fn
+	end
+	-- fn(player, {dev, reason, role}) when a player's dev decision changes after the first one (revoked, new member).
+	function api:onDevChanged(fn)
+		generation.devHandler = fn
+	end
+	-- Reload this server to its branch head: the owner or admins only (checked by the kernel). Returns at once
+	-- ({ok, queued}); the swap runs on a kernel thread, so it survives this generation's hard stop.
+	function api:requestReload(player: Player)
+		return services.requestReload(player)
 	end
 
 	-- Entry-only (not on the TS interface).

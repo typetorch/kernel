@@ -83,6 +83,9 @@ local function notice(player: Player, text: string)
 	Transport.kernelSend(player, Constants.CHANNEL_NOTICE, text)
 end
 
+-- Last dev decision sent per player ("<dev>/<role>"), so the running generation hears about changes (0.2.2).
+local lastDev: { [Player]: string } = {}
+
 local function sendDevStatus(player: Player)
 	local dev, reason, role = Access.check(player)
 	Transport.kernelSend(player, Constants.CHANNEL_DEV, {
@@ -91,6 +94,16 @@ local function sendDevStatus(player: Player)
 		role = role,
 		channel = if current then current.channel else nil,
 	})
+	if player.Parent == nil then
+		return -- left while Access.check yielded
+	end
+	-- A change after the first decision (revoked, new member, badge granted) goes to api:onDevChanged.
+	local key = `{dev}/{role or ""}`
+	local before = lastDev[player]
+	lastDev[player] = key
+	if before ~= nil and before ~= key and current and current.devHandler then
+		task.spawn(current.devHandler, player, { dev = dev, reason = reason, role = role })
+	end
 end
 
 -- Payload loading and mounting -------------------------------------------------------------------------------------
@@ -182,6 +195,16 @@ local function mount(payload: Instance, head)
 			seq = head.seq,
 		},
 	}
+	-- 0.2.2: the artifact's identity on both trees, so the client API can report it too.
+	local artifact = generation.artifact
+	for _, tree in { serverTree, clientTree } do
+		for name, value in { AssetId = artifact.assetId, Commit = artifact.commit, CommitHash = artifact.commitHash, Branch = artifact.branch, Channel = artifact.channel, BuiltAt = artifact.builtAt, Seq = artifact.seq } do
+			local kind = typeof(value)
+			if kind == "string" or kind == "number" or kind == "boolean" then
+				tree:SetAttribute(name, value)
+			end
+		end
+	end
 	return generation
 end
 
@@ -219,12 +242,13 @@ local function startGeneration(generation): (boolean, string?)
 	return result[1], result[2]
 end
 
--- Soft stop, then hard stop. Returns seconds taken.
-local function stopGeneration(generation): number
+-- Soft stop, then hard stop. Returns seconds taken. `info` (0.2.2: {reason, branch, next}) goes to the generation's
+-- stop function, so it can tell game code what replaces it; older frameworks ignore it.
+local function stopGeneration(generation, info): number
 	local started = os.clock()
 	Transport.detach()
 	if generation.stop then
-		local ok, err = pcall(generation.stop)
+		local ok, err = pcall(generation.stop, info)
 		if not ok then
 			warn(`[TypeTorch] {generation.name} stop threw: {err}`)
 		end
@@ -244,32 +268,122 @@ local function stopGeneration(generation): number
 end
 
 local function publishActive(generation)
+	-- 0.2.2: why it started, whether it is pinned, and the server type, for the client API.
+	replicatedRoot:SetAttribute("Reason", generation.reason)
+	replicatedRoot:SetAttribute("Pinned", generation.pinned == true)
+	replicatedRoot:SetAttribute("ServerType", serverType())
 	replicatedRoot:SetAttribute("ArtifactId", generation.artifact.id)
 	replicatedRoot:SetAttribute("Branch", generation.branch)
 	replicatedRoot:SetAttribute("Channel", generation.channel)
 	replicatedRoot:SetAttribute("ActiveGeneration", generation.name)
 end
 
--- Swap to a registry head { assetId, artifactId?, seq?, ... }. Returns a report table.
+-- Swap reasons as game code sees them (api.start.reason, the stop info, pending notices). Registry and poll moves are
+-- deploys the server caught up with.
+local PUBLIC_REASONS = {
+	boot = "boot",
+	deploy = "deploy",
+	registry = "deploy",
+	poll = "deploy",
+	rollback = "rollback",
+	branch = "branch",
+	pin = "pin",
+	reload = "reload",
+	["server-rollback"] = "server_rollback",
+	["auto-rollback"] = "auto_rollback",
+}
+
+local function publicReason(reason: string): string
+	return PUBLIC_REASONS[reason] or "unknown"
+end
+
+-- Mean load + swap seconds of the last few swaps (2 s before the first one).
+local function estimateSwapSeconds(): number
+	local total, count = 0, 0
+	for index = #history, math.max(1, #history - 4), -1 do
+		local entry = history[index]
+		total += (entry.loadSeconds or 0) + (entry.swapSeconds or 0)
+		count += 1
+	end
+	return if count > 0 then total / count else 2
+end
+
+-- 0.2.2: tells the running generation (api:onPending) and every client that a swap to `head` is coming in about
+-- `delay` + the usual swap time, or that it was called off (`cancelled`).
+local function notifyPending(head, reason: string, delay: number, cancelled: boolean?)
+	local info = {
+		reason = publicReason(reason),
+		branch = myBranch,
+		artifactId = head.artifactId,
+		commit = head.commit,
+		eta = if cancelled then 0 else delay + estimateSwapSeconds(),
+		cancelled = cancelled or nil,
+	}
+	if current and current.pendingHandler then
+		task.spawn(current.pendingHandler, table.clone(info))
+	end
+	Transport.kernelBroadcast(Constants.CHANNEL_PENDING, info)
+end
+
+local lastGeneration = nil -- the last generation that started (it may be stopped now), for api.start.previous
+
+-- Swap to a registry head { assetId, artifactId?, seq?, ... }. Returns a report table. `by` is the user id that asked
+-- (dev menu, /tt, game code); `announced` means notifyPending already ran for this swap.
 local swapTo
-swapTo = function(head, reason: string)
+swapTo = function(head, reason: string, by: number?, announced: boolean?)
 	if busy then
-		pendingHead = { head = head, reason = reason }
+		pendingHead = { head = head, reason = reason, by = by }
 		return { ok = false, queued = true }
 	end
 	busy = true
 	local report = { reason = reason, assetId = head.assetId, artifactId = head.artifactId, ok = false }
 	local old = current
+	local oldStopped = false
+	if old and not announced then
+		notifyPending(head, reason, 0)
+	end
 	local ok, err = pcall(function()
 		local loadStarted = os.clock()
 		local payload = loadPayload(head.assetId)
 		report.loadSeconds = os.clock() - loadStarted
 		local generation = mount(payload, head)
+		-- 0.2.2: how this generation starts, for api.start (the kernel adds stopSeconds and swapSeconds below).
+		local previous = lastGeneration
+		generation.reason = publicReason(reason)
+		generation.start = {
+			kind = if previous then "swap" else "boot",
+			reason = generation.reason,
+			requestedBy = by,
+			previous = if previous
+				then {
+					artifact = table.clone(previous.artifact),
+					branch = previous.branch,
+					channel = previous.channel,
+					generation = previous.number,
+				}
+				else nil,
+			branchChanged = previous ~= nil and previous.branch ~= generation.branch,
+			startedAt = generation.startedAt,
+			loadSeconds = report.loadSeconds,
+		}
 
 		local swapStarted = os.clock()
 		if old then
-			report.stopSeconds = stopGeneration(old)
+			local artifact = generation.artifact
+			report.stopSeconds = stopGeneration(old, {
+				reason = generation.reason,
+				branch = generation.branch,
+				next = {
+					id = artifact.id,
+					assetId = artifact.assetId,
+					branch = artifact.branch,
+					commit = artifact.commit,
+					channel = artifact.channel,
+				},
+			})
+			oldStopped = true
 			current = nil
+			generation.start.stopSeconds = report.stopSeconds
 		end
 		generation.clientTree.Parent = clientGenerations
 		local started, startError = startGeneration(generation)
@@ -288,7 +402,10 @@ swapTo = function(head, reason: string)
 			end
 			return
 		end
+		-- Same table the generation got as api.start, so it can read the whole swap time once it is running.
+		generation.start.swapSeconds = report.swapSeconds
 		current = generation
+		lastGeneration = generation
 		table.insert(history, {
 			name = generation.name,
 			artifactId = generation.artifact.id,
@@ -311,6 +428,9 @@ swapTo = function(head, reason: string)
 		report.error = tostring(err)
 		warn(`[TypeTorch] swap failed: {err}`)
 	end
+	if not report.ok and old and not oldStopped then
+		notifyPending(head, reason, 0, true) -- load or mount failed: the old generation keeps running
+	end
 	print("[TypeTorch] swap " .. HttpService:JSONEncode(report))
 	for _, player in Players:GetPlayers() do
 		sendDevStatus(player)
@@ -318,7 +438,7 @@ swapTo = function(head, reason: string)
 	if pendingHead then
 		local next = pendingHead
 		pendingHead = nil
-		task.defer(swapTo, next.head, next.reason)
+		task.defer(swapTo, next.head, next.reason, next.by)
 	end
 	return report
 end
@@ -360,10 +480,16 @@ local function followHead(reason: string, jitter: boolean?)
 		return
 	end
 	appliedSeq = seq
+	local announced = false
 	if jitter and serverType() == "public" then
-		task.wait(math.random() * Constants.PUBLIC_JITTER_SECONDS)
+		local delay = math.random() * Constants.PUBLIC_JITTER_SECONDS
+		if current then
+			notifyPending(head, reason, delay)
+			announced = true
+		end
+		task.wait(delay)
 	end
-	swapTo(head, reason)
+	swapTo(head, reason, nil, announced)
 end
 
 Registry.onChange(function(state)
@@ -445,13 +571,18 @@ local function onDeployMessage(message)
 	end
 	print(`[TypeTorch] {if data.r then "rollback" else "deploy"} message for {data.b}: {data.i}`)
 	appliedSeq = math.max(appliedSeq, seq or appliedSeq)
+	local head = { assetId = data.a, artifactId = data.i, seq = seq, commit = data.c, channel = channel, branch = data.b, deployedAt = sentAt:ToIsoDate() }
+	local reason = if data.r then "rollback" else "deploy"
+	local announced = false
 	if serverType() == "public" then
-		task.wait(math.random() * Constants.PUBLIC_JITTER_SECONDS)
+		local delay = math.random() * Constants.PUBLIC_JITTER_SECONDS
+		if current then
+			notifyPending(head, reason, delay)
+			announced = true
+		end
+		task.wait(delay)
 	end
-	swapTo(
-		{ assetId = data.a, artifactId = data.i, seq = seq, commit = data.c, channel = channel, branch = data.b, deployedAt = sentAt:ToIsoDate() },
-		if data.r then "rollback" else "deploy"
-	)
+	swapTo(head, reason, nil, announced)
 end
 
 -- Control (dev menu, /tt) ------------------------------------------------------------------------------------------
@@ -602,7 +733,7 @@ local function reload(player: Player?)
 		end
 	end
 	appliedSeq = head.seq or appliedSeq
-	return swapTo(head, "reload")
+	return swapTo(head, "reload", if player then player.UserId else nil)
 end
 
 local function rollback(player: Player?)
@@ -617,7 +748,7 @@ local function rollback(player: Player?)
 		local entry = history[index]
 		if not current or entry.artifactId ~= current.artifact.id then
 			Registry.logEvent({ action = "server_rollback", from = current and current.artifact.id, to = entry.artifactId, by = player and player.UserId, job = game.JobId })
-			return swapTo(entry.head, "server-rollback")
+			return swapTo(entry.head, "server-rollback", if player then player.UserId else nil)
 		end
 	end
 	return { ok = false, error = "no earlier artifact on this server" }
@@ -679,9 +810,10 @@ local function pinArtifact(player: Player?, assetId: number)
 		-- Already running it: just hold it here.
 		current.pinned = true
 		current.head.pinned = true
+		replicatedRoot:SetAttribute("Pinned", true)
 		return { ok = true, generation = current.name, assetId = assetId, artifactId = current.artifact.id, pinned = true }
 	end
-	local report = swapTo(head, "pin")
+	local report = swapTo(head, "pin", if player then player.UserId else nil)
 	report.pinned = report.ok or nil
 	return report
 end
@@ -709,7 +841,28 @@ local function switchBranch(player: Player?, branch: string)
 	end
 	myBranch = branch
 	appliedSeq = head.seq or 0
-	return swapTo(head, "branch")
+	return swapTo(head, "branch", if player then player.UserId else nil)
+end
+
+-- 0.2.2: a reload that game code can offer (an admin panel). Only the owner or admins, decided here. The swap runs on
+-- a kernel thread (this BindableEvent's handler): the caller is a thread of the generation the reload stops, and the
+-- hard stop would kill it, and the swap with it, halfway through.
+local reloadRequests = Instance.new("BindableEvent")
+reloadRequests.Event:Connect(function(player: Player)
+	reload(player)
+end)
+local function requestReload(player: Player)
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then
+		return { ok = false, error = "bad player" }
+	end
+	if not Access.isAdmin(player) then
+		return { ok = false, error = "only the owner or admins can reload" }
+	end
+	if not Registry.branchHead(myBranch) then
+		return { ok = false, error = `branch {myBranch} has no artifact` }
+	end
+	reloadRequests:Fire(player)
+	return { ok = true, queued = true, reason = "reload" }
 end
 
 -- Reserves a server on `branch` and teleports the player there. With `assetId` (a known deployment), the new server
@@ -830,6 +983,7 @@ Api.init({
 	switchBranch = switchBranch,
 	pinArtifact = pinArtifact,
 	newServer = newServer,
+	requestReload = requestReload,
 })
 
 -- /tt chat commands (TextChatCommand), the fallback when a generation is broken --------------------------------------
@@ -892,6 +1046,9 @@ command.Parent = TextChatService
 
 Players.PlayerAdded:Connect(function(player)
 	task.defer(sendDevStatus, player)
+end)
+Players.PlayerRemoving:Connect(function(player)
+	lastDev[player] = nil
 end)
 
 local state, err = Registry.start()

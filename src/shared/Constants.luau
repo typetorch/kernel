@@ -4,7 +4,7 @@
 return {
 	-- Bump only when the kernel <-> framework contract changes (artifacts declare the API they need).
 	KERNEL_API = 1,
-	KERNEL_VERSION = "0.2.1",
+	KERNEL_VERSION = "0.2.2",
 
 	-- Interim registry (until the backend exists): a DataStore written by the CLI through Open Cloud.
 	DATASTORE = "TypeTorch",
@@ -26,4 +26,6 @@ return {
 	CHANNEL_NOTICE = "__tt/notice",
 	CHANNEL_DEV = "__tt/dev",
 	CHANNEL_EVENT = "__tt/event",
+	-- 0.2.2: a swap is coming ({reason, branch, artifactId, commit, eta}) or was called off ({cancelled = true}).
+	CHANNEL_PENDING = "__tt/pending",
 }

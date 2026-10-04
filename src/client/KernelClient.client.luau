@@ -55,6 +55,7 @@ local acceptArtifact = nil
 local handler = nil
 local devStatus = { dev = false }
 local eventListeners = {}
+local current = nil -- the running client generation (see Generations below)
 
 local function systemMessage(text: string)
 	local channels = TextChatService:FindFirstChild("TextChannels")
@@ -73,7 +74,16 @@ local function onClientEvent(artifactId, channel, ...)
 		elseif channel == Constants.CHANNEL_DEV then
 			local value = ...
 			if typeof(value) == "table" then
+				local before = devStatus
 				devStatus = value
+				if current and current.devHandler and (before.dev ~= value.dev or before.role ~= value.role) then
+					task.spawn(current.devHandler, table.clone(value))
+				end
+			end
+		elseif channel == Constants.CHANNEL_PENDING then
+			local info = ...
+			if typeof(info) == "table" and current and current.pendingHandler then
+				task.spawn(current.pendingHandler, info)
 			end
 		elseif channel == Constants.CHANNEL_EVENT then
 			local name = ...
@@ -113,6 +123,9 @@ ClientApi.init({
 	devStatus = function()
 		return table.clone(devStatus)
 	end,
+	pinned = function()
+		return root:GetAttribute("Pinned") == true
+	end,
 	onKernelEvent = function(fn)
 		table.insert(eventListeners, fn)
 		return function()
@@ -126,17 +139,18 @@ ClientApi.init({
 
 -- Generations -------------------------------------------------------------------------------------------------------
 local playerScripts = player:WaitForChild("PlayerScripts")
-local current = nil
+local lastGeneration = nil -- the last client generation that started, for api.start.previous
 local generationCount = 0
 local switching = false
 
-local function stopCurrent()
+-- `info` (0.2.2: {reason, branch, next}) goes to the generation's stop function; older frameworks ignore it.
+local function stopCurrent(info)
 	if not current then
 		return
 	end
 	handler = nil
 	if current.stop then
-		local ok, err = pcall(current.stop)
+		local ok, err = pcall(current.stop, info)
 		if not ok then
 			warn(`[TypeTorch] {current.name} stop threw: {err}`)
 		end
@@ -155,13 +169,43 @@ local function start(name: string)
 		return
 	end
 	generationCount += 1
+	local artifactId = tree:GetAttribute("ArtifactId") or name
+	local branch = root:GetAttribute("Branch")
+	local previous = lastGeneration
 	local generation = {
 		name = name,
-		artifactId = tree:GetAttribute("ArtifactId") or name,
-		branch = root:GetAttribute("Branch"),
+		artifactId = artifactId,
+		-- 0.2.2: the artifact identity the server put on the tree.
+		artifact = {
+			id = artifactId,
+			assetId = tree:GetAttribute("AssetId"),
+			commit = tree:GetAttribute("Commit"),
+			commitHash = tree:GetAttribute("CommitHash"),
+			branch = tree:GetAttribute("Branch"),
+			channel = tree:GetAttribute("Channel"),
+			builtAt = tree:GetAttribute("BuiltAt"),
+			seq = tree:GetAttribute("Seq"),
+		},
+		branch = branch,
 		channel = root:GetAttribute("Channel"),
+		serverType = root:GetAttribute("ServerType"),
 		number = generationCount,
 		readyEvent = Instance.new("BindableEvent"),
+		-- 0.2.2: how this client generation starts. A player's first one is a boot, whatever the server swapped for.
+		start = {
+			kind = if previous then "swap" else "boot",
+			reason = if previous then root:GetAttribute("Reason") or "unknown" else "boot",
+			previous = if previous
+				then {
+					artifact = table.clone(previous.artifact),
+					branch = previous.branch,
+					channel = previous.channel,
+					generation = previous.number,
+				}
+				else nil,
+			branchChanged = previous ~= nil and previous.branch ~= branch,
+			startedAt = os.time(),
+		},
 	}
 	local entry = template:Clone()
 	entry.Name = name
@@ -195,6 +239,7 @@ local function start(name: string)
 		return
 	end
 	current = generation
+	lastGeneration = generation
 	print(`[TypeTorch] client running {name} ({math.floor((os.clock() - started) * 1000)} ms)`)
 end
 
@@ -209,7 +254,13 @@ local function follow()
 		if current and current.name == wanted then
 			break
 		end
-		stopCurrent()
+		stopCurrent(if wanted
+			then {
+				reason = root:GetAttribute("Reason") or "unknown",
+				branch = root:GetAttribute("Branch"),
+				next = { id = root:GetAttribute("ArtifactId") },
+			}
+			else nil)
 		if wanted == nil then
 			break
 		end

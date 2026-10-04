@@ -6,7 +6,8 @@ local ClientApi = {}
 
 local persistStore: { [string]: any } = {}
 local entries: { [LocalScript]: any } = {}
-local services = nil -- set by KernelClient: { transport, logs, devStatus, onKernelEvent, KERNEL_API, KERNEL_VERSION }
+local services = nil -- set by KernelClient: { transport, logs, devStatus, onKernelEvent, pinned, KERNEL_API,
+-- KERNEL_VERSION }
 
 function ClientApi.init(kernelServices)
 	services = kernelServices
@@ -26,10 +27,15 @@ function ClientApi.forEntry(entry: LocalScript)
 	local api = {
 		kernelApi = services.KERNEL_API,
 		kernelVersion = services.KERNEL_VERSION,
-		artifact = { id = generation.artifactId },
+		-- 0.2.2: the whole artifact identity (from the client tree's attributes); before: { id } only.
+		artifact = if generation.artifact then table.clone(generation.artifact) else { id = generation.artifactId },
 		generation = generation.number,
 		branch = generation.branch,
 		channel = generation.channel,
+		-- 0.2.2: the server type and how this client generation started ({ kind, reason, previous?, branchChanged,
+		-- startedAt }; a client's first generation is kind "boot", reason "boot").
+		serverType = generation.serverType,
+		start = generation.start,
 	}
 	function api:persist(key: string, init: () -> any)
 		local value = persistStore[key]
@@ -58,6 +64,18 @@ function ClientApi.forEntry(entry: LocalScript)
 	end
 	function api:logs(since: number?, limit: number?)
 		return services.logs.since(since, limit)
+	end
+	-- Kernel 0.2.2+ (additive). One handler each per generation; the framework installs them and fans out.
+	function api:pinned(): boolean
+		return services.pinned()
+	end
+	-- fn({reason, branch, artifactId?, commit?, eta, cancelled?}): the server says a swap is coming (or called it off).
+	function api:onPending(fn)
+		generation.pendingHandler = fn
+	end
+	-- fn({dev, reason, role, channel}) when the server's decision about this player changes.
+	function api:onDevChanged(fn)
+		generation.devHandler = fn
 	end
 	function api.ready(stop: () -> ())
 		generation.stop = stop

@@ -15,6 +15,12 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
 - Deployment history and pins (0.2.0): every deploy message is recorded in the DataStore key `deployments`;
   `api:artifacts()` lists it, `api:pinArtifact(player, assetId)` holds a server on a known artifact until its branch
   gets a newer deploy, and `api:newServer(player, branch, assetId?)` opens a reserved server pinned to one.
+- Hooks for game code (0.2.2), used by the framework's `TypeTorch` API: `api.start` (how the generation started:
+  boot or swap, reason, previous artifact and branch, timings), stop info `{reason, branch, next}`, `api:onPending`
+  (a swap is coming, with an ETA; also broadcast to clients), `api:onDevChanged`, `api:pinned()` and
+  `api:requestReload(player)` (owner and admins). Clients get the full artifact identity, the server type and their
+  own `start`.
 
-Contract with payloads: `Server.boot.boot(kernel)` / `Client.boot.boot(kernel)` return a stop function. The typed view
+Contract with payloads: `Server.boot.boot(kernel)` / `Client.boot.boot(kernel)` return a stop function (0.2.2 passes
+it what replaces the generation). The typed view
 of `kernel` is `ServerKernel` / `ClientKernel` in `@typetorch/framework`. Design: `../plans/01-kernel.md`.
