@@ -10,6 +10,8 @@
 --         branches = { [name] = { artifactId, assetId, channel, commit, commitHash, seq, deployedAt, by } },
 --         deployments = { newest last, at most 25 } }
 --   * In-game DataStore "TypeTorch" for what game servers write themselves (no Open Cloud scope needed):
+--       head/<branch>              { assetId, artifactId, seq, commit, channel, deployedAt }  (from deploy messages;
+--                                  the fallback registry when ConfigService isn't written; higher seq wins)
 --       private/<PrivateServerId>  { branch, setBy, setAt }   (private and reserved servers' branch)
 --       events                     { list }                   (automatic and server-local rollbacks)
 --
@@ -147,8 +149,72 @@ function Registry.onChange(fn)
 	table.insert(listeners, fn)
 end
 
+-- Branch heads persisted by game servers from deploy messages (in-game DataStore, key "head/<branch>"). This keeps the
+-- system working when the CLI can't write ConfigService (missing `universe:write` scope): every server that receives a
+-- deploy message records the head, so servers started later still boot the right artifact. The head with the higher
+-- seq wins between the two sources.
+local storedHeads: { [string]: any } = {}
+
+local function getStore(): DataStore
+	if not store then
+		store = DataStoreService:GetDataStore(Constants.DATASTORE)
+	end
+	return store :: DataStore
+end
+
+function Registry.refreshStoredHead(branch: string)
+	local ok, value = pcall(function()
+		return getStore():GetAsync("head/" .. branch)
+	end)
+	if ok and typeof(value) == "table" and typeof(value.assetId) == "number" then
+		storedHeads[branch] = value
+	end
+	return storedHeads[branch]
+end
+
+function Registry.saveHead(branch: string, head)
+	local current = storedHeads[branch]
+	if current and (current.seq or 0) >= (head.seq or 0) then
+		return
+	end
+	storedHeads[branch] = head
+	task.spawn(function()
+		pcall(function()
+			getStore():UpdateAsync("head/" .. branch, function(existing)
+				if typeof(existing) == "table" and (existing.seq or 0) >= (head.seq or 0) then
+					return nil -- keep the newer one already stored
+				end
+				return head
+			end)
+		end)
+	end)
+end
+
+-- Branch names with a stored head (ListKeysAsync over "head/"). Yields; for the dev menu.
+function Registry.storedBranches(): { string }
+	local names = {}
+	pcall(function()
+		local pages = getStore():ListKeysAsync("head/", 50)
+		while true do
+			for _, key in pages:GetCurrentPage() do
+				table.insert(names, string.sub(key.KeyName, 6))
+			end
+			if pages.IsFinished then
+				break
+			end
+			pages:AdvanceToNextPageAsync()
+		end
+	end)
+	return names
+end
+
 function Registry.branchHead(name: string)
-	return Registry.state().branches[name]
+	local fromConfig = Registry.state().branches[name]
+	local fromStore = storedHeads[name]
+	if fromConfig and fromStore then
+		return if (fromStore.seq or 0) > (fromConfig.seq or 0) then fromStore else fromConfig
+	end
+	return fromConfig or fromStore
 end
 
 function Registry.channelOf(branch: string): string
@@ -158,13 +224,6 @@ function Registry.channelOf(branch: string): string
 end
 
 -- In-game DataStore (game-written data) ---------------------------------------------------------------------------
-
-local function getStore(): DataStore
-	if not store then
-		store = DataStoreService:GetDataStore(Constants.DATASTORE)
-	end
-	return store :: DataStore
-end
 
 function Registry.privateBranch(privateServerId: string): (string?, string?)
 	local ok, value = pcall(function()

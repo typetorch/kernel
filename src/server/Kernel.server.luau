@@ -362,7 +362,9 @@ Registry.onChange(function(state)
 	task.spawn(followHead, "registry", true)
 end)
 
--- Deploy messages: {b = branch, a = assetId, i = artifactId, s = seq, t = sent ms, r = rollback?}.
+-- Deploy messages: {b = branch, a = assetId, i = artifactId, s = seq, c = commit, ch = channel, t = sent ms,
+-- r = rollback?}. Every server records the head (any branch) so servers started later boot it even without a
+-- ConfigService registry.
 local function onDeployMessage(message)
 	local ok, data = pcall(HttpService.JSONDecode, HttpService, message.Data)
 	if not ok or typeof(data) ~= "table" then
@@ -373,7 +375,19 @@ local function onDeployMessage(message)
 		receivedMs = DateTime.now().UnixTimestampMillis,
 		sentMs = if typeof(message.Sent) == "number" then math.floor(message.Sent * 1000) else nil,
 	}
-	if data.b ~= myBranch or typeof(data.a) ~= "number" then
+	if typeof(data.b) ~= "string" or typeof(data.a) ~= "number" then
+		return
+	end
+	Registry.saveHead(data.b, {
+		assetId = data.a,
+		artifactId = data.i,
+		seq = tonumber(data.s) or 0,
+		commit = data.c,
+		channel = if data.ch == "prod" or data.ch == "dev" then data.ch else nil,
+		deployedAt = DateTime.now():ToIsoDate(),
+		rollback = data.r and true or nil,
+	})
+	if data.b ~= myBranch then
 		return
 	end
 	if current and data.i == current.artifact.id then
@@ -385,7 +399,10 @@ local function onDeployMessage(message)
 	if serverType() == "public" then
 		task.wait(math.random() * Constants.PUBLIC_JITTER_SECONDS)
 	end
-	swapTo({ assetId = data.a, artifactId = data.i, seq = data.s, commit = data.c }, if data.r then "rollback" else "deploy")
+	swapTo(
+		{ assetId = data.a, artifactId = data.i, seq = data.s, commit = data.c, channel = data.ch },
+		if data.r then "rollback" else "deploy"
+	)
 end
 
 -- Control (dev menu, /tt) ------------------------------------------------------------------------------------------
@@ -437,6 +454,7 @@ local function switchBranch(player: Player?, branch: string)
 	if kind == "public" then
 		return { ok = false, error = "public servers always run the default branch; use /tt new <branch>" }
 	end
+	Registry.refreshStoredHead(branch)
 	local head = Registry.branchHead(branch)
 	if not head then
 		return { ok = false, error = `no artifact on branch {branch}` }
@@ -457,6 +475,7 @@ local function newServer(player: Player, branch: string)
 	if not allowed then
 		return { ok = false, error = why }
 	end
+	Registry.refreshStoredHead(branch)
 	if not Registry.branchHead(branch) then
 		return { ok = false, error = `no artifact on branch {branch}` }
 	end
@@ -478,8 +497,22 @@ local function newServer(player: Player, branch: string)
 end
 
 local function branchList()
+	local names = {}
+	for name in Registry.state().branches do
+		names[name] = true
+	end
+	for _, name in Registry.storedBranches() do
+		if not names[name] then
+			Registry.refreshStoredHead(name)
+			names[name] = true
+		end
+	end
 	local list = {}
-	for name, head in Registry.state().branches do
+	for name in names do
+		local head = Registry.branchHead(name)
+		if not head then
+			continue
+		end
 		table.insert(list, {
 			name = name,
 			channel = Registry.channelOf(name),
@@ -618,11 +651,21 @@ task.spawn(function()
 	end
 end)
 
+Registry.refreshStoredHead(myBranch)
 if Registry.branchHead(myBranch) then
 	followHead("boot", false)
 else
 	warn(`[TypeTorch] branch {myBranch} has no artifact yet{if err then ` (registry: {err})` else ""}; waiting for a deploy`)
 end
+
+-- Backup for missed messages: re-read the stored head (ConfigService has its own refresh in Registry.start).
+task.spawn(function()
+	while true do
+		task.wait(Constants.POLL_SECONDS)
+		Registry.refreshStoredHead(myBranch)
+		followHead("poll", true)
+	end
+end)
 for _, player in Players:GetPlayers() do
 	sendDevStatus(player)
 end

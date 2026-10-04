@@ -10,7 +10,7 @@
 	"publishConfig": {
 		"access": "public"
 	},
-	"files": ["src", "place.project.json", "README.md"],
+	"files": ["src", "place.project.json", "README.md", "LICENSE"],
 	"typetorch": {
 		"kernelApi": 1,
 		"placeProject": "place.project.json"
