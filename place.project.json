@@ -37,6 +37,7 @@
 		},
 		"ServerScriptService": {
 			"$className": "ServerScriptService",
+			"$properties": { "LoadStringEnabled": true },
 			"TypeTorchKernel": {
 				"$className": "Folder",
 				"Kernel": { "$path": "src/server/Kernel.server.luau" },
