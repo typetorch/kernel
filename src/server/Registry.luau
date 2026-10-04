@@ -417,6 +417,41 @@ function Registry.branchHead(name: string, accept: ((any) -> boolean)?)
 	return fromConfig or fromStore
 end
 
+-- 0.3 boot fail-safe: every head this server can find for `branch` (ConfigService, the cached copy, and fresh reads of
+-- the MemoryStore and DataStore copies), distinct by asset and seq, newest seq first. Yields. Untrusted: the kernel
+-- checks each one.
+function Registry.bootCandidates(branch: string): { any }
+	local list, seen = {}, {}
+	local function add(head)
+		if isHead(head) then
+			local key = `{head.assetId}#{tostring(head.seq)}`
+			if not seen[key] then
+				seen[key] = true
+				table.insert(list, head)
+			end
+		end
+	end
+	add(Registry.state().branches[branch])
+	add(storedHeads[branch])
+	local memoryOk, memory = pcall(function()
+		return getMemory():GetAsync(HEADS_KEY)
+	end)
+	if memoryOk and typeof(memory) == "table" then
+		add(memory[branch])
+	end
+	local durableOk, durable = pcall(function()
+		return getStore():GetAsync(HEADS_KEY)
+	end)
+	if durableOk and typeof(durable) == "table" then
+		add(durable[branch])
+	end
+	table.sort(list, function(a, b)
+		local seqA, seqB = if typeof(a.seq) == "number" then a.seq else -1, if typeof(b.seq) == "number" then b.seq else -1
+		return seqA > seqB
+	end)
+	return list
+end
+
 -- 0.3: both candidate heads of a branch (ConfigService, stored), either may be nil.
 function Registry.headCandidates(name: string): (any?, any?)
 	local fromConfig = Registry.state().branches[name]

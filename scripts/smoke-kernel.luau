@@ -1,6 +1,6 @@
 -- Smoke test for the whole server kernel (from kernel/): `lune run scripts/smoke-kernel.luau`, then again with
 -- `--fallback` (the key asset never loads), `--dev` (a reserved dev-branch server), `--vip` (a non-dev's private server),
--- `--bootstrap`, `--bootstrap-only` and `--nothing` (BootstrapHeads and the no-trusted-head case).
+-- `--bootstrap`, `--bootstrap-only` (BootstrapHeads), `--blind` (the boot fail-safe) and `--empty` (nothing usable).
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore, ConfigService unavailable), then drives it:
 -- signed / unsigned / dev-channel / replayed deploy messages, a payload holding a Script (S-L4), a payload that fails to
@@ -678,10 +678,13 @@ local FIELDS = {
 
 -- `--bootstrap`: only an UNSIGNED 0.2-style prod head in the stores, matching the stamped BootstrapHeads.
 -- `--bootstrap-only`: no stored heads at all; the server boots the BootstrapHeads entry itself.
--- `--nothing`: unsigned prod heads only and no BootstrapHeads: no trusted head, nothing runs, status says so.
+-- `--blind`: unsigned prod heads only and no BootstrapHeads: the boot fail-safe boots the newest usable one, flagged;
+-- updates stay strictly verified.
+-- `--empty`: every stored head fails its checks: nothing runs until a signed deploy.
 local BOOTSTRAP_MODE = table.find(process.args, "--bootstrap") ~= nil
 local BOOTSTRAP_ONLY_MODE = table.find(process.args, "--bootstrap-only") ~= nil
-local NOTHING_MODE = table.find(process.args, "--nothing") ~= nil
+local BLIND_MODE = table.find(process.args, "--blind") ~= nil
+local EMPTY_MODE = table.find(process.args, "--empty") ~= nil
 if BOOTSTRAP_MODE or BOOTSTRAP_ONLY_MODE then
 	kernelFolder:SetAttribute("BootstrapHeads", '{"prod":{"a":1001,"s":10,"i":"aaaaaaa-111111"}}')
 end
@@ -701,12 +704,15 @@ memoryStore.data.heads = {
 	-- An unsigned dev-branch head (dev deploys stay unsigned).
 	dev = { assetId = 1004, artifactId = "ddddddd-444444", seq = 5, commit = "ddddddd", channel = "dev", t = 1759580000000, deployedAt = "2026-10-04T00:00:00Z" },
 }
-if BOOTSTRAP_MODE or NOTHING_MODE then
-	-- H1 as a 0.2 kernel stored it: no t, no signatures.
+if BOOTSTRAP_MODE or BLIND_MODE then
+	-- H1 as a 0.2 kernel stored it: no t, no signatures. (MemoryStore keeps the forged dev-channel head, seq 99.)
 	dataStore.data.heads = { prod = { assetId = h1.a, artifactId = h1.i, seq = h1.s, commit = h1.c, channel = h1.ch, deployedAt = "2026-10-04T00:00:00Z" } }
 elseif BOOTSTRAP_ONLY_MODE then
 	dataStore.data.heads = {}
 	memoryStore.data.heads = {}
+elseif EMPTY_MODE then
+	-- Only unusable heads: the forged dev-channel one (seq 99, MemoryStore) and one whose payload holds a Script.
+	dataStore.data.heads = { prod = { assetId = 1005, artifactId = "eeeeeee-555555", seq = 70, commit = "eeeeeee", channel = "prod", deployedAt = "2026-10-04T00:00:00Z" } }
 end
 
 -- Boot ---------------------------------------------------------------------------------------------------------------
@@ -716,6 +722,9 @@ Constants.PUBLIC_JITTER_SECONDS = 0.05
 Constants.CONFIG_BOOT_WAIT = 0.1
 Constants.LOAD_RETRY_DELAYS = { 0.1, 0.1, 0.1 }
 Constants.STOP_DEADLINE = 0.3
+if BLIND_MODE then
+	Constants.POLL_SECONDS = 0.3 -- the forged newer head must meet several polls
+end
 local Signing = requireInstance(kernelFolder.Signing)
 
 local function waitFor(what: string, condition: () -> boolean, timeout: number?): boolean
@@ -754,7 +763,7 @@ end
 local function finish()
 	check("no kernel or script errors", #kernelErrors == 0 and #scriptErrors == 0)
 	for _, line in output do
-		if line.kind == "warn" and string.find(line.text, "swap failed", 1, true) and not string.find(line.text, "eeeeeee", 1, true) and not string.find(line.text, "1006", 1, true) then
+		if line.kind == "warn" and string.find(line.text, "swap failed", 1, true) and not string.find(line.text, "eeeeeee", 1, true) and not string.find(line.text, "1006", 1, true) and not string.find(line.text, "ccccccc", 1, true) then
 			check(`unexpected: {line.text}`, false)
 		end
 	end
@@ -771,7 +780,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif NOTHING_MODE then "--nothing" else "public server"
+	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -810,21 +819,68 @@ if BOOTSTRAP_MODE or BOOTSTRAP_ONLY_MODE then
 	end))
 	finish()
 end
-if NOTHING_MODE then
-	task.wait(1)
-	local s0 = SMOKE.kernel and status()
-	check("nothing: no trusted head, nothing runs", SMOKE.kernel == nil)
-	-- No generation, so no kernel API from a payload: read the warning instead, then send a signed deploy.
-	local warned = false
+local function said(text: string): boolean
 	for _, line in output do
-		warned = warned or string.find(line.text, "no trusted prod head", 1, true) ~= nil
+		if string.find(line.text, text, 1, true) then
+			return true
+		end
 	end
-	check("nothing: warned 'no trusted prod head'", warned and s0 == nil)
+	return false
+end
+if BLIND_MODE then
+	-- No verified head, no bootstrap head: the boot fail-safe skips the forged dev-channel head (seq 99) and boots the
+	-- unsigned prod head (seq 10), flagged.
+	check("blind: boots the unverified stored head (the dev-channel forgery skipped)", waitFor("boot", function()
+		return running() == "aaaaaaa-111111"
+	end))
+	local s0 = status()
+	check("blind: flagged unverified, no verified badge, appliedSeq untouched", s0.unverified == true and s0.generation.artifact.verified == nil and s0.appliedSeq == -1)
+	check("blind: warned", said("BOOT FAIL-SAFE"))
+	check("blind: event booted_unverified", (function()
+		for _, event in (dataStore.data.events or { list = {} }).list do
+			if event.action == "booted_unverified" and event.assetId == 1001 then
+				return true
+			end
+		end
+		return false
+	end)())
+	-- Updates stay strictly verified: an unsigned deploy, an unsigned pin, and a forged newer stored head.
+	publish("TypeTorch/deploy", deployMessage(nil, FIELDS.M4))
+	local pin = table.clone(FIELDS.P2)
+	pin.t = nowMs()
+	publish("TypeTorch/pin", pin)
+	memoryStore.data.heads.prod = { assetId = 1002, artifactId = "bbbbbbb-222222", seq = 300, commit = "bbbbbbb", channel = "prod", t = nowMs(), deployedAt = "2026-10-05T00:00:00Z" }
+	task.wait(1.5) -- several polls
+	check("blind: unsigned deploy, unsigned pin and a forged newer head are refused", rejected("deploy") == 1 and rejected("pin") == 1 and running() == "aaaaaaa-111111")
+	local admin = newInstance("Player", "Owner")
+	admin.UserId = 1
+	local rollback = SMOKE.kernel:rollback(admin)
+	check("blind: still flagged after the refusals", status().unverified == true and rollback.ok == false)
+	-- A signed head for the SAME asset vouches for it: no swap, the flag clears.
+	local boots = #SMOKE.boots
+	publish("TypeTorch/deploy", deployMessage("H1", FIELDS.H1, { "sig" }))
+	check("blind: a signed message for the running asset clears the flag without a swap", waitFor("vouch", function()
+		return status().unverified == nil and status().appliedSeq == 10
+	end) and #SMOKE.boots == boots and status().generation.artifact.verified ~= nil)
+	-- The next signed deploy (seq 11, below the forged 99 and 300) still lands: the blind boot didn't move appliedSeq.
 	publish("TypeTorch/deploy", deployMessage("M2", FIELDS.M2, { "sig" }))
-	check("nothing: the next signed deploy boots", waitFor("boot B", function()
+	check("blind: the next signed deploy swaps", waitFor("swap to B", function()
+		return running() == "bbbbbbb-222222" and status().appliedSeq == 11
+	end))
+	-- The vouched-for generation is a verified rollback target now.
+	local back = SMOKE.kernel:rollback(admin)
+	check("blind: /tt rollback to the vouched generation works", back.ok == true and running() == "aaaaaaa-111111" and status().unverified == nil)
+	finish()
+end
+if EMPTY_MODE then
+	-- Every stored head fails its checks (dev channel; a Script inside): the server stays empty and says so.
+	task.wait(1)
+	check("empty: nothing loads", SMOKE.kernel == nil and said("nothing loaded"))
+	publish("TypeTorch/deploy", deployMessage("M2", FIELDS.M2, { "sig" }))
+	check("empty: the next signed deploy boots it", waitFor("boot B", function()
 		return SMOKE.kernel ~= nil and running() == "bbbbbbb-222222"
 	end))
-	check("nothing: status no longer flags it", status().noTrustedHead == nil)
+	check("empty: not flagged unverified", status().unverified == nil and status().noTrustedHead == nil)
 	finish()
 end
 

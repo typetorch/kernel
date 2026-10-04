@@ -33,14 +33,17 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   asset has loaded), the payload `Channel` attribute exactly `"prod"`, and a seq newer than the applied one.
   Payloads there may hold only Folders and ModuleScripts. The only unsigned head a prod server takes is the one in
   `BootstrapHeads` (exact branch, asset and seq). A re-signed head (`r = "resign"`, same asset) moves the head without
-  a swap. Pins there must be signed too (dev menu pins are refused: use `typetorch pin`). Dev servers stay unsigned.
+  a swap. Pins there must be signed too (dev menu pins are refused: use `typetorch pin`); a signed experiment may run
+  any channel. Boot fail-safe: when no verified or bootstrap head loads at boot, the server boots the newest stored
+  head that passes the prod checks, flagged `status().unverified` (updates stay strictly verified). Dev servers stay
+  unsigned.
   `KeyAssetId`, `FallbackPublicKey` and `BootstrapHeads` are attributes on `ServerScriptService.TypeTorchKernel`,
   stamped by `typetorch kernel deploy` and read once at boot. `api:keys()` shows the trust state; `api:artifacts()`
   and `status()` carry `verified = {main, fallback}`. Format: `../plans/03-artifact.md` "Signed prod messages";
   rules: `../plans/01-kernel.md`.
 - Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
-  `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--nothing`).
+  `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.
 

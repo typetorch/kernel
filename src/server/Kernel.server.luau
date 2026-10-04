@@ -193,6 +193,23 @@ local function signedHead(branch: string)
 	return bootstrapFor(branch)
 end
 
+-- 0.3 boot fail-safe: a verified head (signed or the bootstrap match) for the asset an unverified generation already
+-- runs vouches for it: the flag clears and the generation keeps running (no swap).
+local function vouchFor(head)
+	local how = head and admitted[head]
+	if current and current.unverified and (how == "signed" or how == "bootstrap") and head.assetId == current.artifact.assetId then
+		current.unverified = nil
+		current.head = cloneHead(head)
+		for _, entry in history do
+			if entry.name == current.name then
+				entry.head = current.head -- a later /tt rollback to it is a rollback to a verified head
+			end
+		end
+		replicatedRoot:SetAttribute("Unverified", nil)
+		print(`[TypeTorch] {current.artifact.id} is verified now (seq {tostring(head.seq)}); the boot fail-safe state ended`)
+	end
+end
+
 -- The head this server should follow on `branch`: signed only when this server requires signatures.
 local function headFor(branch: string)
 	if requiresSignatures(branch) then
@@ -584,6 +601,8 @@ local function publishActive(generation)
 	replicatedRoot:SetAttribute("ArtifactId", generation.artifact.id)
 	replicatedRoot:SetAttribute("Branch", generation.branch)
 	replicatedRoot:SetAttribute("Channel", generation.channel)
+	-- 0.3: this generation came from the boot fail-safe (an unverified prod head), or nil.
+	replicatedRoot:SetAttribute("Unverified", if generation.unverified then true else nil)
 	replicatedRoot:SetAttribute("ActiveGeneration", generation.name)
 end
 
@@ -662,8 +681,12 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 	-- 0.3: the last gate on prod servers. Every way in (deploy messages, heads, pins, reloads, rollbacks) admits the
 	-- head table it checked; anything else is refused here.
 	local signedOnly = requiresSignatures(myBranch)
-	if signedOnly and not admitted[head] then
-		refuse("swap", "not a signed or admin-approved head", { reason = reason, assetId = head.assetId, artifactId = head.artifactId })
+	-- "blind" (the boot fail-safe) counts only for this server's first generation, or to restore the generation that
+	-- was just running when its replacement failed to start (auto-rollback); never for updates.
+	local how = admitted[head]
+	local blindOk = how == "blind" and ((reason == "boot" and lastGeneration == nil) or reason == "auto-rollback")
+	if signedOnly and (not how or (how == "blind" and not blindOk)) then
+		refuse("swap", if how == "blind" then "an unverified head after boot" else "not a signed head", { reason = reason, assetId = head.assetId, artifactId = head.artifactId })
 		return { ok = false, reason = reason, assetId = head.assetId, artifactId = head.artifactId, error = "refused: not signed", stage = "gate" }
 	end
 	busy = true
@@ -681,11 +704,13 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		report.stage = "mount"
 		-- Signed deploys and heads (and bootstrap heads) on prod servers: Channel exactly "prod"; pins keep their own rule
 		-- (head.requireChannel); experiments (signed remote pins) may be any channel.
-		local how = admitted[head]
 		local generation = mount(payload, head, {
-			requireChannel = if signedOnly and (how == "signed" or how == "bootstrap") then "prod" else nil,
+			requireChannel = if signedOnly and (how == "signed" or how == "bootstrap" or how == "blind") then "prod" else nil,
 			modulesOnly = signedOnly,
 		})
+		-- 0.3 boot fail-safe: a generation from an unverified head is flagged until a verified head replaces or vouches
+		-- for it (status().unverified, an Attention error, no verified badge).
+		generation.unverified = signedOnly and how == "blind" or nil
 		-- 0.2.2: how this generation starts, for api.start (the kernel adds stopSeconds and swapSeconds below).
 		local previous = lastGeneration
 		generation.reason = publicReason(reason)
@@ -888,6 +913,7 @@ runWorker = function()
 			continue
 		end
 		if current and ((head.artifactId and head.artifactId == current.artifact.id) or head.assetId == current.artifact.assetId) then
+			vouchFor(head)
 			appliedSeq = math.max(appliedSeq, if typeof(seq) == "number" then seq else appliedSeq)
 			continue
 		end
@@ -960,6 +986,7 @@ local function followHead(reason: string, jitter: boolean?)
 		if current.pinned and inRollout(rollout) then
 			setHold(false, nil) -- the pinned artifact is the head now (seq > appliedSeq here)
 		end
+		vouchFor(head)
 		appliedSeq = seq
 		return
 	end
@@ -1107,6 +1134,10 @@ local function onDeployMessage(message)
 		end
 		if seq and seq > appliedSeq and r == "resign" then
 			print(`[TypeTorch] re-signed head for {data.b}: {data.i} #{seq} (no swap)`)
+		end
+		if signedOnly then
+			-- Verified above: it vouches for an unverified (boot fail-safe) generation running this asset.
+			vouchFor(admit({ assetId = data.a, artifactId = data.i, seq = seq, commit = data.c, channel = channel, branch = data.b, t = t, r = r, rollback = if r == 1 then true else nil, sig = sig, sigF = sigF }, "signed"))
 		end
 		appliedSeq = math.max(appliedSeq, seq or appliedSeq)
 		return
@@ -1589,7 +1620,7 @@ local function runningArtifact()
 		return nil
 	end
 	local artifact = table.clone(current.artifact)
-	artifact.verified = Signing.headSignatures(artifact.branch or myBranch, current.head)
+	artifact.verified = if current.unverified then nil else Signing.headSignatures(artifact.branch or myBranch, current.head)
 	return artifact
 end
 
@@ -1638,6 +1669,8 @@ local function status()
 		-- 0.3: a signed-only server with no trusted head for its branch (no verified head, no bootstrap head): it runs
 		-- nothing new until a signed deploy arrives (it keeps polling and re-reading the keys on the normal schedule).
 		noTrustedHead = if requiresSignatures(myBranch) and myBranch and not headFor(myBranch) then true else nil,
+		-- 0.3 boot fail-safe: the running generation came from an UNVERIFIED stored head (no verified head loaded at boot).
+		unverified = if current and current.unverified then true else nil,
 		signing = Signing.summary(),
 		rejected = rejectedInfo(),
 	}
@@ -1649,6 +1682,7 @@ local function keysInfo()
 	local info = Signing.keys()
 	info.signedOnly = requiresSignatures(myBranch)
 	info.noTrustedHead = if info.signedOnly and myBranch and not headFor(myBranch) then true else nil
+	info.unverified = if current and current.unverified then true else nil
 	info.rejected = rejectedInfo()
 	info.refusals = table.clone(refusals)
 	return info
@@ -1825,6 +1859,9 @@ local function runCommand(player: Player, text: string)
 	elseif command == "status" then
 		local s = status()
 		local pinned = if s.experiment then ", A/B experiment" elseif s.pinned then ", pinned" else ""
+		if s.unverified then
+			pinned ..= ", UNVERIFIED boot (fail-safe)"
+		end
 		local signing = if s.signedOnly then `, signed only ({s.signing.mode}{if s.rejected.total > 0 then `, {s.rejected.total} rejected` else ""})` else ""
 		notice(player, `{s.serverType} server, branch {s.branch} ({s.channel or "?"}), {if s.generation then s.generation.name else "no generation"}{pinned}, up {s.uptime}s, kernel {s.kernelVersion}{if s.kernelBuild then `@{s.kernelBuild}` else ""}{signing}`)
 	elseif command == "branch" and argument then
@@ -1955,6 +1992,63 @@ if bootPin and signedBoot and not signedProd(if typeof(bootPin.branch) == "strin
 	refuse("pin", "the stored pin is not a signed prod deploy; booting the branch head", { assetId = bootPin.assetId, artifactId = bootPin.artifactId })
 	bootPin = nil
 end
+-- 0.3 boot on a prod server (user decisions): the verified heads, newest first (signed, or the exact bootstrap match),
+-- then the bootstrap head itself, then the BOOT FAIL-SAFE: the other stored heads, blind, newest first ("never boot
+-- an empty game"). Each must still be Channel "prod" and only Folders and ModuleScripts at mount; a head that fails is
+-- skipped for the next one. Blind trust is for this first generation only: everything after boot stays strictly
+-- verified, and a blind boot doesn't move appliedSeq (a forged seq can't block the next signed deploy).
+local function bootSigned()
+	local tried = {}
+	local function try(head, how: string): boolean
+		local key = `{tostring(head.assetId)}#{tostring(head.seq)}`
+		if tried[key] then
+			return false
+		end
+		tried[key] = true
+		local report = swapTo(head, "boot")
+		if report.ok then
+			if how ~= "blind" and typeof(head.seq) == "number" then
+				appliedSeq = math.max(appliedSeq, head.seq)
+			end
+			return true
+		end
+		if how ~= "blind" then
+			noteFailure(head, "boot", report) -- a verified head that failed to LOAD is retried and replaces the fallback
+		end
+		return false
+	end
+	local verified = headFor(myBranch)
+	if verified and try(verified, admitted[verified] or "signed") then
+		return
+	end
+	local candidates = Registry.bootCandidates(myBranch)
+	for _, candidate in candidates do
+		if trustedProd(myBranch, candidate) then
+			local head = cloneHead(candidate)
+			if try(admit(head, if signedProd(myBranch, candidate) then "signed" else "bootstrap"), admitted[head]) then
+				return
+			end
+		end
+	end
+	local bootstrap = bootstrapFor(myBranch)
+	if bootstrap and try(bootstrap, "bootstrap") then
+		return
+	end
+	for _, candidate in candidates do
+		if not trustedProd(myBranch, candidate) then
+			local head = admit(table.clone(candidate), "blind")
+			if try(head, "blind") then
+				warn(
+					`[TypeTorch] BOOT FAIL-SAFE: no verified head for {myBranch} loaded, so this server booted the UNVERIFIED stored head {head.artifactId or `asset-{head.assetId}`} (seq {tostring(head.seq)}). Updates still need signatures; the next signed deploy replaces it.`
+				)
+				Registry.logEvent({ action = "booted_unverified", branch = myBranch, assetId = head.assetId, artifactId = head.artifactId, seq = head.seq, job = game.JobId })
+				return
+			end
+		end
+	end
+	warn(`[TypeTorch] branch {myBranch}: nothing loaded (no verified, bootstrap or usable stored head){if err then ` (registry: {err})` else ""}; waiting for a signed deploy`)
+end
+
 local bootHead = headFor(myBranch)
 if bootPin and (not bootHead or (bootHead.seq or 0) <= (bootPin.headSeq or 0)) then
 	appliedSeq = math.max(bootPin.headSeq or 0, if bootPin.branch == myBranch then bootPin.seq or 0 else 0)
@@ -1966,18 +2060,21 @@ if bootPin and (not bootHead or (bootHead.seq or 0) <= (bootPin.headSeq or 0)) t
 	end
 	print(`[TypeTorch] booting pinned artifact {bootPin.artifactId or bootPin.assetId}`)
 	swapTo(head, "pin")
-	if not current and bootHead then
+	if not current then
 		appliedSeq = -1
-		followHead("boot", false) -- the pinned artifact failed to start: fall back to the branch head
+		-- The pinned artifact failed to start: fall back to the branch head.
+		if signedBoot then
+			bootSigned()
+		elseif bootHead then
+			followHead("boot", false)
+		end
 	end
+elseif signedBoot then
+	bootSigned()
 elseif bootHead then
 	followHead("boot", false)
 else
-	local why = if signedBoot then "no trusted prod head (no verified head, no bootstrap head)" else "no artifact"
-	warn(`[TypeTorch] branch {myBranch} has {why} yet{if err then ` (registry: {err})` else ""}; waiting for a deploy`)
-	if signedBoot then
-		followHead("boot", false) -- reports a newer unsigned head, if there is one
-	end
+	warn(`[TypeTorch] branch {myBranch} has no artifact yet{if err then ` (registry: {err})` else ""}; waiting for a deploy`)
 end
 
 -- Backup for missed messages: re-read the stored head (ConfigService has its own refresh in Registry.start).
