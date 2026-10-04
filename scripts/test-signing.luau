@@ -1,0 +1,262 @@
+-- Signing.luau specs, run by scripts/test-ed25519.luau (`lune run scripts/test-ed25519.luau`).
+-- Vectors: plans/03 "Signed prod messages" (throwaway test keys whose seeds are public: never use them for real).
+--   main      seed +YR5DRjMHSBmbLgmt3LewYocFNfHgl5nKv+CepjNM8Y=                                public ErlwbCHD...
+--   fallback  seed SHA-256("TypeTorch test vector: fallback key (public, never use)")         public mb6ZhKXQ...
+--   rotated   seed SHA-256("tt-test-rotated-main-key") (kernel tests only)                     public 3Kvcf4gI...
+-- The signatures were made with node:crypto over the canonical strings below.
+
+local Signing = require("../src/server/Signing")
+
+local MAIN = "ErlwbCHDCN4WvDHY6l3plaeihIONuatx2jjqoqXZiq4="
+local FALLBACK = "mb6ZhKXQSzn2N+Xzle+xv1IuOLNWfQrtvifYYBknu0E="
+local ROTATED = "3Kvcf4gIFRT+mcefCGeN+CNctoEb/DJK+YO9EfF4TEI="
+
+local VECTORS = {
+	deploy = {
+		fields = { b = "dev", a = 134192491895548, i = "12b63b9-3fa91c", s = 17, c = "12b63b9", ch = "dev", t = 1759580000000 },
+		canonical = "tt1\ndev\n134192491895548\n12b63b9-3fa91c\n17\n12b63b9\ndev\n1759580000000\n",
+		sig = "PGUNDeXnLquAaE67z6rObJxcbYEWFgHPFxqb4EM93auudYqZtTEYUc0yF4K4gJQn0nKr+bTBv2QjArxSUSHRAw==",
+		sigF = "hmsNvZOG4myGw9fKa/JxDH44tWzFrRxMbmFXpn338kEGLenb7hewIS8PoAs2/wu+ulB2cjHaZR6p7c01mcGyAQ==",
+		sigR = "zsY29/TP6iS59Ai0apSzcOn05g/WjSxlfZ5L8Uctsrh0q3NtDkcMWpabPmaumxJQY40Ap/qZHQGnJZFMMb2sAg==",
+	},
+	rollback = {
+		fields = { b = "prod", a = 138576381221184, i = "12b63b9-8be210", s = 18, c = "12b63b9", ch = "prod", t = 1759580060000, r = 1 },
+		canonical = "tt1\nprod\n138576381221184\n12b63b9-8be210\n18\n12b63b9\nprod\n1759580060000\n1",
+		sig = "h4D9wxKwyj9ZiZEgEeje5bLXd62iH1Zqqbi6UCzNnGBu1SAPQq38g1zFWizogRTVumLr3OTz4T2hlSx/6fl9AQ==",
+		sigF = "SJG++3eiXGCYmu35ADj79qI7M0n/NxlRS61uZXqa6V2ahdN0pMZHBc2OB31r//ve87pKEY8AUvTH/lbz4fx7Bw==",
+	},
+	pinRandom = {
+		fields = { pct = 10, a = 134192491895548, b = "prod", by = 12345, t = 1759580000000 },
+		canonical = "ttpin1\n\n10\n134192491895548\nprod\n12345\n1759580000000\n",
+		sig = "MijytIjeJVoxwHEpyHoRL5eXYkK5mITqTq7qJ68Drmr99UTChkPtqMjwlw/ZDSPgpaVScRT7X7+X0CFx1kIFDw==",
+		sigF = "WnO6qvIK2ZJe0gXL8kL34mEzOC7El0aKUfTNK7UlAWQOxvcGKXssCMKueDR1a8Yf1JnrvWT6TKJ1kTkpvtN1AQ==",
+	},
+	unpinJobs = {
+		fields = { j = { "abc-1", "def-2" }, b = "prod", by = 12345, t = 1759580000000, unpin = true },
+		canonical = "ttpin1\nabc-1,def-2\n\n\nprod\n12345\n1759580000000\n1",
+		sig = "gf0acP9eFaccZjjZ+rhVD83evswOjg+bNEuwD0Zp5Od9m5XOntm7xEIj2vgHfcM2zbGaAg3ttmFvPPAPEMGLDA==",
+		sigF = "U+0euzxvLWtaWValUrOAz+6wv0XmsQIsWx09zTK33/Dl2zd4Uf+57nFE00ffytdvThNmeGJpOUJp6LLDXGKxDw==",
+	},
+}
+
+local function folder(attributes)
+	return {
+		GetAttribute = function(_self, name)
+			return attributes[name]
+		end,
+	}
+end
+
+return function(check: (string, boolean) -> (), helpers)
+	local function b64(text: string): string?
+		local decoded = Signing.base64Decode(text)
+		return if decoded then buffer.tostring(decoded) else nil
+	end
+
+	-- Base64.
+	check("base64 TWFu", b64("TWFu") == "Man")
+	check("base64 TWE=", b64("TWE=") == "Ma")
+	check("base64 TQ==", b64("TQ==") == "M")
+	check("base64 32-byte key", (Signing.base64Decode(MAIN) and buffer.len(Signing.base64Decode(MAIN) :: buffer)) == 32)
+	check("base64 refuses ''", b64("") == nil)
+	check("base64 refuses bad length", b64("TWF") == nil)
+	check("base64 refuses '=' inside", b64("TQ==TWFu") == nil)
+	check("base64 refuses '-' (url alphabet)", b64("TW-u") == nil)
+	check("base64 refuses non-strings", Signing.base64Decode(5) == nil)
+	check("base64 key bytes", helpers.toHex(Signing.base64Decode(MAIN) :: buffer) == "12b9706c21c308de16bc31d8ea5de995a7a284838db9ab71da38eaa2a5d98aae")
+
+	-- Canonical strings.
+	check("deploy canonical", Signing.deployCanonical(VECTORS.deploy.fields) == VECTORS.deploy.canonical)
+	check("rollback canonical", Signing.deployCanonical(VECTORS.rollback.fields) == VECTORS.rollback.canonical)
+	check("pin canonical (pct)", Signing.pinCanonical(VECTORS.pinRandom.fields) == VECTORS.pinRandom.canonical)
+	check("unpin canonical (j)", Signing.pinCanonical(VECTORS.unpinJobs.fields) == VECTORS.unpinJobs.canonical)
+	local bad = table.clone(VECTORS.deploy.fields)
+	bad.a = 1.5
+	check("deploy canonical refuses a fraction", Signing.deployCanonical(bad) == nil)
+	bad = table.clone(VECTORS.deploy.fields)
+	bad.b = "a\nb"
+	check("deploy canonical refuses a newline", Signing.deployCanonical(bad) == nil)
+	bad = table.clone(VECTORS.deploy.fields)
+	bad.t = nil
+	check("deploy canonical needs t", Signing.deployCanonical(bad) == nil)
+	bad = table.clone(VECTORS.deploy.fields)
+	bad.s = -1
+	check("deploy canonical refuses a negative seq", Signing.deployCanonical(bad) == nil)
+	check("deploy canonical: large ids stay integers", string.find(Signing.deployCanonical({ b = "x", a = 1e14, i = "i", s = 1, c = "c", ch = "prod", t = 1 }) :: string, "\n100000000000000\n", 1, true) ~= nil)
+	check("pin canonical refuses a comma in a job id", Signing.pinCanonical({ j = { "a,b" }, b = "prod", by = 1, t = 1 }) == nil)
+	check("head fields = deploy fields", Signing.deployCanonical(Signing.headFields("prod", {
+		assetId = 138576381221184,
+		artifactId = "12b63b9-8be210",
+		seq = 18,
+		commit = "12b63b9",
+		channel = "prod",
+		t = 1759580060000,
+		rollback = true,
+	})) == VECTORS.rollback.canonical)
+
+	-- Trust rules, with stubbed Roblox parts.
+	local clock = 1000
+	local warnings, events = {}, {}
+	local nextRead: any = nil
+	local readCalls = 0
+	Signing._reset()
+	Signing.configure({
+		now = function()
+			return clock
+		end,
+		unixNow = function()
+			return 1759580000
+		end,
+		warn = function(text)
+			table.insert(warnings, text)
+		end,
+		print = function() end,
+		logEvent = function(entry)
+			table.insert(events, entry)
+		end,
+		loadKeys = function(_assetId, _version)
+			readCalls += 1
+			if typeof(nextRead) == "function" then
+				return nextRead()
+			end
+			return nextRead
+		end,
+	})
+
+	local deploy = VECTORS.deploy
+	local function verifyDeploy(sig, sigF)
+		return Signing.verifyDeploy(deploy.fields, sig, sigF)
+	end
+
+	-- No trust roots at all: refuse.
+	Signing.init(folder({}))
+	local ok, why = verifyDeploy(deploy.sig, deploy.sigF)
+	check("no KeyAssetId/FallbackPublicKey: refused", not ok and string.find(why or "", "keys init", 1, true) ~= nil)
+	check("no trust roots: not configured", not Signing.configured())
+
+	-- Fallback only (the key asset hasn't loaded): sigF counts, sig doesn't.
+	Signing._reset()
+	Signing.init(folder({ KeyAssetId = "99", FallbackPublicKey = FALLBACK }))
+	check("configured", Signing.configured())
+	local byWhich
+	ok, why, byWhich = verifyDeploy(deploy.sig, deploy.sigF)
+	check("before the key asset loads: sigF accepted", ok and byWhich == "sigF")
+	ok = verifyDeploy(deploy.sig, nil)
+	check("before the key asset loads: sig alone refused", not ok)
+	ok = verifyDeploy(nil, deploy.rollbackSigF or VECTORS.rollback.sigF)
+	check("before the key asset loads: another message's sigF refused", not ok)
+	ok = verifyDeploy(nil, "AAAA")
+	check("malformed sigF refused", not ok)
+
+	-- Key asset loads: from now on only sig counts.
+	nextRead = { publicKeys = MAIN, revokedKeys = "", version = 7 }
+	local read, changed = Signing.refresh("boot")
+	check("boot read", read and changed and Signing.loaded())
+	ok, why, byWhich = verifyDeploy(deploy.sig, deploy.sigF)
+	check("after load: sig accepted", ok and byWhich == "sig")
+	ok = verifyDeploy(nil, deploy.sigF)
+	check("after load: sigF alone refused", not ok)
+	ok = verifyDeploy(deploy.sigR, nil)
+	check("after load: a key not in PublicKeys refused", not ok)
+	local rollbackFields = VECTORS.rollback.fields
+	ok = Signing.verifyDeploy(rollbackFields, VECTORS.rollback.sig, nil)
+	check("rollback vector: sig accepted", ok)
+	local tampered = table.clone(rollbackFields)
+	tampered.ch = "dev"
+	ok = Signing.verifyDeploy(tampered, VECTORS.rollback.sig, nil)
+	check("rollback vector with ch changed: refused", not ok)
+	check("first load is not a change", #events == 0)
+
+	-- Rate limits: a hint right away doesn't read, but stays due.
+	local callsBefore = readCalls
+	read = Signing.refresh("hint")
+	check("hint inside 30 s: no read", not read and readCalls == callsBefore)
+	check("hint is remembered", (Signing.hintDue() or -1) > 0)
+	read = Signing.refresh("failure")
+	check("failure inside 60 s: no read", not read)
+
+	-- Rotation: the rotated key is added, main is revoked.
+	clock += 31
+	nextRead = { publicKeys = `{ROTATED}, {MAIN}`, revokedKeys = MAIN, version = 8 }
+	read, changed = Signing.refresh("hint")
+	check("hint after 30 s: read and changed", read and changed)
+	check("hint no longer due", Signing.hintDue() == nil)
+	check("change logged", #events == 1 and events[1].action == "keys_changed" and events[1].added[1] == ROTATED and events[1].revokedAdded[1] == MAIN)
+	check("change warned", string.find(warnings[#warnings] or "", "CHANGED", 1, true) ~= nil)
+	ok = verifyDeploy(deploy.sig, nil)
+	check("revoked main key refused", not ok)
+	ok = verifyDeploy(deploy.sigR, nil)
+	check("rotated key accepted", ok)
+	local status = Signing.status()
+	check("status: 2 public, 1 revoked, 1 trusted", #status.publicKeys == 2 and #status.revokedKeys == 1 and status.trusted == 1 and status.version == 8 and #status.changes == 1)
+
+	-- A failed read keeps the last good keys.
+	clock += 61
+	nextRead = function()
+		error("HTTP 500")
+	end
+	read, changed = Signing.refresh("failure")
+	check("failed read: attempted, no change", read and not changed)
+	ok = verifyDeploy(deploy.sigR, nil)
+	check("failed read keeps the keys", ok and Signing.status().lastReadOk == false)
+
+	-- A read without the PublicKeys attribute is a failed read too.
+	clock += 301
+	nextRead = { revokedKeys = "" }
+	Signing.refresh("periodic")
+	ok = verifyDeploy(deploy.sigR, nil)
+	check("missing PublicKeys keeps the keys", ok)
+
+	-- "unchanged" (same asset version) keeps the keys without a load.
+	clock += 301
+	nextRead = { unchanged = true, version = 8 }
+	read, changed = Signing.refresh("periodic")
+	check("unchanged version: read, no change", read and not changed and Signing.status().lastReadOk == true)
+
+	-- Garbage entries are skipped; the fallback key can be revoked.
+	clock += 301
+	nextRead = { publicKeys = `not-a-key, {ROTATED}`, revokedKeys = `{MAIN},{FALLBACK}`, version = 9 }
+	Signing.refresh("periodic")
+	status = Signing.status()
+	check("garbage key skipped", status.trusted == 1 and status.invalid and status.invalid[1] == "not-a-key")
+	check("fallback revoked shows in status", status.fallbackRevoked == true)
+	ok = verifyDeploy(nil, deploy.sigF)
+	check("revoked fallback: sigF refused", not ok)
+
+	-- An empty key list refuses everything (fail closed).
+	clock += 301
+	nextRead = { publicKeys = "", revokedKeys = "", version = 10 }
+	Signing.refresh("periodic")
+	ok, why = verifyDeploy(deploy.sigR, deploy.sigF)
+	check("empty PublicKeys: refused", not ok and string.find(why or "", "no usable", 1, true) ~= nil)
+
+	-- KeyAssetId set but never loaded, no fallback: refused.
+	Signing._reset()
+	Signing.init(folder({ KeyAssetId = 99 }))
+	ok, why = verifyDeploy(deploy.sig, deploy.sigF)
+	check("no fallback and no load yet: refused", not ok and string.find(why or "", "not loaded", 1, true) ~= nil)
+	Signing._reset()
+	Signing.init(folder({ KeyAssetId = "x", FallbackPublicKey = "AAAA" }))
+	check("bad attributes reported", Signing.status().configError ~= nil and not Signing.configured())
+
+	-- Pins.
+	Signing._reset()
+	Signing.init(folder({ KeyAssetId = 99, FallbackPublicKey = FALLBACK }))
+	local pin = table.clone(VECTORS.pinRandom.fields)
+	pin.sigF = VECTORS.pinRandom.sigF
+	check("pin: sigF before load", (Signing.verifyPin(pin)))
+	local unpin = table.clone(VECTORS.unpinJobs.fields)
+	unpin.sig = VECTORS.unpinJobs.sig
+	unpin.sigF = VECTORS.unpinJobs.sigF
+	clock += 1000
+	nextRead = { publicKeys = MAIN, revokedKeys = "", version = 1 }
+	Signing.refresh("boot")
+	check("unpin: sig after load", (Signing.verifyPin(unpin)))
+	unpin.j = { "abc-1" }
+	check("unpin with another job list: refused", not (Signing.verifyPin(unpin)))
+	local deployAsPin = table.clone(VECTORS.pinRandom.fields)
+	deployAsPin.sig = deploy.sig
+	check("a deploy signature is no pin signature", not (Signing.verifyPin(deployAsPin)))
+
+	Signing._reset()
+end
