@@ -1,0 +1,65 @@
+{
+	"name": "TypeTorchPlace",
+	"tree": {
+		"$className": "DataModel",
+		"HttpService": {
+			"$className": "HttpService",
+			"$properties": { "HttpEnabled": true }
+		},
+		"Workspace": {
+			"$className": "Workspace",
+			"Baseplate": {
+				"$className": "Part",
+				"$properties": {
+					"Anchored": true,
+					"Locked": true,
+					"Size": [512, 16, 512],
+					"Position": [0, -8, 0],
+					"Color": [0.36, 0.38, 0.42],
+					"Material": "SmoothPlastic",
+					"TopSurface": "Smooth",
+					"BottomSurface": "Smooth"
+				}
+			},
+			"SpawnLocation": {
+				"$className": "SpawnLocation",
+				"$properties": {
+					"Anchored": true,
+					"Neutral": true,
+					"Size": [12, 1, 12],
+					"Position": [0, 0.5, 0],
+					"Duration": 0,
+					"Color": [0.95, 0.75, 0.25],
+					"TopSurface": "Smooth",
+					"BottomSurface": "Smooth"
+				}
+			}
+		},
+		"ServerScriptService": {
+			"$className": "ServerScriptService",
+			"TypeTorchKernel": {
+				"$className": "Folder",
+				"Kernel": { "$path": "src/server/Kernel.server.luau" },
+				"Api": { "$path": "src/server/Api.luau" },
+				"Access": { "$path": "src/server/Access.luau" },
+				"Logs": { "$path": "src/server/Logs.luau" },
+				"Registry": { "$path": "src/server/Registry.luau" },
+				"Transport": { "$path": "src/server/Transport.luau" },
+				"Entry": { "$path": "src/server/Entry.server.luau", "$properties": { "Disabled": true } }
+			}
+		},
+		"ReplicatedStorage": {
+			"$className": "ReplicatedStorage",
+			"TypeTorchKernelShared": {
+				"$className": "Folder",
+				"Constants": { "$path": "src/shared/Constants.luau" },
+				"ClientApi": { "$path": "src/shared/ClientApi.luau" },
+				"ClientEntry": { "$path": "src/shared/ClientEntry.client.luau", "$properties": { "Disabled": true } }
+			}
+		},
+		"ReplicatedFirst": {
+			"$className": "ReplicatedFirst",
+			"TypeTorchKernelClient": { "$path": "src/client/KernelClient.client.luau" }
+		}
+	}
+}
