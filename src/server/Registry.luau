@@ -78,12 +78,18 @@ function Registry.studioOverride()
 	return nil
 end
 
+-- The engine warns 'Config value not found for key "TypeTorch"' on every GetValue of a missing key, which floods the
+-- dev Logs tab. So once the key is missing, it is only read again after a publish (UpdateAvailable, or the key's own
+-- changed signal), never from the periodic refresh.
+local keyMissing = false
+
 local function read()
-	if snapshot then
+	if snapshot and not keyMissing then
 		local ok, value = pcall(function()
 			return snapshot:GetValue(CONFIG_KEY)
 		end)
 		if ok then
+			keyMissing = value == nil
 			return value
 		end
 	end
@@ -127,7 +133,15 @@ function Registry.start(): (any, string?)
 		pcall(function()
 			snapshot:Refresh()
 		end)
+		keyMissing = false -- a publish may have added the key
 		changed()
+	end)
+	-- Also covers a key added by a Refresh from the loop below (if the engine has the per-key signal).
+	pcall(function()
+		snapshot:GetValueChangedSignal(CONFIG_KEY):Connect(function()
+			keyMissing = false
+			changed()
+		end)
 	end)
 	task.spawn(function()
 		while true do
@@ -135,9 +149,11 @@ function Registry.start(): (any, string?)
 			pcall(function()
 				snapshot:Refresh()
 			end)
-			local value = read()
-			if HttpService:JSONEncode(normalize(value)) ~= HttpService:JSONEncode(state) then
-				changed()
+			if not keyMissing then
+				local value = read()
+				if HttpService:JSONEncode(normalize(value)) ~= HttpService:JSONEncode(state) then
+					changed()
+				end
 			end
 		end
 	end)
