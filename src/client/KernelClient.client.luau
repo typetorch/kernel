@@ -94,7 +94,13 @@ local function onClientEvent(artifactId, channel, ...)
 		return
 	end
 	if channel == Constants.CHANNEL_RESYNC then
-		return -- the server already runs a newer generation; ActiveGeneration will move us
+		-- The server already runs a newer generation and dropped a message of ours; ActiveGeneration will move us.
+		-- 0.3.2 (P-N1): the generation whose message was dropped hears it (the framework fails its pending calls fast).
+		local dropped = ...
+		if current and current.resyncHandler and (dropped == nil or dropped == current.artifactId) then
+			task.spawn(current.resyncHandler)
+		end
+		return
 	end
 	if handler and artifactId == acceptArtifact then
 		handler(channel, ...)

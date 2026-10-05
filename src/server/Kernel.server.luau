@@ -653,6 +653,9 @@ local function mount(payload: Instance, head, policy)
 
 	-- A pinned head may come from another branch (head.branch); the payload's own Channel attribute wins.
 	local artifactChannel = payload:GetAttribute("Channel") or head.channel
+	-- 0.3.2 (P-N1): the payload's network protocol hash (stamped at build time), or nil.
+	local protocolHash = payload:GetAttribute("ProtocolHash")
+	protocolHash = if typeof(protocolHash) == "string" and protocolHash ~= "" and #protocolHash <= 128 then protocolHash else nil
 	local branch = myBranch
 	local generation = {
 		name = name,
@@ -676,12 +679,13 @@ local function mount(payload: Instance, head, policy)
 			commitHash = head.commitHash,
 			builtAt = payload:GetAttribute("BuiltAt"),
 			seq = head.seq,
+			protocolHash = protocolHash,
 		},
 	}
 	-- 0.2.2: the artifact's identity on both trees, so the client API can report it too.
 	local artifact = generation.artifact
 	for _, tree in { serverTree, clientTree } do
-		for name, value in { AssetId = artifact.assetId, Commit = artifact.commit, CommitHash = artifact.commitHash, Branch = artifact.branch, Channel = artifact.channel, BuiltAt = artifact.builtAt, Seq = artifact.seq } do
+		for name, value in { AssetId = artifact.assetId, Commit = artifact.commit, CommitHash = artifact.commitHash, Branch = artifact.branch, Channel = artifact.channel, BuiltAt = artifact.builtAt, Seq = artifact.seq, ProtocolHash = artifact.protocolHash } do
 			local kind = typeof(value)
 			if kind == "string" or kind == "number" or kind == "boolean" then
 				tree:SetAttribute(name, value)

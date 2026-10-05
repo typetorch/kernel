@@ -63,7 +63,9 @@ function Api.forEntry(entry: Script)
 
 	-- Transport: only the running generation's handler receives messages.
 	function api:onMessage(fn)
-		services.Transport.attach(generation.artifact.id, fn)
+		-- 0.3.2 (P-N1): with the payload's ProtocolHash, clients still tagging an older artifact of the same protocol
+		-- reach this handler too.
+		services.Transport.attach(generation.artifact.id, fn, generation.artifact.protocolHash)
 	end
 	function api:send(player: Player, channel: string, ...)
 		services.Transport.send(player, channel, ...)

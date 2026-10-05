@@ -77,6 +77,11 @@ function ClientApi.forEntry(entry: LocalScript)
 	function api:onDevChanged(fn)
 		generation.devHandler = fn
 	end
+	-- Kernel 0.3.2+ (P-N1): fn() when the server dropped one of this generation's messages (it runs a newer
+	-- generation with another protocol). This generation is about to be replaced: pending requests won't be answered.
+	function api:onResync(fn)
+		generation.resyncHandler = if typeof(fn) == "function" then fn else nil
+	end
 	function api.ready(stop: () -> ())
 		generation.stop = stop
 		generation.readyEvent:Fire(true)

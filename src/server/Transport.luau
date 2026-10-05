@@ -19,6 +19,12 @@ local netU: UnreliableRemoteEvent = nil
 
 local acceptArtifact: string? = nil
 local handler: ((Player, string, ...any) -> ())? = nil
+-- 0.3.2 (audit P-N1): the network protocol hash of recent generations (the payload's ProtocolHash attribute), by
+-- artifact id. A client message tagged with an older artifact whose hash equals the running one's is the same
+-- protocol (a client mid-swap): it reaches the running generation instead of being dropped. No hash, no match.
+local acceptProtocol: string? = nil
+local protocols: { [string]: string } = {}
+local protocolOrder: { string } = {}
 -- 0.3.2: kernel channels clients send to (tagged "*" instead of an artifact id), e.g. __tt/client (P-K7).
 local kernelHandlers: { [string]: (Player, ...any) -> () } = {}
 
@@ -53,10 +59,12 @@ local function onServerEvent(player: Player, artifactId: any, channel: any, ...)
 		end
 		return
 	end
-	if handler and artifactId == acceptArtifact then
+	local sameProtocol = acceptProtocol ~= nil and typeof(artifactId) == "string" and protocols[artifactId] == acceptProtocol
+	if handler and (artifactId == acceptArtifact or sameProtocol) then
 		task.spawn(handler, player, channel, ...)
 	elseif acceptArtifact then
-		net:FireClient(player, acceptArtifact, Constants.CHANNEL_RESYNC)
+		-- 0.3.2: names the artifact whose message was dropped, so only that client generation rejects its pending calls.
+		net:FireClient(player, acceptArtifact, Constants.CHANNEL_RESYNC, if typeof(artifactId) == "string" then string.sub(artifactId, 1, 120) else nil)
 	end
 end
 
@@ -75,10 +83,19 @@ function Transport.start(parent: Instance)
 	end)
 end
 
--- The running generation's inbound handler. Only messages tagged with `artifactId` reach it.
-function Transport.attach(artifactId: string, fn: (Player, string, ...any) -> ())
+-- The running generation's inbound handler. Only messages tagged with `artifactId` reach it, and (0.3.2) messages
+-- tagged with a recent artifact of the same non-empty `protocolHash`.
+function Transport.attach(artifactId: string, fn: (Player, string, ...any) -> (), protocolHash: string?)
 	acceptArtifact = artifactId
 	handler = fn
+	acceptProtocol = if typeof(protocolHash) == "string" and protocolHash ~= "" then protocolHash else nil
+	if acceptProtocol and protocols[artifactId] == nil then
+		protocols[artifactId] = acceptProtocol
+		table.insert(protocolOrder, artifactId)
+		while #protocolOrder > 5 do
+			protocols[table.remove(protocolOrder, 1)] = nil
+		end
+	end
 end
 
 function Transport.detach()

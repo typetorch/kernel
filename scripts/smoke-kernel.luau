@@ -327,7 +327,10 @@ function Methods.GetFullName(self)
 	return if parent and parent ~= GAME_ROOT then `{parent:GetFullName()}.{name}` else name
 end
 
-function Methods.FireClient() end
+local firedToClient = {} -- 0.3.2: every RemoteEvent:FireClient call ({ player, args... })
+function Methods.FireClient(_, player, ...)
+	table.insert(firedToClient, { player, ... })
+end
 function Methods.FireAllClients() end
 function Methods.Fire(self, ...)
 	self.Event:Fire(...)
@@ -346,7 +349,7 @@ end
 
 -- Scripts and require ----------------------------------------------------------------------------------------------
 
-local SMOKE = { boots = {}, stops = {}, closed = {}, behave = {}, task = ownedTask }
+local SMOKE = { boots = {}, stops = {}, closed = {}, behave = {}, messages = {}, task = ownedTask }
 local moduleCache = {}
 local game
 
@@ -803,6 +806,9 @@ local BOOT_SOURCE = [[
 return {
 	boot = function(kernel)
 		SMOKE.kernel = kernel
+		kernel:onMessage(function(player, channel, ...)
+			table.insert(SMOKE.messages, { kernel.artifact.id, channel })
+		end)
 		table.insert(SMOKE.boots, kernel.artifact.id)
 		if kernel.onClose then
 			kernel:onClose(function()
@@ -823,13 +829,14 @@ return {
 }
 ]]
 
-local function payload(artifactId: string, channel: string?, extraScript: boolean?)
+local function payload(artifactId: string, channel: string?, extraScript: boolean?, protocolHash: string?)
 	return function()
 		local model = newInstance("Model", "TypeTorchPayload")
 		model:SetAttribute("ArtifactId", artifactId)
 		model:SetAttribute("Channel", channel)
 		model:SetAttribute("Commit", string.sub(artifactId, 1, 7))
 		model:SetAttribute("KernelApi", 1)
+		model:SetAttribute("ProtocolHash", protocolHash) -- 0.3.2 (P-N1)
 		for _, part in { "Server", "Shared", "Client", "include" } do
 			local folder = newInstance("Folder", part)
 			folder.Parent = model
@@ -846,10 +853,10 @@ local function payload(artifactId: string, channel: string?, extraScript: boolea
 	end
 end
 
-addAsset(1001, payload("aaaaaaa-111111", "prod"))
-addAsset(1002, payload("bbbbbbb-222222", "prod"))
+addAsset(1001, payload("aaaaaaa-111111", "prod", false, "proto-1"))
+addAsset(1002, payload("bbbbbbb-222222", "prod", false, "proto-1"))
 addAsset(1003, payload("ccccccc-333333", "dev"))
-addAsset(1004, payload("ddddddd-444444", "prod"))
+addAsset(1004, payload("ddddddd-444444", "prod", false, "proto-1"))
 addAsset(1005, payload("eeeeeee-555555", "prod", true))
 addAsset(1006, payload("fffffff-666666", "prod"), 2)
 -- 0.3.2 health tests (behaviors set per mode): G errors after ready, H's onStart fails, I fails to start.
@@ -1127,7 +1134,13 @@ if CLIENT_MODE then
 						SMOKE.clientFailures["NAME"] -= 1
 						error("client boot boom")
 					end
-					return { boot = function(kernel) SMOKE.clientKernel = kernel return function() end end }]]
+					return { boot = function(kernel)
+						SMOKE.clientKernel = kernel
+						if kernel.onResync then
+							kernel:onResync(function() SMOKE.resynced = (SMOKE.resynced or 0) + 1 end)
+						end
+						return function() end
+					end }]]
 				internals[boot].sourceText = (string.gsub(source, "NAME", name))
 				boot.Parent = folder
 			end
@@ -1157,6 +1170,14 @@ if CLIENT_MODE then
 		local report = lastReport()
 		return report ~= nil and report.g == "aaaaaaa-111111#1" and report.ok == true and report.retried == true and typeof(report.ms) == "number"
 	end) and SMOKE.clientKernel ~= nil and localPlayer.PlayerScripts:FindFirstChild("TypeTorchRetry") ~= nil)
+	-- P-N1: a resync naming this generation's artifact reaches it (the framework fails its pending calls); one naming
+	-- another artifact doesn't.
+	local net = root.Net
+	net.OnClientEvent:Fire("bbbbbbb-222222", "__tt/resync", "zzzzzzz-000000")
+	net.OnClientEvent:Fire("bbbbbbb-222222", "__tt/resync", "aaaaaaa-111111")
+	check("P-N1: the client generation hears a resync of its own artifact only", waitFor("resync", function()
+		return SMOKE.resynced == 1
+	end))
 	root:SetAttribute("ActiveGeneration", "bbbbbbb-222222#2")
 	check("client: a generation that keeps failing is reported failed after its one retry", waitFor("client B", function()
 		local report = lastReport()
@@ -1174,6 +1195,29 @@ if DEV_MODE then
 	publish("TypeTorch/deploy", { b = "dev", a = 1002, i = "bbbbbbb-222222", s = 20, c = "bbbbbbb", ch = "dev", t = nowMs() })
 	check("dev: an unsigned deploy swaps", waitFor("swap to B", function()
 		return running() == "bbbbbbb-222222" and status().appliedSeq == 20
+	end))
+	-- 0.3.2 (P-N1): a client still tagging the previous artifact (same ProtocolHash) reaches the running generation;
+	-- another protocol gets a resync that names the dropped artifact.
+	local client = newInstance("Player", "Client1")
+	client.UserId = 5
+	local net = services.ReplicatedStorage.TypeTorch.Net
+	net.OnServerEvent:Fire(client, "ddddddd-444444", "e:ping", 1)
+	check("P-N1: an old-id message of the same protocol reaches the running generation", waitFor("message", function()
+		for _, message in SMOKE.messages do
+			if message[1] == "bbbbbbb-222222" and message[2] == "e:ping" then
+				return true
+			end
+		end
+		return false
+	end))
+	net.OnServerEvent:Fire(client, "zzzzzzz-000000", "e:ping", 2)
+	check("P-N1: another protocol gets a resync naming the dropped artifact", waitFor("resync", function()
+		for _, call in firedToClient do
+			if call[1] == client and call[3] == "__tt/resync" and call[4] == "zzzzzzz-000000" then
+				return true
+			end
+		end
+		return false
 	end))
 	finish()
 end
