@@ -590,7 +590,7 @@ local subscribeFailures = {} -- topic -> number of SubscribeAsync calls that fai
 local assets = {}
 local assetVersions = {} -- version -> asset id
 local closeCallbacks = {} -- game:BindToClose
-local fakePlayers = {} -- 0.3.3 `--override`: the players in this server
+local fakePlayers = {} -- 0.3.4 `--switch`: the players in this server
 local kicked = {} -- names of players Kick was called on
 local SMOKE_CONFIG = nil -- the ConfigService snapshot in `--fleet`
 -- 0.3.2 fleet API: every RequestAsync ({ url, method, headers, body (decoded), status }); `httpScript` = status codes
@@ -673,7 +673,7 @@ local services = {
 	ConfigService = {
 		GetConfigAsync = function()
 			simWait("config")
-			if not table.find(process.args, "--fleet") and not table.find(process.args, "--override") then
+			if not table.find(process.args, "--fleet") and not table.find(process.args, "--switch") then
 				error("ConfigService unavailable (smoke)")
 			end
 			local snapshot = { UpdateAvailable = signal() }
@@ -843,11 +843,12 @@ local CLIENT_MODE = table.find(process.args, "--client") ~= nil
 -- `--fleet` (0.3.2): ConfigService holds TypeTorchFleet, so the kernel sends its fleet data over HTTP (stubbed): a
 -- reserved dev server whose head fails to start (nothing runs: the alerts and heartbeats still go out), then recovers.
 local FLEET_MODE = table.find(process.args, "--fleet") ~= nil
--- `--override` (0.3.3): the owner switches a public prod server in place to dev, to a build, and back.
-local OVERRIDE_MODE = table.find(process.args, "--override") ~= nil
-if OVERRIDE_MODE then
+-- `--switch` (0.3.4): the owner switches a public prod server to dev and back, loads builds here; Reload and Rollback
+-- keep working; no admins (a member with the old role "admin" is a dev); members with role "owner" are owners.
+local SWITCH_MODE = table.find(process.args, "--switch") ~= nil
+if SWITCH_MODE then
 	configValues.TypeTorchFleet = { url = "https://fleet.example.test/api", token = FLEET_TOKEN }
-	configValues.TypeTorch = { defaultBranch = "prod", members = { ["2"] = "admin" } }
+	configValues.TypeTorch = { defaultBranch = "prod", members = { ["2"] = "admin", ["4"] = "owner" } }
 end
 local HEALTH_MODE = table.find(process.args, "--health") ~= nil
 local HEALTH_PROD_MODE = table.find(process.args, "--health-prod") ~= nil
@@ -1207,8 +1208,8 @@ if BOOT_SCENARIO then
 	Constants.PRIVATE_READ_RETRY_DELAYS = { 1 * SCALE, 2 * SCALE, 4 * SCALE }
 	Constants.POLL_SECONDS = 60 * SCALE
 end
-if OVERRIDE_MODE then
-	Constants.OVERRIDE_GAP = 0.3
+if SWITCH_MODE then
+	Constants.SWITCH_GAP = 0.3
 	Constants.POLL_SECONDS = 0.3
 	Constants.FLEET_RETRY_DELAYS = { 0.05 }
 	Constants.FLEET_RATE_PER_MINUTE = 6000
@@ -1325,7 +1326,7 @@ local function finish()
 	check(`no unexpected errors on kernel threads{if #unexpected > 0 then ": " .. unexpected[1] else ""}`, #unexpected == 0)
 	check(`no swap ran on a thread its own stopped generation owned (busy-flag hazard){if #hazards > 0 then ": " .. hazards[1] else ""}`, #hazards == 0)
 	check("the kernel never used a MemoryStore sorted map (0.3.2: fleet status and reports are API only)", #sortedMapRequests == 0)
-	if not FLEET_MODE and not OVERRIDE_MODE then
+	if not FLEET_MODE and not SWITCH_MODE then
 		check("no HTTP request without TypeTorchFleet", #httpRequests == 0)
 	end
 	local leaked = false
@@ -1351,7 +1352,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif OVERRIDE_MODE then "--override" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -1679,17 +1680,19 @@ local function rolledBackFrom(artifactId: string, to: string): boolean
 	return health.lastRollback ~= nil and health.lastRollback.from == artifactId and running() == to
 end
 
-if OVERRIDE_MODE then
+if SWITCH_MODE then
 	local function player(userId: number, name: string)
 		local instance = newInstance("Player", name)
 		instance.UserId = userId
 		instance.Parent = GAME_ROOT -- in the game (Parent ~= nil)
 		return instance
 	end
-	local owner, admin, stranger = player(1, "Owner"), player(2, "Admin"), player(3, "Stranger")
-	table.insert(fakePlayers, owner)
-	table.insert(fakePlayers, admin)
-	table.insert(fakePlayers, stranger)
+	-- Owner = the creator (1); CoOwner = a member with role "owner" (4); Legacy = a member with the old role "admin" (2);
+	-- Stranger = no dev (3).
+	local owner, legacy, stranger, coOwner = player(1, "Owner"), player(2, "Legacy"), player(3, "Stranger"), player(4, "CoOwner")
+	for _, each in { owner, legacy, stranger, coOwner } do
+		table.insert(fakePlayers, each)
+	end
 	local net = nil
 	local nextId = 0
 	-- The player's own client asks (kernel transport, tagged "*"); returns the kernel's answer.
@@ -1698,11 +1701,11 @@ if OVERRIDE_MODE then
 		nextId += 1
 		local id = nextId
 		request.id = id
-		net.OnServerEvent:Fire(who, "*", "__tt/override", request)
+		net.OnServerEvent:Fire(who, "*", "__tt/switch", request)
 		local answer = nil
 		waitFor(`answer {id}`, function()
 			for _, call in firedToClient do
-				if call[1] == who and call[3] == "__tt/override" and type(call[4]) == "table" and call[4].id == id then
+				if call[1] == who and call[3] == "__tt/switch" and type(call[4]) == "table" and call[4].id == id then
 					answer = call[4]
 					return true
 				end
@@ -1711,42 +1714,56 @@ if OVERRIDE_MODE then
 		end, 6)
 		return answer or {}
 	end
-	local function overrideAlerts()
+	local function alerts(code: string)
 		local list = {}
 		for _, request in httpRequests do
-			if request.body and request.body.code == "owner_override" then
+			if request.body and request.body.code == code then
 				table.insert(list, request.body)
 			end
 		end
 		return list
 	end
+	local function gap()
+		task.wait(0.4) -- SWITCH_GAP is 0.3 s here
+	end
 
-	check("override: a public prod server boots the signed prod head", waitFor("boot", function()
+	check("switch: a public prod server boots the signed prod head", waitFor("boot", function()
 		return running() == "aaaaaaa-111111"
 	end) and status().signedOnly == true)
 
-	-- Only the owner and admins.
-	local refused = ask(stranger, { branch = "dev" })
-	check("override: a non-owner/admin is refused", refused.ok == false and string.find(refused.error or "", "owner or admins", 1, true) ~= nil and running() == "aaaaaaa-111111")
+	-- No admins: the old role "admin" is a dev (least privilege), with a warning; role "owner" members are owners.
+	local api = SMOKE.kernel
+	check("switch: a legacy admin member is a dev, warned once", api:devInfo(legacy).role == "dev" and said("role admin no longer exists: use owner or dev") and api:devInfo(coOwner).role == "owner" and api:devInfo(owner).role == "owner")
 
-	-- The owner switches THIS public prod server to dev, in place.
+	-- Payload code can't do it for a player: the server API refuses on a prod server.
+	local viaSwitch = api:switchBranch(owner, "dev")
+	local viaPin = api:pinArtifact(owner, 1004)
+	check("switch: no server API switches or loads unsigned builds on a prod server (payload code can't act for the owner)", api.requestSwitch == nil and api.ownerSwitch == nil and viaSwitch.ok == false and viaPin.ok == false and running() == "aaaaaaa-111111")
+
+	-- Non-owners are refused (a non-dev, a legacy admin).
+	local refused = ask(stranger, { branch = "dev" })
+	gap()
+	local refusedLegacy = ask(legacy, { branch = "dev" })
+	check("switch: non-owners are refused (a legacy admin too)", refused.ok == false and refusedLegacy.ok == false and string.find(refusedLegacy.error or "", "only the owner", 1, true) ~= nil and running() == "aaaaaaa-111111")
+
+	-- The owner switches THIS public prod server to dev: an ordinary switch, players stay.
 	local generationBefore = status().generation.number
 	local switched = ask(owner, { branch = "dev" })
+	local tooSoon = ask(owner, { branch = "prod" })
 	local s1 = status()
-	check("override: the owner switches the public prod server to dev in place", switched.ok == true and running() == "ddddddd-444444" and s1.branch == "dev" and s1.serverType == "public" and s1.generation.number > generationBefore)
-	check("override: players stay (no kick, no teleport)", #kicked == 0 and fleet().n == 3)
-	check("override: status().ov and fleetStatus().ov = {by, at, branch}", s1.ov ~= nil and s1.ov.by == 1 and s1.ov.branch == "dev" and typeof(s1.ov.at) == "number" and s1.ov.name == "Owner" and s1.ov.back == "prod" and fleet().ov ~= nil and fleet().ov.branch == "dev" and fleet().ov.name == nil)
-	check("override: an owner_override alert (warning) is posted", waitFor("alert", function()
-		local list = overrideAlerts()
-		return #list == 1 and list[1].level == "warning" and string.find(list[1].message, "switched this server to dev", 1, true) ~= nil
-	end))
-	check("override: the server logs it", said("OWNER OVERRIDE: Owner (1) switched this server to dev") and hasEvent("owner_override", "by", 1))
+	check("switch: the owner switches the public prod server to dev", switched.ok == true and running() == "ddddddd-444444" and s1.branch == "dev" and s1.serverType == "public" and s1.generation.number > generationBefore)
+	check("switch: players stay (no kick, no teleport)", #kicked == 0 and fleet().n == 4)
+	check("switch: status().switched = {by, name, at, branch}; the heartbeat's b is the branch; no ov", s1.switched ~= nil and s1.switched.by == 1 and s1.switched.name == "Owner" and s1.switched.branch == "dev" and typeof(s1.switched.at) == "number" and s1.ov == nil and fleet().b == "dev" and fleet().ov == nil)
+	check("switch: a branch_switch alert (info) is posted and the server logs it", waitFor("alert", function()
+		local list = alerts("branch_switch")
+		return #list == 1 and list[1].level == "info" and string.find(list[1].message, "switched this server to dev", 1, true) ~= nil
+	end) and said("Owner (1) switched this server to dev") and hasEvent("branch_switch", "by", 1) and #alerts("owner_override") == 0)
 
-	-- A signed prod deploy doesn't move it (it follows dev now); the prod head still moves for new servers.
+	-- A signed prod deploy doesn't move it (it follows dev now); nothing is stored, so new servers boot prod.
 	publish("TypeTorch/deploy", deployMessage("M2", FIELDS.M2, { "sig" }))
 	task.wait(0.6)
-	check("override: a signed prod deploy doesn't move it", running() == "ddddddd-444444")
-	check("override: new servers still boot the signed prod head (nothing stored for the override)", (function()
+	check("switch: a signed prod deploy doesn't move it", running() == "ddddddd-444444")
+	check("switch: new servers still boot the signed prod head (nothing stored)", (function()
 		local memoryHead = memoryStore.data.heads and memoryStore.data.heads.prod
 		for key in dataStore.data do
 			if string.sub(tostring(key), 1, 8) == "private/" then
@@ -1757,58 +1774,59 @@ if OVERRIDE_MODE then
 	end)())
 	-- A dev deploy does (dev rules: unsigned).
 	publish("TypeTorch/deploy", { b = "dev", a = 1003, i = "ccccccc-333333", s = 21, c = "ccccccc", ch = "dev", t = nowMs() })
-	check("override: a dev deploy moves it (dev rules, unsigned)", waitFor("dev deploy", function()
+	check("switch: a dev deploy moves it (dev rules, unsigned)", waitFor("dev deploy", function()
 		return running() == "ccccccc-333333" and status().appliedSeq == 21
 	end))
+	check("switch: one request per player per SWITCH_GAP", tooSoon.ok == false and string.find(tooSoon.error or "", "one switch per", 1, true) ~= nil)
+	gap()
 
-	-- Payload code can't switch on another player's behalf: no server API starts an override.
-	local api = SMOKE.kernel
-	local viaSwitch = api:switchBranch(owner, "prod")
-	local viaPin = api:pinArtifact(owner, 1001)
-	check("override: no server API starts one (payload code can't act for another player)", api.requestOverride == nil and api.applyOverride == nil and viaSwitch.ok == false and viaPin.ok == false and running() == "ccccccc-333333")
-	local tooSoon = ask(owner, { branch = "dev" })
-	local tooSoon2 = ask(owner, { back = true })
-	check("override: one request per player per OVERRIDE_GAP", tooSoon.ok == false and tooSoon2.ok == false and string.find(tooSoon2.error or "", "one switch per", 1, true) ~= nil)
-	task.wait(0.4)
+	-- Reload and Rollback work on the current branch and history (nothing locks the server).
+	local generationBeforeReload = status().generation.number
+	local reloaded = api:reload(owner)
+	check("switch: Reload works afterwards (the dev head again)", reloaded.ok == true and running() == "ccccccc-333333" and status().generation.number > generationBeforeReload)
+	local rolledBack = api:rollback(owner)
+	check("switch: Rollback works afterwards (the previous build here)", rolledBack.ok == true and running() == "ddddddd-444444")
+	local refusedRollback = api:rollback(legacy)
+	check("switch: a dev can't roll back a public (prod-channel) server", refusedRollback.ok == false and string.find(refusedRollback.error or "", "only the owner", 1, true) ~= nil)
 
-	-- An admin loads a known build in place; it holds through deploys.
-	local loaded = ask(admin, { assetId = 1001 })
-	check("override: an admin loads a known build in place (ov.artifact)", loaded.ok == true and running() == "aaaaaaa-111111" and status().ov.artifact == "aaaaaaa-111111" and status().ov.by == 2)
-	publish("TypeTorch/deploy", { b = "prod", a = 1004, i = "ddddddd-444444", s = 22, c = "ddddddd", ch = "prod", t = nowMs() })
-	task.wait(0.6)
-	check("override: a held build doesn't move on deploys", running() == "aaaaaaa-111111")
-	task.wait(0.4)
-
-	-- Back to prod: the verified prod head, by the normal signed rules.
-	local back = ask(owner, { back = true })
-	local s2 = status()
-	check("override: switching back runs the verified prod head (signed rules again)", back.ok == true and running() == "bbbbbbb-222222" and s2.ov == nil and s2.branch == "prod" and s2.signedOnly == true and s2.generation.artifact.verified ~= nil)
-	check("override: the switch-back alert too (no 60 s gap for owner_override)", waitFor("alerts", function()
-		return #overrideAlerts() == 3
+	-- Load here: a normal pin of a known build on this server; the next deploy of its branch moves it.
+	local loaded = ask(owner, { assetId = 1001 })
+	check("switch: the owner loads a build here (a normal pin)", loaded.ok == true and running() == "aaaaaaa-111111" and status().pinned == true and status().switched.artifact == "aaaaaaa-111111" and waitFor("build_load alert", function()
+		return #alerts("build_load") == 1 and alerts("build_load")[1].level == "info"
+	end), { ok = loaded.ok, running = running(), pinned = status().pinned, switched = status().switched })
+	publish("TypeTorch/deploy", { b = "dev", a = 1004, i = "ddddddd-444444", s = 22, c = "ddddddd", ch = "dev", t = nowMs() })
+	check("switch: the next deploy of the branch moves a pinned server (normal pin semantics)", waitFor("dev deploy 2", function()
+		return running() == "ddddddd-444444" and status().appliedSeq == 22
 	end))
+	gap()
+
+	-- Back to prod = Switch on the prod row: the verified prod head, by the signed rules.
+	local back = ask(owner, { branch = "prod" })
+	local s2 = status()
+	check("switch: switching to prod runs the verified prod head (signed rules again)", back.ok == true and running() == "bbbbbbb-222222" and s2.branch == "prod" and s2.signedOnly == true and s2.generation.artifact.verified ~= nil)
 	publish("TypeTorch/deploy", { b = "prod", a = 1004, i = "ddddddd-444444", s = 40, c = "ddddddd", ch = "prod", t = nowMs() })
-	check("override: after switching back an unsigned prod deploy is refused again", waitFor("refusal", function()
+	check("switch: back on prod an unsigned prod deploy is refused again", waitFor("refusal", function()
 		return rejected("deploy") >= 1
 	end) and running() == "bbbbbbb-222222")
-	task.wait(0.4)
+	gap()
 
-	-- /tt branch on a public server: the owner switches in place; /tt back.
+	-- The owner loads an unsigned dev build on the prod server (their own client only), then Reload goes back to prod.
+	local devOnProd = ask(owner, { assetId = 1003 })
+	check("switch: the owner loads a dev build on a prod server from their own client", devOnProd.ok == true and running() == "ccccccc-333333" and status().branch == "prod" and status().pinned == true)
+	local reloadProd = api:reload(owner)
+	check("switch: Reload goes back to the verified prod head", reloadProd.ok == true and running() == "bbbbbbb-222222" and status().generation.artifact.verified ~= nil)
+	gap()
+
+	-- A member with role "owner" is an owner; /tt branch works for owners.
+	local byCoOwner = ask(coOwner, { branch = "dev" })
+	check("switch: a member with role owner switches too", byCoOwner.ok == true and status().branch == "dev" and status().switched.by == 4)
+	gap()
 	local commandSignal = services.TextChatService.TypeTorchCommand.Triggered
-	commandSignal:Fire({ UserId = 1 }, "/tt branch dev")
-	check("override: /tt branch dev by the owner on a public server switches in place", waitFor("tt branch", function()
-		return status().ov ~= nil and status().branch == "dev"
+	commandSignal:Fire({ UserId = 1 }, "/tt branch prod")
+	check("switch: /tt branch prod by the owner", waitFor("tt branch", function()
+		return status().branch == "prod" and running() == "bbbbbbb-222222"
 	end))
-	task.wait(0.4)
-	commandSignal:Fire({ UserId = 1 }, "/tt back")
-	check("override: /tt back", waitFor("tt back", function()
-		return status().ov == nil and status().branch == "prod" and running() == "bbbbbbb-222222"
-	end))
-	task.wait(0.4)
-
-	-- Owner-only places: admins are refused.
-	requireInstance(kernelFolder.Access).setOverrideOwnerOnly(true)
-	local adminRefused = ask(admin, { branch = "dev" })
-	check("override: an owner-only place refuses admins", adminRefused.ok == false and string.find(adminRefused.error or "", "only the owner", 1, true) ~= nil and status().ov == nil)
+	check("switch: no /tt back, no override field anywhere", status().ov == nil and fleet().ov == nil and not said("OWNER OVERRIDE"))
 	finish()
 end
 
@@ -2200,7 +2218,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.3")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.4")
 check("status: running artifact verified main + fallback", s.generation.artifact.verified and s.generation.artifact.verified.main and s.generation.artifact.verified.fallback)
 
 -- Unsigned deploy: refused.

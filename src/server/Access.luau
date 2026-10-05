@@ -1,6 +1,8 @@
 --!nonstrict
 -- Who is a dev (plans/10): a Studio session, OR the experience owner, OR a registry member, OR a dev-badge holder,
--- AND not revoked.
+-- AND not revoked. 0.3.4: two roles, "owner" (the experience creator, the owning group's owner, members with role
+-- "owner") and "dev". There are no admins: a member with the old role "admin" is a dev (least privilege), with a warning
+-- once per server.
 -- Decided on the server only. Roblox has no in-game "edit access" API, so this is TypeTorch's own rule.
 --
 -- 0.3.2 (audit S-M2): revocation fails closed. The revocation list comes with the registry; until a registry read has
@@ -54,12 +56,37 @@ local function isOwner(player: Player): boolean
 	return owner
 end
 
+-- 0.3.4: member roles are "owner" or "dev"; anything else (the old "admin") is "dev", with a warning once per server.
+local warnedRoles: { [string]: boolean } = {}
+local function normalizedMembers(members)
+	local result = {}
+	if typeof(members) ~= "table" then
+		return result
+	end
+	for key, role in members do
+		if typeof(role) == "string" then
+			if role ~= "owner" and role ~= "dev" then
+				local warnKey = `{tostring(key)}/{role}`
+				if not warnedRoles[warnKey] then
+					warnedRoles[warnKey] = true
+					warn(`[TypeTorch] member {tostring(key)}: role {role} no longer exists: use owner or dev (treated as dev)`)
+				end
+				role = "dev"
+			end
+			result[tostring(key)] = role
+		end
+	end
+	return result
+end
+
 -- `isKnown` (0.3.2): the registry has been read on this server (Registry.known()); see S-M2 above.
 function Access.setConfig(newConfig, isKnown: boolean?)
 	if newConfig.devBadgeId ~= config.devBadgeId then
 		table.clear(badgeCache)
 	end
-	config = newConfig
+	config = table.clone(newConfig)
+	config.members = normalizedMembers(newConfig.members)
+	config.revoked = if typeof(newConfig.revoked) == "table" then newConfig.revoked else {}
 	known = isKnown == true
 end
 
@@ -91,7 +118,7 @@ local function hasBadge(userId: number): boolean
 	return owns
 end
 
--- Returns (isDev, reason, role). role is "owner" | "admin" | "dev" | nil. Reasons: "studio", "owner", "member",
+-- Returns (isDev, reason, role). role is "owner" | "dev" | nil (0.3.4: no "admin"). Reasons: "studio", "owner", "member",
 -- "badge", "revoked", "none", and (0.3.2) "registry-unknown" (a badge or member check while the revocation list is
 -- unknown).
 function Access.check(player: Player): (boolean, string, string?)
@@ -118,40 +145,24 @@ function Access.check(player: Player): (boolean, string, string?)
 	return false, "none", nil
 end
 
--- 0.3.3 (owner override): the place may make in-place switches owner-only (the OverrideOwnerOnly attribute, stamped
--- by kernel deploy from typetorch.json). Default: the owner and admins.
-local overrideOwnerOnly = false
-function Access.setOverrideOwnerOnly(value: boolean)
-	overrideOwnerOnly = value == true
-end
-function Access.overrideOwnerOnly(): boolean
-	return overrideOwnerOnly
-end
-
--- 0.3.3: whether `player` may switch THIS server in place (an owner override): the owner always (Studio counts as the
--- owner), admins unless owner-only; the same roles as experiment pins. Revoked users never.
-function Access.mayOverride(player: Player): boolean
-	local dev, _, role = Access.check(player)
-	return dev and (role == "owner" or (role == "admin" and not overrideOwnerOnly))
-end
-
 function Access.isDev(player: Player): boolean
 	local dev = Access.check(player)
 	return dev
 end
 
-function Access.isAdmin(player: Player): boolean
+-- 0.3.4: an owner (Studio counts as one): owner-only actions (A/B, public servers, prod rollbacks, kick/ban, ...).
+function Access.isOwner(player: Player): boolean
 	local dev, _, role = Access.check(player)
-	return dev and (role == "owner" or role == "admin")
+	return dev and role == "owner"
 end
 
 -- userId -> owns the experience, for users who may not be in this server (group owners: GroupService, cached).
 local ownerIdCache: { [number]: boolean } = {}
 
--- 0.2.3: whether `userId` is the owner or an admin, for messages from other servers (pin messages carry `by`). The
--- player is usually elsewhere: the registry's members, the user-owned creator, or rank 255 in the owning group (a web
--- call, cached; a failure counts as "no" for a while). Revoked users never are.
-function Access.isAdminUserId(userId: number): boolean
+-- 0.2.3: whether `userId` is an owner, for messages from other servers (pin messages carry `by`). The player is usually
+-- elsewhere: members with role "owner", the user-owned creator, or rank 255 in the owning group (a web call, cached; a
+-- failure counts as "no" for a while). Revoked users never are.
+function Access.isOwnerUserId(userId: number): boolean
 	if typeof(userId) ~= "number" or userId <= 0 or userId % 1 ~= 0 then
 		return false
 	end
@@ -162,8 +173,7 @@ function Access.isAdminUserId(userId: number): boolean
 	if RunService:IsStudio() then
 		return true
 	end
-	local role = config.members[key]
-	if role == "owner" or role == "admin" then
+	if config.members[key] == "owner" then
 		return true
 	end
 	local player = game:GetService("Players"):GetPlayerByUserId(userId)
@@ -197,7 +207,7 @@ function Access.isAdminUserId(userId: number): boolean
 	return owner
 end
 
--- 0.3: whether `userId` is a dev (owner, admin, member or dev-badge holder, not revoked), for users who may not be in
+-- 0.3: whether `userId` is a dev (owner, member or dev-badge holder, not revoked), for users who may not be in
 -- this server. Used at boot to decide whether a player-owned private server may follow its stored (game-written)
 -- branch choice. A failed web call counts as "no". 0.3.2: badge holders and members only once revocations are known.
 function Access.isDevUserId(userId: number): boolean
@@ -207,7 +217,7 @@ function Access.isDevUserId(userId: number): boolean
 	if config.revoked[tostring(userId)] then
 		return false
 	end
-	if Access.isAdminUserId(userId) then
+	if Access.isOwnerUserId(userId) then
 		return true -- before the registry is known, only the creator or the group owner can be one
 	end
 	if not known then

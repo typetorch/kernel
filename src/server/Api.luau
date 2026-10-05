@@ -104,7 +104,7 @@ function Api.forEntry(entry: Script)
 	function api:artifacts()
 		return services.artifacts()
 	end
-	-- 0.2.3: `options` = { experiment = true } pins as an A/B experiment (owner/admin; any channel, public servers
+	-- 0.2.3: `options` = { experiment = true } pins as an A/B experiment (owner only; any channel, public servers
 	-- too). Only `experiment` is read: who asked is always `player` here.
 	function api:pinArtifact(player: Player, assetId: number, options: any?)
 		local experiment = typeof(options) == "table" and options.experiment == true
@@ -134,7 +134,7 @@ function Api.forEntry(entry: Script)
 	function api:onDevChanged(fn)
 		generation.devHandler = fn
 	end
-	-- Reload this server to its branch head: the owner or admins only (checked by the kernel). Returns at once
+	-- Reload this server to its branch head: the owner only (checked by the kernel). Returns at once
 	-- ({ok, queued}); the swap runs on a kernel thread, so it survives this generation's hard stop.
 	function api:requestReload(player: Player)
 		return services.requestReload(player)
@@ -145,7 +145,7 @@ function Api.forEntry(entry: Script)
 	function api:experiment()
 		return services.experiment()
 	end
-	-- Ends this server's experiment (back to the branch head). Owner/admin on public servers, devs elsewhere.
+	-- Ends this server's experiment (back to the branch head). The owner on public servers, devs elsewhere.
 	function api:unpin(player: Player)
 		if typeof(player) ~= "Instance" or not player:IsA("Player") then
 			return { ok = false, error = "bad player" }
@@ -179,7 +179,7 @@ function Api.forEntry(entry: Script)
 	end
 	-- This server's fleet status: { t, b, c?, a?, n, m, s, u, p, k?, x?, v, q, g, h, e?, sv = 2 } (plans/01 "Fleet
 	-- status and deploy reports"). Cheap, no yield. The kernel writes it nowhere: the framework's analytics engine sends
-	-- it as a heartbeat and Admin > Servers' roll call answers with it. `k` (a reserved server's access code) is
+	-- it as a heartbeat and Manage > Servers' roll call answers with it. `k` (a reserved server's access code) is
 	-- server-only data: never send it to a client.
 	function api:fleetStatus()
 		return services.fleetStatus()

@@ -21,9 +21,10 @@
 -- reports, alerts, closing), client generation reports (P-K7), onClose per generation, and every swap game code starts
 -- runs on a kernel thread (busy-flag hazard).
 --
--- 0.3.3 (owner override): the owner, or an admin unless the place is owner-only, may switch THIS server in place to a
--- branch or a known artifact, public and prod servers included. Only from that player's own client, through the
--- kernel transport (or /tt); never stored, so new servers still boot the signed prod head. See "Owner override" below.
+-- 0.3.4 (owner switch): the dev menu's Switch and Load here are ordinary branch switches and pins on every server. On
+-- public servers, and for builds on servers that take only signed artifacts, only the owner may, and only from their own
+-- client through the kernel transport (or /tt): a public switch lasts for this server's lifetime and is never stored, so
+-- new servers still boot the signed prod head. No admin role: owners and devs. See "Owner switch" below.
 
 -- 0.3.2 (boot budget): every boot wait and cap counts from here.
 local kernelStartedAt = os.clock()
@@ -54,11 +55,8 @@ local KERNEL_BUILD = kernelFolder:GetAttribute("KernelCommit") -- P-V1: short co
 local KERNEL_HASH = kernelFolder:GetAttribute("KernelHash")
 KERNEL_BUILD = if typeof(KERNEL_BUILD) == "string" and KERNEL_BUILD ~= "" then KERNEL_BUILD else nil
 KERNEL_HASH = if typeof(KERNEL_HASH) == "string" and KERNEL_HASH ~= "" then KERNEL_HASH else nil
--- 0.3.3: OverrideOwnerOnly (stamped by kernel deploy from typetorch.json): in-place switches for the owner only.
-local OVERRIDE_OWNER_ONLY = kernelFolder:GetAttribute("OverrideOwnerOnly") == true or kernelFolder:GetAttribute("OverrideOwnerOnly") == "true"
 
 local Access = require(script.Parent.Access)
-Access.setOverrideOwnerOnly(OVERRIDE_OWNER_ONLY)
 local Api = require(script.Parent.Api)
 local Logs = require(script.Parent.Logs)
 local Registry = require(script.Parent.Registry)
@@ -216,27 +214,12 @@ local restoring = false -- 0.3.2: restoreLastKnownGood is running (a failed cand
 local lastErrorText, lastErrorAt = nil, nil -- 0.3.2: the newest error worth a look (fleet status `e`)
 local lastHealthRollback = nil -- 0.3.2: { from, to?, why, at } of the last health-window rollback
 local closing = false -- 0.3.2: BindToClose ran: no more swaps
--- 0.3.3 OWNER OVERRIDE: { kind = "branch" | "artifact", branch (the one it follows), artifact?, assetId?, seq?, head?
--- (artifact), by, byName, at } while the owner or an admin holds THIS server on another branch or build. In memory only.
--- `naturalBranch` = the branch the server has without it (switching back returns there, by the normal rules).
-local ownerOverride = nil
-local naturalBranch = nil
-local applyOverride -- (player, request) -> report, defined with the other controls below
-local OVERRIDE_BUSY = "an owner override holds this server: switch back first"
-
--- `ov` for status() and fleetStatus(): { by, at, branch } or { by, at, artifact }.
-local function overrideInfo()
-	if not ownerOverride then
-		return nil
-	end
-	local kind = ownerOverride.kind
-	return {
-		by = ownerOverride.by,
-		at = ownerOverride.at,
-		branch = if kind == "branch" then ownerOverride.branch else nil,
-		artifact = if kind == "artifact" then ownerOverride.artifact else nil,
-	}
-end
+-- 0.3.4 (owner switch): the last branch switch or build load on THIS server, for status().switched ("switched by
+-- <name> 3m ago"): { by, name, at, branch, artifact? }. `ownerBranch`: the dev branch the owner switched THIS public
+-- server to; it follows dev rules here (in memory only: never stored, so new servers still boot the signed prod head).
+local lastSwitch = nil
+local ownerBranch = nil
+local ownerSwitch -- (player, request) -> report, defined with the other controls below
 local failing = nil -- P-K2: { seq, assetId, attempts, nextAt } of the deploy that failed here (see noteFailure)
 local ownAccessCode = nil -- 0.3.2: a reserved server's own access code (private/<id>.code), for its fleet status `k`
 
@@ -362,9 +345,9 @@ local function requiresSignatures(branch: string?): boolean
 	if kind == "studio" then
 		return false
 	end
-	-- 0.3.3: an owner override follows its dev branch by dev rules (this server only). A prod-channel target, and the
-	-- way back, keep the signed rules.
-	if ownerOverride and branch == ownerOverride.branch and trustedChannelOf(branch) == "dev" then
+	-- 0.3.4: a public server the owner switched to a dev branch follows it by dev rules (this server only). A switch to a
+	-- prod-channel branch keeps the signed rules.
+	if kind == "public" and ownerBranch ~= nil and branch == ownerBranch and trustedChannelOf(branch) == "dev" then
 		return false
 	end
 	if kind == "public" then
@@ -637,8 +620,6 @@ local function sendDevStatus(player: Player)
 		reason = reason,
 		role = role,
 		channel = if current then current.channel else nil,
-		-- 0.3.3: this player may switch this server in place (the dev menu's Switch / Load here).
-		canOverride = Access.mayOverride(player) or nil,
 	})
 	if player.Parent == nil then
 		return -- left while Access.check yielded
@@ -1214,12 +1195,12 @@ local function healthState(): string
 end
 
 -- 0.3.2 (P-O1): this server's fleet status (api:fleetStatus()), the heartbeat the analytics engine sends and the
--- framework's Admin > Servers roll call answers with. Contract (plans/01 "Fleet status and deploy reports"):
+-- framework's Manage > Servers roll call answers with. Contract (plans/01 "Fleet status and deploy reports"):
 --   { t = server type, b = branch, c = effective channel?, a = artifact id?, n = players, m = max players,
 --     s = server start (unix s), u = now (unix s), p = place id, k = reserved access code (server-only data)?,
 --     x = 1 during an A/B experiment?, v = kernel version, q = applied seq, g = generation number (0 = none),
 --     h = "ok" | "failed" | "unverified" | "degraded", e = last error (<= 200 bytes)?, sv = 2 }
--- t..v are the fields the framework's admin heartbeat had before 0.3.2. `e` only while it is recent (15 min) or the
+-- t..v are the fields the framework's own server heartbeat had before 0.3.2. `e` only while it is recent (15 min) or the
 -- server isn't healthy. Cheap: no yield, no web call.
 local function fleetStatus()
 	local kind = serverType()
@@ -1242,7 +1223,6 @@ local function fleetStatus()
 		g = if current then current.number else 0,
 		h = health,
 		e = if recentError then lastErrorText else nil,
-		ov = overrideInfo(), -- 0.3.3: an owner override holds this server
 		sv = 2,
 	}
 end
@@ -1325,7 +1305,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		-- (head.requireChannel); experiments (signed remote pins) may be any channel. Local payloads: modules only.
 		local generation = mount(payload, head, {
 			requireChannel = if signedOnly and (how == "signed" or how == "bootstrap" or how == "blind") then "prod" else nil,
-			modulesOnly = signedOnly or isLocal or serverType() == "public" or ownerOverride ~= nil,
+			modulesOnly = signedOnly or isLocal or serverType() == "public",
 		})
 		generation.localPayload = isLocal or nil
 		-- 0.3 boot fail-safe: a generation from an unverified head is flagged until a verified head replaces or vouches
@@ -1702,9 +1682,6 @@ local function followHead(reason: string, jitter: boolean?)
 	if not myBranch or localMode then
 		return
 	end
-	if ownerOverride and ownerOverride.kind == "artifact" then
-		return -- 0.3.3: an owner override holds this build until it is switched back
-	end
 	local head = headFor(myBranch)
 	if requiresSignatures(myBranch) then
 		local best = if head and typeof(head.seq) == "number" then head.seq else -1
@@ -1770,13 +1747,11 @@ end
 
 Registry.onChange(function(state)
 	Access.setConfig(state, Registry.known())
-	-- Public servers always run the default branch. ConfigService may arrive after boot (P-K5) or change it.
-	if ownerOverride and serverType() == "public" and typeof(state.defaultBranch) == "string" then
-		naturalBranch = state.defaultBranch -- 0.3.3: the override stays; switching back goes to the new default
-	elseif myBranch and serverType() == "public" and typeof(state.defaultBranch) == "string" and state.defaultBranch ~= myBranch then
+	-- Public servers run the default branch. ConfigService may arrive after boot (P-K5) or change it. 0.3.4: a public
+	-- server the owner switched keeps the owner's branch.
+	if myBranch and serverType() == "public" and not lastSwitch and typeof(state.defaultBranch) == "string" and state.defaultBranch ~= myBranch then
 		print(`[TypeTorch] default branch is now {state.defaultBranch} (was {myBranch})`)
 		myBranch = state.defaultBranch
-		naturalBranch = myBranch
 		appliedSeq = -1 -- a new branch (from ConfigService, which game code can't write); its newest head wins
 	end
 	for _, player in Players:GetPlayers() do
@@ -1888,11 +1863,6 @@ local function onDeployMessage(message)
 		sigF = sigF,
 	}, entries)
 	if data.b ~= myBranch then
-		return
-	end
-	if ownerOverride and ownerOverride.kind == "artifact" then
-		print(`[TypeTorch] deploy {tostring(data.i)} for {data.b} not applied: an owner override holds {ownerOverride.artifact}`)
-		reportOnce({ seq = seq, branch = data.b, artifactId = data.i, assetId = data.a }, "skipped", { e = "an owner override holds another build here" })
 		return
 	end
 	if localMode then
@@ -2125,7 +2095,7 @@ end
 
 -- The seq a pin on `branch` must stay at: the branch head's seq (or the pinned deploy's, if it's newer on that branch).
 local function pinSeq(branch: string, entry): number
-	local head = Registry.branchHead(branch)
+	local head = if requiresSignatures(branch) then signedHead(branch) else Registry.branchHead(branch)
 	local seq = if head and typeof(head.seq) == "number" then head.seq else 0
 	if entry.branch == branch and typeof(entry.seq) == "number" then
 		seq = math.max(seq, entry.seq)
@@ -2275,7 +2245,7 @@ local function reload(player: Player?)
 		return { ok = false, error = why }
 	end
 	-- 0.3.1: a Studio session on the local payload reloads a fresh clone of it.
-	local head = if localMode then localHead() elseif ownerOverride and ownerOverride.kind == "artifact" then ownerOverride.head else headFor(myBranch)
+	local head = if localMode then localHead() else headFor(myBranch)
 	if not head then
 		if localMode then
 			return { ok = false, error = "no ServerStorage.TypeTorchDev.Payload to reload" }
@@ -2283,7 +2253,7 @@ local function reload(player: Player?)
 		return { ok = false, error = `branch {myBranch} has no {if requiresSignatures(myBranch) then "signed " else ""}artifact` }
 	end
 	local kind = serverType()
-	if storedPin and not ownerOverride and (kind == "private" or kind == "reserved") then
+	if storedPin and (kind == "private" or kind == "reserved") then
 		-- Back to the branch head for good: drop the stored pin (keeps the branch).
 		if Registry.setPrivateBranch(game.PrivateServerId, myBranch, if player then player.UserId else 0) then
 			storedPin = false
@@ -2301,11 +2271,8 @@ local function rollback(player: Player?)
 	if not allowed then
 		return { ok = false, error = why }
 	end
-	if player and current and current.channel == "prod" and not Access.isAdmin(player) then
-		return { ok = false, error = "only admins can roll back a prod-channel server" }
-	end
-	if ownerOverride then
-		return { ok = false, error = OVERRIDE_BUSY }
+	if player and current and current.channel == "prod" and not Access.isOwner(player) then
+		return { ok = false, error = "only the owner can roll back a prod-channel server" }
 	end
 	for index = #history - 1, 1, -1 do
 		local entry = history[index]
@@ -2318,13 +2285,15 @@ local function rollback(player: Player?)
 end
 
 -- Swaps THIS server to a known artifact and holds it there until a newer deploy seq for this server's branch arrives.
--- Devs on private/reserved/studio servers; on public servers only owner/admin, and only prod-channel artifacts.
--- 0.2.3: `options.experiment = true` is an A/B experiment pin (owner/admin only): ANY known artifact, any channel,
+-- Devs on private/reserved/studio servers; on public servers only the owner, and only prod-channel artifacts.
+-- 0.2.3: `options.experiment = true` is an A/B experiment pin (owner only): ANY known artifact, any channel,
 -- also on public servers. The effective channel stays "prod" there (public), so devtools stay read-only. It holds until
 -- the next deploy of this server's branch (that reaches this server), an unpin, or the server closing; it is never
 -- stored. `options.by` / `options.remote` come only from pin messages (Api.luau passes `experiment` alone).
 -- 0.3: on prod servers (public; private on a prod branch) only signed remote pins (`options.signed`, set by
 -- onPinMessage after it verified them) work; dev menu and /tt pins there are refused ("use the CLI: typetorch pin").
+-- 0.3.4: and the owner's own pins (`options.owner`, set only by ownerSwitch: the owner's own client or /tt): any known
+-- build, any channel, on this server only (modules only; never stored on a prod server, a restart couldn't verify it).
 local PROD_PIN_ERROR = "prod servers take only signed pins: use the CLI (typetorch pin)"
 
 local function pinArtifact(player: Player?, assetId: number, options)
@@ -2332,11 +2301,12 @@ local function pinArtifact(player: Player?, assetId: number, options)
 	if not allowed then
 		return { ok = false, error = why }
 	end
-	if ownerOverride then
-		return { ok = false, error = OVERRIDE_BUSY } -- 0.3.3 (remote pins too: the owner's choice wins)
+	local ownerPin = typeof(options) == "table" and options.owner == true and player ~= nil
+	if ownerPin and not Access.isOwner(player) then
+		return { ok = false, error = "only the owner can load a build on this server" }
 	end
 	-- 0.3: say so before any lookup (the check below admits only signed pins on prod servers).
-	if player and requiresSignatures(myBranch) then
+	if player and requiresSignatures(myBranch) and not ownerPin then
 		return { ok = false, error = PROD_PIN_ERROR }
 	end
 	if typeof(assetId) ~= "number" then
@@ -2345,11 +2315,11 @@ local function pinArtifact(player: Player?, assetId: number, options)
 	local experiment = typeof(options) == "table" and options.experiment == true
 	local by = if player then player.UserId elseif typeof(options) == "table" and typeof(options.by) == "number" then options.by else nil
 	local kind = serverType()
-	if experiment and player and not Access.isAdmin(player) then
-		return { ok = false, error = "only the owner or admins can start an experiment" }
+	if experiment and player and not Access.isOwner(player) then
+		return { ok = false, error = "only the owner can start an experiment" }
 	end
-	if kind == "public" and player and not Access.isAdmin(player) then
-		return { ok = false, error = "only the owner or admins can pin a public server" }
+	if kind == "public" and player and not Access.isOwner(player) then
+		return { ok = false, error = "only the owner can pin a public server" }
 	end
 	Registry.refreshStoredHead(myBranch, 3)
 	local entry = findArtifact(assetId, myBranch)
@@ -2357,17 +2327,21 @@ local function pinArtifact(player: Player?, assetId: number, options)
 		return { ok = false, error = `asset {assetId} is not a known deployment` }
 	end
 	local channel = entry.channel or Registry.channelOf(entry.branch)
-	if kind == "public" and channel ~= "prod" and not experiment then
+	if kind == "public" and channel ~= "prod" and not experiment and not ownerPin then
 		return { ok = false, error = "dev-channel artifacts run on public servers only as an experiment" }
 	end
 	local head = pinHead(entry)
-	if kind == "public" and not experiment then
+	if kind == "public" and not experiment and not ownerPin then
 		head.requireChannel = "prod"
 	end
-	-- 0.3 (user decision): on prod servers only a signed remote pin (onPinMessage checked it) is a way in.
-	if requiresSignatures(myBranch) then
+	-- 0.3 (user decision): on prod servers only a signed remote pin (onPinMessage checked it) is a way in; 0.3.4: and
+	-- the owner's own pin.
+	local signedOnly = requiresSignatures(myBranch)
+	if signedOnly then
 		if typeof(options) == "table" and options.signed == true then
 			admit(head, "pin")
+		elseif ownerPin then
+			admit(head, "owner")
 		else
 			if not player then
 				refuse("pin", "an unsigned pin on a prod server", { assetId = assetId, by = by })
@@ -2378,7 +2352,7 @@ local function pinArtifact(player: Player?, assetId: number, options)
 	local seq = pinSeq(myBranch, entry)
 	if experiment then
 		head.experiment = { artifactId = entry.artifactId or `asset-{assetId}`, assetId = assetId, by = by, since = os.time() }
-	elseif kind == "private" or kind == "reserved" then
+	elseif (kind == "private" or kind == "reserved") and not (ownerPin and signedOnly) then
 		-- The pin survives a restart of this private server (until the branch gets a newer deploy).
 		local pin = table.clone(head)
 		pin.pinned = nil
@@ -2395,6 +2369,7 @@ local function pinArtifact(player: Player?, assetId: number, options)
 	Registry.logEvent({
 		action = "pin",
 		experiment = experiment or nil,
+		owner = ownerPin or nil,
 		remote = (typeof(options) == "table" and options.remote == true) or nil,
 		from = current and current.artifact.id,
 		to = entry.artifactId or `asset-{assetId}`,
@@ -2421,17 +2396,14 @@ end
 
 -- 0.2.3: ends this server's A/B experiment: back to its branch head (the server may then run a newer artifact than
 -- before the experiment, e.g. one it skipped as outside a partial rollout). Remote unpins pass `assetId` to end only
--- that experiment. Owner/admin on public servers, any dev elsewhere; `player` nil = a pin message (checked there).
+-- that experiment. The owner on public servers, any dev elsewhere; `player` nil = a pin message (checked there).
 local function unpin(player: Player?, by: number?, assetId: number?)
 	local allowed, why = requireDev(player)
 	if not allowed then
 		return { ok = false, error = why }
 	end
-	if player and serverType() == "public" and not Access.isAdmin(player) then
-		return { ok = false, error = "only the owner or admins can unpin a public server" }
-	end
-	if ownerOverride then
-		return { ok = false, error = OVERRIDE_BUSY }
+	if player and serverType() == "public" and not Access.isOwner(player) then
+		return { ok = false, error = "only the owner can unpin a public server" }
 	end
 	local experiment = current and current.head.experiment
 	if not experiment then
@@ -2456,6 +2428,17 @@ local function unpin(player: Player?, by: number?, assetId: number?)
 	return report
 end
 
+-- 0.3.4: a branch switch or build load is printed, logged and posted to the fleet API (info); status().switched shows it.
+local function noteSwitch(player: Player?, code: string, text: string, branch: string, artifact: string?)
+	local name = if player then player.Name else "?"
+	local by = if player then player.UserId else nil
+	lastSwitch = { by = by, name = name, at = os.time(), branch = branch, artifact = artifact }
+	print(`[TypeTorch] {name} ({by or "?"}) {text}`)
+	Registry.logEvent({ action = code, by = by, what = clip(text, 200), job = game.JobId })
+	fleetAlert("info", code, `{name} ({by or "?"}) {text}`, nil, true)
+end
+
+-- Private, reserved and Studio servers: the stored switch (devs; it survives a restart). Public servers: ownerSwitch.
 local function switchBranch(player: Player?, branch: string)
 	local allowed, why = requireDev(player)
 	if not allowed then
@@ -2463,10 +2446,7 @@ local function switchBranch(player: Player?, branch: string)
 	end
 	local kind = serverType()
 	if kind == "public" then
-		return { ok = false, error = "public servers always run the default branch; use /tt new <branch>" }
-	end
-	if ownerOverride then
-		return { ok = false, error = OVERRIDE_BUSY }
+		return { ok = false, error = "only the owner switches a public server (dev menu or /tt branch)" }
 	end
 	Registry.refreshStoredHead(branch, 3)
 	-- 0.3: a prod branch gives only a signed head (this server then requires signatures).
@@ -2482,81 +2462,47 @@ local function switchBranch(player: Player?, branch: string)
 		storedPin = false
 	end
 	myBranch = branch
-	naturalBranch = branch
 	appliedSeq = head.seq or 0
-	return swapTo(head, "branch", if player then player.UserId else nil)
+	local report = swapTo(head, "branch", if player then player.UserId else nil)
+	if report.ok then
+		noteSwitch(player, "branch_switch", `switched this server to {branch} ({head.artifactId or head.assetId})`, branch)
+	end
+	return report
 end
 
--- 0.3.3 OWNER OVERRIDE ---------------------------------------------------------------------------------------------
--- The owner, or an admin unless the place is owner-only (Access.mayOverride: the roles of experiment pins), switches
--- THIS server in place: to a branch (it then follows that branch's head; dev rules for a dev branch) or to a known
--- build (an entry of this server's history or the deployment lists; it holds that build). Public and prod servers
--- included. It holds until the server closes or the owner/admin switches back, which returns to the verified head of
--- `naturalBranch` by the normal signed rules. Never stored (no head, private record or BootstrapHeads): new servers boot
--- the signed prod head, and prod signing for deploy messages, stored heads and remote pins is unchanged.
--- The ONLY ways in: the requesting player's own client through the kernel transport (CHANNEL_OVERRIDE), and /tt. No
--- server API starts one, so payload code can't do it on another player's behalf. Each switch is printed, logged and
--- posted to the fleet API as an `owner_override` alert (warning).
-
-local function announceOverride(player: Player, text: string)
-	print(`[TypeTorch] OWNER OVERRIDE: {player.Name} ({player.UserId}) {text}`)
-	Registry.logEvent({ action = "owner_override", by = player.UserId, what = clip(text, 200), job = game.JobId })
-	fleetAlert("warning", "owner_override", `{player.Name} ({player.UserId}) {text}`, nil, true)
-end
-
--- `request` = { branch = name } | { assetId = n } | { back = true }. Kernel threads only.
-applyOverride = function(player: Player, request)
+-- 0.3.4 OWNER SWITCH ---------------------------------------------------------------------------------------------------
+-- What the dev menu's Switch and Load here send from the player's own client (CHANNEL_SWITCH), and /tt branch / pin.
+-- Ordinary switches and pins, routed by server type:
+--   { branch }: private/reserved/Studio servers take the stored switch (devs). Public servers: the owner only; the
+--     server follows that branch for its lifetime (dev rules for a dev branch: ownerBranch; the signed head for a prod
+--     one), never stored, so new servers still boot the signed prod head. Back to prod = a switch to the prod branch.
+--   { assetId }: a normal pin of that known build on this server. On public servers and servers that take only signed
+--     artifacts the owner's own pin (any channel, modules only, held until the next deploy of this server's branch);
+--     elsewhere the dev pin.
+-- No server API starts the owner's way in, so payload code can't act on another player's behalf.
+ownerSwitch = function(player: Player, request)
 	if typeof(player) ~= "Instance" or not player:IsA("Player") or player.Parent == nil then
 		return { ok = false, error = "bad player" }
-	end
-	if not Access.mayOverride(player) then
-		return { ok = false, error = if Access.overrideOwnerOnly() then "only the owner can switch this server" else "only the owner or admins can switch this server" }
-	end
-	if closing then
-		return { ok = false, error = "the server is closing" }
-	end
-	if localMode then
-		return { ok = false, error = "this Studio session runs the local payload: use Reload" }
 	end
 	if typeof(request) ~= "table" then
 		return { ok = false, error = "bad request" }
 	end
-	naturalBranch = naturalBranch or myBranch
-	local previous, oldBranch, oldSeq = ownerOverride, myBranch, appliedSeq
-	-- Load or mount refused: the old generation still runs, so nothing changed.
-	local function undoUnless(report)
-		if not report.ok and not report.queued and report.stage ~= "start" then
-			ownerOverride, myBranch, appliedSeq = previous, oldBranch, oldSeq
-			return false
-		end
-		return true
+	if closing then
+		return { ok = false, error = "the server is closing" }
 	end
-	local wantsBranch = typeof(request.branch) == "string"
-	if request.back == true or (wantsBranch and ownerOverride ~= nil and request.branch == naturalBranch) then
-		if not ownerOverride then
-			return { ok = false, error = "this server isn't overridden" }
-		end
-		ownerOverride = nil -- the normal rules from here (signed on prod)
-		Registry.refreshStoredHead(naturalBranch, 3)
-		local head = headFor(naturalBranch)
-		if not head then
-			ownerOverride = previous
-			return { ok = false, error = `no {if requiresSignatures(naturalBranch) then "verified " else ""}build on {naturalBranch}` }
-		end
-		myBranch = naturalBranch
-		appliedSeq = if typeof(head.seq) == "number" then head.seq else 0
-		local report = swapTo(head, "branch", player.UserId)
-		if undoUnless(report) then
-			announceOverride(player, `switched this server back to {naturalBranch} ({head.artifactId or head.assetId})`)
-		end
-		return report
-	end
-	if wantsBranch then
+	local kind = serverType()
+	if typeof(request.branch) == "string" then
 		local branch = request.branch
 		if #branch == 0 or #branch > 64 or string.find(branch, "%c") then
 			return { ok = false, error = "bad branch" }
 		end
-		if branch == myBranch and (not ownerOverride or ownerOverride.kind == "branch") then
+		if kind ~= "public" then
+			return switchBranch(player, branch)
+		end
+		if not Access.isOwner(player) then
+			return { ok = false, error = "only the owner can switch a public server" }
+		end
+		if branch == myBranch then
 			return { ok = false, error = `this server already runs {branch}` }
 		end
 		Registry.refreshStoredHead(branch, 3)
@@ -2565,52 +2511,49 @@ applyOverride = function(player: Player, request)
 		if not head or typeof(head.assetId) ~= "number" then
 			return { ok = false, error = `no {if devRules then "" else "signed "}build on {branch}` }
 		end
-		ownerOverride = { kind = "branch", branch = branch, by = player.UserId, byName = player.Name, at = os.time() }
+		local old = { myBranch, appliedSeq, ownerBranch, lastSwitch }
+		ownerBranch = if devRules then branch else nil
 		myBranch = branch
 		appliedSeq = if typeof(head.seq) == "number" then head.seq else 0
+		lastSwitch = { by = player.UserId, name = player.Name, at = os.time(), branch = branch } -- keeps it off the default
 		local report = swapTo(head, "branch", player.UserId)
-		if undoUnless(report) then
-			announceOverride(player, `switched this server to {branch} ({head.artifactId or head.assetId}{if typeof(head.seq) == "number" then ` #{head.seq}` else ""})`)
+		if not report.ok and not report.queued and report.stage ~= "start" then
+			myBranch, appliedSeq, ownerBranch, lastSwitch = old[1], old[2], old[3], old[4] -- the old generation still runs
+			return report
 		end
+		noteSwitch(player, "branch_switch", `switched this server to {branch} ({head.artifactId or head.assetId}{if typeof(head.seq) == "number" then ` #{head.seq}` else ""})`, branch)
 		return report
 	end
 	if typeof(request.assetId) == "number" then
-		local assetId = request.assetId
-		Registry.refreshStoredHead(myBranch, 3)
-		local entry = findArtifact(assetId, myBranch)
-		if not entry then
-			return { ok = false, error = `asset {assetId} is not a known build` }
+		if kind ~= "public" and not requiresSignatures(myBranch) then
+			return pinArtifact(player, request.assetId) -- a dev server: the dev pin
 		end
-		if current and sameDeploy(current.artifact, entry) then
-			return { ok = false, error = "this server already runs that build" }
+		if not Access.isOwner(player) then
+			return { ok = false, error = "only the owner can load a build on this server" }
 		end
-		-- The owner's choice admits it on a prod server (a signed pin isn't needed for THIS server); modules only.
-		local head = admit(pinHead(entry), "override")
-		local artifact = entry.artifactId or `asset-{assetId}`
-		ownerOverride = { kind = "artifact", branch = entry.branch, artifact = artifact, assetId = assetId, seq = entry.seq, head = head, by = player.UserId, byName = player.Name, at = os.time() }
-		myBranch = entry.branch
-		local report = swapTo(head, "pin", player.UserId)
-		if undoUnless(report) then
-			announceOverride(player, `loaded {artifact}{if typeof(entry.seq) == "number" then ` #{entry.seq}` else ""} on this server`)
+		local report = pinArtifact(player, request.assetId, { owner = true })
+		if report.ok then
+			local artifact = report.artifactId or `asset-{request.assetId}`
+			noteSwitch(player, "build_load", `loaded {artifact} on this server`, myBranch, artifact)
 		end
 		return report
 	end
 	return { ok = false, error = "bad request" }
 end
 
--- The requesting player's own client asks (CHANNEL_OVERRIDE, tagged "*"): the kernel acts for that Player only.
+-- The requesting player's own client asks (CHANNEL_SWITCH, tagged "*"): the kernel acts for that Player only.
 do -- (scoped: the main chunk is near Luau's 200-local limit)
 	local lastRequest: { [Player]: number } = {}
 	Players.PlayerRemoving:Connect(function(player)
 		lastRequest[player] = nil
 	end)
-	Transport.onKernel(Constants.CHANNEL_OVERRIDE, function(player: Player, request)
+	Transport.onKernel(Constants.CHANNEL_SWITCH, function(player: Player, request)
 		if typeof(request) ~= "table" then
 			return
 		end
 		local id = if typeof(request.id) == "number" then request.id else nil
 		local function reply(result)
-			Transport.kernelSend(player, Constants.CHANNEL_OVERRIDE, {
+			Transport.kernelSend(player, Constants.CHANNEL_SWITCH, {
 				id = id,
 				ok = result.ok == true,
 				error = if result.error ~= nil then clip(tostring(result.error), 200) else nil,
@@ -2619,31 +2562,30 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 			})
 		end
 		local now = os.clock()
-		if lastRequest[player] and now - lastRequest[player] < Constants.OVERRIDE_GAP then
-			reply({ ok = false, error = `one switch per {Constants.OVERRIDE_GAP} s` })
+		if lastRequest[player] and now - lastRequest[player] < Constants.SWITCH_GAP then
+			reply({ ok = false, error = `one switch per {Constants.SWITCH_GAP} s` })
 			return
 		end
 		lastRequest[player] = now
 		spawnOnKernel(function()
-			local ok, result = pcall(applyOverride, player, {
+			local ok, result = pcall(ownerSwitch, player, {
 				branch = if typeof(request.branch) == "string" then request.branch else nil,
 				assetId = if typeof(request.assetId) == "number" then request.assetId else nil,
-				back = request.back == true or nil,
 			})
 			reply(if ok and typeof(result) == "table" then result else { ok = false, error = tostring(result) })
 		end)
 	end)
 end
 
--- 0.2.2: a reload that game code can offer (an admin panel). Only the owner or admins, decided here. The swap runs on
+-- 0.2.2: a reload that game code can offer (an owner panel). Only the owner, decided here. The swap runs on
 -- a kernel thread (spawnOnKernel): the caller is a thread of the generation the reload stops, and the hard stop would
 -- kill it, and the swap with it, halfway through. Returns at once.
 local function requestReload(player: Player)
 	if typeof(player) ~= "Instance" or not player:IsA("Player") then
 		return { ok = false, error = "bad player" }
 	end
-	if not Access.isAdmin(player) then
-		return { ok = false, error = "only the owner or admins can reload" }
+	if not Access.isOwner(player) then
+		return { ok = false, error = "only the owner can reload" }
 	end
 	if not localMode and not Registry.branchHead(myBranch) then
 		return { ok = false, error = `branch {myBranch} has no artifact` }
@@ -2742,7 +2684,7 @@ local function newServer(player: Player, branch: string, assetId: number?)
 		return { ok = false, error = tostring(code) }
 	end
 	-- 0.3.2: the access code goes in the record too (server-only), so the new server can give it in its fleet status
-	-- (`k`) and Admin > Servers can join it.
+	-- (`k`) and Manage > Servers can join it.
 	local saved, err = Registry.setPrivateBranch(privateServerId, branch, player.UserId, pin, code)
 	if not saved then
 		return { ok = false, error = `could not save the branch: {err}` }
@@ -2880,16 +2822,8 @@ local function status()
 		reports = { total = reportsTotal, kept = #recentReports, listeners = #reportListeners },
 		-- 0.3.2 (P-K7): client generation reports.
 		clients = clientSummary(),
-		-- 0.3.3: an owner override holds this server: { by, at, branch | artifact, name, back, seq? }.
-		ov = (function()
-			local info = overrideInfo()
-			if info then
-				info.name = ownerOverride.byName
-				info.back = naturalBranch
-				info.seq = if current then current.artifact.seq else nil
-			end
-			return info
-		end)(),
+		-- 0.3.4: the last branch switch or build load here: { by, name, at, branch, artifact? }.
+		switched = if lastSwitch then table.clone(lastSwitch) else nil,
 	}
 end
 
@@ -2917,8 +2851,8 @@ end
 -- the artifact must be a known deployment); `unpin` ends an experiment (only one on asset `a`, if given).
 -- TRUST (0.3): prod servers act only on pins signed like deploy messages (`sig` / `sigF` over the pin canonical
 -- string, plans/03; the CLI signs them). Dev servers still take unsigned pins. Also: strict fields, a 120 s freshness
--- window (the signed `t`), and `by` must be the owner or an admin by the registry. The framework's Admin > Servers
--- publishes unsigned pins (admin.ab, owner/admin only, rate-limited), so those reach dev servers only.
+-- window (the signed `t`), and `by` must be an owner (0.3.4: no admins). The framework's Manage > Servers publishes
+-- unsigned pins (admin.ab, owners only, rate-limited), so those reach dev servers only.
 
 local checkPinMessage -- (data) -> (ok, why?)
 do -- (scoped: the main chunk is near Luau's 200-local limit)
@@ -3005,8 +2939,8 @@ local function onPinMessage(message)
 			return
 		end
 	end
-	if not Access.isAdminUserId(data.by) then
-		warn(`[TypeTorch] pin message ignored: {data.by} is not the owner or an admin`)
+	if not Access.isOwnerUserId(data.by) then
+		warn(`[TypeTorch] pin message ignored: {data.by} is not an owner`)
 		return
 	end
 	lastPin = {
@@ -3033,7 +2967,7 @@ local function onPinMessage(message)
 	print("[TypeTorch] pin message " .. HttpService:JSONEncode(report))
 end
 
--- 0.3.2: game code (the framework's dev menu, admin panels) calls these from its own threads; each runs on a kernel
+-- 0.3.2: game code (the framework's dev menu, owner panels) calls these from its own threads; each runs on a kernel
 -- thread (busy-flag hazard) and the caller waits for the report, unless its generation is swapped out meanwhile.
 local function onKernel(fn)
 	return function(...)
@@ -3081,7 +3015,7 @@ Api.init({
 -- /tt chat commands (TextChatCommand), the fallback when a generation is broken --------------------------------------
 
 do -- (scoped: the main chunk is near Luau's 200-local limit)
-	local HELP = "/tt status | branch <name> | back | new <branch> [assetId] | pin <assetId> | unpin | reload | rollback | dev"
+	local HELP = "/tt status | branch <name> | new <branch> [assetId] | pin <assetId> | unpin | reload | rollback | dev"
 
 	local function describe(report): string
 		if report.ok then
@@ -3109,19 +3043,13 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 				pinned ..= ", local payload"
 			end
 			local signing = if s.signedOnly then `, signed only ({s.signing.mode}{if s.rejected.total > 0 then `, {s.rejected.total} rejected` else ""})` else ""
-			if s.ov then
-				pinned ..= `, OWNER OVERRIDE by {s.ov.name or s.ov.by} (back: {s.ov.back})`
+			if s.switched then
+				pinned ..= `, switched by {s.switched.name}`
 			end
 			notice(player, `{s.serverType} server, branch {s.branch} ({s.channel or "?"}), {if s.generation then s.generation.name else "no generation"}{pinned}, up {s.uptime}s, kernel {s.kernelVersion}{if s.kernelBuild then `@{s.kernelBuild}` else ""}{signing}`)
 		elseif command == "branch" and argument then
-			-- 0.3.3: the owner/admins switch a public server (or an overridden one) in place; elsewhere the stored switch.
-			if Access.mayOverride(player) and (serverType() == "public" or ownerOverride ~= nil) then
-				notice(player, describe(applyOverride(player, { branch = argument })))
-			else
-				notice(player, describe(switchBranch(player, argument)))
-			end
-		elseif command == "back" then
-			notice(player, describe(applyOverride(player, { back = true })))
+			-- 0.3.4: the owner switches a public server for its lifetime; elsewhere the stored switch (ownerSwitch routes).
+			notice(player, describe(ownerSwitch(player, { branch = argument })))
 		elseif command == "new" and argument then
 			local assetId = tonumber(words[3])
 			local report = newServer(player, argument, assetId)
@@ -3129,13 +3057,8 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 				notice(player, `failed: {report.error}`)
 			end
 		elseif command == "pin" and tonumber(argument) then
-			-- 0.3.3: the owner/admins load a build in place on public and prod servers (and while overridden).
-			local assetId = tonumber(argument) :: number
-			if Access.mayOverride(player) and (serverType() == "public" or requiresSignatures(myBranch) or ownerOverride ~= nil) then
-				notice(player, describe(applyOverride(player, { assetId = assetId })))
-			else
-				notice(player, describe(pinArtifact(player, assetId)))
-			end
+			-- 0.3.4: the owner's pin on public and prod servers; the dev pin elsewhere (ownerSwitch routes).
+			notice(player, describe(ownerSwitch(player, { assetId = tonumber(argument) :: number })))
 		elseif command == "unpin" then
 			notice(player, describe(unpin(player)))
 		elseif command == "reload" then
@@ -3202,7 +3125,6 @@ local err = if Registry.connected() then nil else Registry.readError() or "Confi
 registryError = err
 localMode = localPayloadSource() ~= nil -- 0.3.1: Studio only (localPayloadSource checks IsStudio)
 myBranch = chooseBranch()
-naturalBranch = myBranch
 
 -- 0.3.2 (P-K8): a subscription that fails is retried (SUBSCRIBE_RETRY_DELAYS, then the last delay) until it works;
 -- until then the 60 s poll is the only way deploys arrive.
@@ -3490,11 +3412,6 @@ end)
 applyLatePrivate = function(override)
 	local branch = branchFromOverride(override)
 	bootPin = nil
-	if ownerOverride then
-		naturalBranch = branch -- 0.3.3: the override stays; switching back goes there
-		return
-	end
-	naturalBranch = branch
 	if branch ~= myBranch and not localMode then
 		print(`[TypeTorch] this server's stored branch is readable now: moving to {branch}`)
 		myBranch = branch

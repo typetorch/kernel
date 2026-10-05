@@ -6,7 +6,7 @@ local ClientApi = {}
 
 local persistStore: { [string]: any } = {}
 local entries: { [LocalScript]: any } = {}
-local services = nil -- set by KernelClient: { transport, logs, devStatus, onKernelEvent, pinned, requestOverride,
+local services = nil -- set by KernelClient: { transport, logs, devStatus, onKernelEvent, pinned, requestSwitch,
 -- KERNEL_API, KERNEL_VERSION }
 
 function ClientApi.init(kernelServices)
@@ -79,12 +79,12 @@ function ClientApi.forEntry(entry: LocalScript)
 	end
 	-- Kernel 0.3.2+ (P-N1): fn() when the server dropped one of this generation's messages (it runs a newer
 	-- generation with another protocol). This generation is about to be replaced: pending requests won't be answered.
-	-- Kernel 0.3.3+ (owner override): asks the server to switch ITSELF in place, for this player: { branch = name } |
-	-- { assetId = n } (a known build) | { back = true }. The server allows the owner (and admins unless the place is
-	-- owner-only). Yields until it answers (at most 30 s): { ok, error?, generation?, queued? }; a switch replaces this
-	-- client generation too, so the caller may not see the answer. devStatus().canOverride says whether to offer it.
-	function api:requestOverride(request)
-		return services.requestOverride(request)
+	-- Kernel 0.3.4+ (owner switch): asks the server to switch THIS server to a branch ({ branch = name }) or load a known
+	-- build here ({ assetId = n }), for this player only. The server decides (public servers and prod builds: owners
+	-- only; elsewhere devs, as the dev menu's ops). Yields until it answers (at most 30 s): { ok, error?, generation?,
+	-- queued? }; a switch replaces this client generation too, so the caller may not see the answer.
+	function api:requestSwitch(request)
+		return services.requestSwitch(request)
 	end
 	function api:onResync(fn)
 		generation.resyncHandler = if typeof(fn) == "function" then fn else nil

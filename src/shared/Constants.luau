@@ -7,13 +7,13 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.3.3",
+	KERNEL_VERSION = "0.3.4",
 
 	-- Interim registry (until the backend exists): a DataStore written by the CLI through Open Cloud.
 	DATASTORE = "TypeTorch",
 	-- Fast path for deploys; the poll below is the backup (MessagingService delivery is best-effort).
 	DEPLOY_TOPIC = "TypeTorch/deploy",
-	-- 0.2.3: remote experiment pins (A/B) from Admin > Servers: { j?, pct?, a?, b, by, t, unpin? }.
+	-- 0.2.3: remote experiment pins (A/B) from Manage > Servers: { j?, pct?, a?, b, by, t, unpin? }.
 	PIN_TOPIC = "TypeTorch/pin",
 	-- A pin message older (or newer) than this many seconds by its `t` is ignored.
 	PIN_MAX_AGE = 120,
@@ -113,9 +113,9 @@ return {
 	CHANNEL_CLIENT = "__tt/client",
 	-- 0.3.2 (P-K7): a client generation that failed to start is tried once more after this many seconds.
 	CLIENT_RETRY_SECONDS = 2,
-	-- 0.3.3 (owner override): client -> server, tagged "*": { id, branch? | assetId? | back? } asks to switch THIS server in
-	-- place; server -> client: { id, ok, error?, generation? }. One request per player per OVERRIDE_GAP seconds (2 s, like
-	-- the dev menu's swaps).
-	CHANNEL_OVERRIDE = "__tt/override",
-	OVERRIDE_GAP = 2,
+	-- 0.3.4 (owner switch): client -> server, tagged "*": { id, branch? | assetId? } asks the kernel to switch THIS server
+	-- to a branch or load a build here, for the requesting player; server -> client: { id, ok, error?, generation?,
+	-- queued? }. One request per player per SWITCH_GAP seconds (2 s, like the dev menu's swaps).
+	CHANNEL_SWITCH = "__tt/switch",
+	SWITCH_GAP = 2,
 }

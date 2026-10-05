@@ -43,8 +43,7 @@
 				"$attributes": {
 					"KeyAssetId": "",
 					"FallbackPublicKey": "",
-					"BootstrapHeads": "",
-					"OverrideOwnerOnly": false
+					"BootstrapHeads": ""
 				},
 				"Kernel": { "$path": "src/server/Kernel.server.luau" },
 				"Api": { "$path": "src/server/Api.luau" },
