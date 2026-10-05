@@ -1210,15 +1210,29 @@ if DEV_MODE then
 		end
 		return false
 	end))
-	net.OnServerEvent:Fire(client, "zzzzzzz-000000", "e:ping", 2)
-	check("P-N1: another protocol gets a resync naming the dropped artifact", waitFor("resync", function()
+	local function resynced(artifactId: string): boolean
 		for _, call in firedToClient do
-			if call[1] == client and call[3] == "__tt/resync" and call[4] == "zzzzzzz-000000" then
+			if call[1] == client and call[3] == "__tt/resync" and call[4] == artifactId then
 				return true
 			end
 		end
 		return false
+	end
+	net.OnServerEvent:Fire(client, "zzzzzzz-000000", "e:ping", 2)
+	check("P-N1: another protocol gets a resync naming the dropped artifact", waitFor("resync", function()
+		return resynced("zzzzzzz-000000")
 	end))
+	net.OnServerEvent:Fire(client, "ddddddd-444444", "r:shop.buy", 7, "sword")
+	check("P-N1: a request of the old artifact is never taken (its reply couldn't reach it): resync", waitFor("request resync", function()
+		return resynced("ddddddd-444444")
+	end) and (function()
+		for _, message in SMOKE.messages do
+			if message[2] == "r:shop.buy" then
+				return false
+			end
+		end
+		return true
+	end)())
 	finish()
 end
 if VIP_MODE then

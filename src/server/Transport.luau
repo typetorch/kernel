@@ -59,7 +59,13 @@ local function onServerEvent(player: Player, artifactId: any, channel: any, ...)
 		end
 		return
 	end
-	local sameProtocol = acceptProtocol ~= nil and typeof(artifactId) == "string" and protocols[artifactId] == acceptProtocol
+	-- Only events ("e:" channels, fire-and-forget): a request's reply is tagged with the running artifact, which the old
+	-- client generation drops, so a request would take effect without an answer. Requests get the resync instead (the
+	-- client fails them at once and the next try reaches the new generation).
+	local sameProtocol = acceptProtocol ~= nil
+		and typeof(artifactId) == "string"
+		and protocols[artifactId] == acceptProtocol
+		and string.sub(channel, 1, 2) == "e:"
 	if handler and (artifactId == acceptArtifact or sameProtocol) then
 		task.spawn(handler, player, channel, ...)
 	elseif acceptArtifact then
