@@ -36,6 +36,38 @@ return {
 
 	-- A generation must call ready() within this long or the kernel rolls back.
 	READY_TIMEOUT = 20,
+	-- 0.3.2 (audit P-F1): the health window. A generation whose onStart failed (reported by the framework), or whose
+	-- own scripts raised HEALTH_ERRORS errors, within HEALTH_WINDOW seconds of ready is rolled back to the last known
+	-- good artifact, which is then marked failed on this server.
+	HEALTH_WINDOW = 30,
+	HEALTH_ERRORS = 3,
+	-- 0.3.2 (audit P-K3): at most this many last-known-good candidates are tried after one failure.
+	LKG_MAX_TRIES = 5,
+	-- 0.3.2: BindToClose gives the running generation's onClose handler at most this long (Roblox allows 30 s).
+	CLOSE_DEADLINE = 20,
+	-- 0.3.2 (audit P-K8): MessagingService subscriptions that fail are retried after these delays (seconds), then
+	-- every last delay for as long as the server runs.
+	SUBSCRIBE_RETRY_DELAYS = { 5, 15, 30, 60 },
+	-- 0.3.2 (audit P-K8): a private/reserved server's stored branch is read at boot with these retry delays; after
+	-- that the sync loop keeps trying and applies the branch late.
+	PRIVATE_READ_RETRY_DELAYS = { 1, 2, 4 },
+	-- 0.3.2 (audit P-K9): a failed badge, group rank or group list web call counts as "no" for this long before the
+	-- next call (a Roblox outage must not turn every dev check into a web call).
+	ACCESS_FAILURE_CACHE = 30,
+
+	-- 0.3.2 (audit P-O1): the kernel's heartbeat and deploy reports (contract shared with the CLI; plans/01).
+	-- Heartbeat: MemoryStore SortedMap SERVERS_MAP, key = JobId, written every HEARTBEAT_SECONDS +- HEARTBEAT_JITTER.
+	SERVERS_MAP = "TypeTorchServers",
+	SERVERS_TTL = 150,
+	HEARTBEAT_SECONDS = 60,
+	HEARTBEAT_JITTER = 10,
+	-- An extra heartbeat after a swap (so `typetorch servers` sees it), at most one per this many seconds.
+	HEARTBEAT_MIN_GAP = 10,
+	-- Reports: MemoryStore SortedMap REPORTS_MAP, key = "<seq, 10 digits>/<JobId>", one per deploy outcome per server.
+	REPORTS_MAP = "TypeTorchReports",
+	REPORTS_TTL = 7 * 24 * 3600,
+	-- A failed heartbeat or report write is retried after these delays (seconds), then dropped.
+	WRITE_RETRY_DELAYS = { 1, 3, 9 },
 	-- Old client trees stay this long after a swap so clients can stop their old generation first.
 	CLIENT_TREE_GRACE = 30,
 	-- Random delay before a public server fetches a new deploy, so all servers don't hit LoadAsset at once.
@@ -48,4 +80,9 @@ return {
 	CHANNEL_EVENT = "__tt/event",
 	-- 0.2.2: a swap is coming ({reason, branch, artifactId, commit, eta}) or was called off ({cancelled = true}).
 	CHANNEL_PENDING = "__tt/pending",
+	-- 0.3.2 (audit P-K7): client -> server, tagged "*": how this client's generation start went
+	-- ({g = generation name, ok, e = error?, ms, retried?}).
+	CHANNEL_CLIENT = "__tt/client",
+	-- 0.3.2 (P-K7): a client generation that failed to start is tried once more after this many seconds.
+	CLIENT_RETRY_SECONDS = 2,
 }

@@ -19,6 +19,8 @@ local netU: UnreliableRemoteEvent = nil
 
 local acceptArtifact: string? = nil
 local handler: ((Player, string, ...any) -> ())? = nil
+-- 0.3.2: kernel channels clients send to (tagged "*" instead of an artifact id), e.g. __tt/client (P-K7).
+local kernelHandlers: { [string]: (Player, ...any) -> () } = {}
 
 -- Per-player token bucket over every message: [tokens, last refill].
 local BURST, RATE = 120, 60
@@ -41,6 +43,14 @@ end
 
 local function onServerEvent(player: Player, artifactId: any, channel: any, ...)
 	if typeof(channel) ~= "string" or #channel > 120 or not allow(player) then
+		return
+	end
+	if artifactId == "*" then
+		-- Kernel channels only (__tt/...); the generation never sees "*" messages.
+		local kernelHandler = kernelHandlers[channel]
+		if kernelHandler then
+			task.spawn(kernelHandler, player, ...)
+		end
 		return
 	end
 	if handler and artifactId == acceptArtifact then
@@ -73,6 +83,11 @@ end
 
 function Transport.detach()
 	handler = nil
+end
+
+-- 0.3.2: a kernel handler for client messages tagged "*" on `channel` (a "__tt/" channel). Untrusted input.
+function Transport.onKernel(channel: string, fn: (Player, ...any) -> ())
+	kernelHandlers[channel] = fn
 end
 
 function Transport.current(): string?

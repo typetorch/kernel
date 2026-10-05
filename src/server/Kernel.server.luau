@@ -13,13 +13,20 @@
 --
 -- 0.3.1: in Studio only, ServerStorage.TypeTorchDev.Payload (a Model shaped like an uploaded payload) is mounted instead
 -- of LoadAsset, a fresh clone per mount; see "Studio local payload" below and plans/01.
+--
+-- 0.3.2 (bad deploys are safe): a health window after ready (a failed onStart, or HEALTH_ERRORS errors from the new
+-- generation's own scripts, rolls the server back; P-F1), a last-known-good chain that skips artifacts that failed
+-- here (P-K3), a kernel-owned heartbeat and per-deploy reports in MemoryStore (P-O1, Reports.luau), client generation
+-- reports (P-K7), onClose per generation, and every swap game code starts runs on a kernel thread (busy-flag hazard).
 
 local HttpService = game:GetService("HttpService")
 local InsertService = game:GetService("InsertService")
+local MemoryStoreService = game:GetService("MemoryStoreService")
 local MessagingService = game:GetService("MessagingService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local ScriptContext = game:GetService("ScriptContext")
 local ServerScriptService = game:GetService("ServerScriptService")
 local ServerStorage = game:GetService("ServerStorage")
 local Stats = game:GetService("Stats")
@@ -46,7 +53,87 @@ local Logs = require(script.Parent.Logs)
 local Registry = require(script.Parent.Registry)
 local Transport = require(script.Parent.Transport)
 
+-- 0.3.2: Reports.luau is a new file. A place project that doesn't map it yet (an older template studio.project.json
+-- lists the kernel's files one by one) still boots, without heartbeat and reports, and says so.
+local Reports
+do
+	local module = script.Parent:FindFirstChild("Reports")
+	if module then
+		Reports = require(module)
+	else
+		warn("[TypeTorch] TypeTorchKernel.Reports is missing (map src/server/Reports.luau in the place project): no heartbeat or deploy reports on this server")
+		local function noop() end
+		Reports = {
+			clip = function(text, max)
+				return if text == nil then nil else string.sub(tostring(text), 1, max)
+			end,
+			configure = noop,
+			heartbeat = noop,
+			poke = noop,
+			startHeartbeat = noop,
+			close = noop,
+			report = noop,
+			enabled = function()
+				return false
+			end,
+			info = function()
+				return { enabled = false, missing = true }
+			end,
+		}
+	end
+end
+
 Logs.start()
+
+-- 0.3.2 (busy-flag hazard, plans/12): work that game code starts (reload, rollback, switchBranch, pins) runs on a
+-- thread the KERNEL owns. Run on the caller's thread, a swap dies in the caller's own generation's hard stop (its Entry
+-- is disabled halfway through the swap), leaving `busy` set for good. A BindableEvent's handlers run on threads of the
+-- script that connected them, so this one's jobs are kernel threads. Jobs stay in a table (functions don't cross
+-- BindableEvents).
+local kernelJobs = Instance.new("BindableEvent")
+local jobQueue: { [number]: () -> () } = {}
+local nextJobId = 0
+kernelJobs.Event:Connect(function(id)
+	local job = jobQueue[id]
+	jobQueue[id] = nil
+	if job then
+		job()
+	end
+end)
+
+-- Runs fn(...) on a kernel thread; returns at once.
+local function spawnOnKernel(fn, ...)
+	local args = table.pack(...)
+	nextJobId += 1
+	jobQueue[nextJobId] = function()
+		fn(table.unpack(args, 1, args.n))
+	end
+	kernelJobs:Fire(nextJobId)
+end
+
+-- Runs fn(...) on a kernel thread and waits for its result (a report table). If the caller's generation is stopped
+-- meanwhile (the call swapped it out), the caller dies but the kernel thread finishes the work.
+local function callOnKernel(fn, ...)
+	local done, result = false, nil
+	spawnOnKernel(function(...)
+		local ok, value = pcall(fn, ...)
+		result = if ok then value else { ok = false, error = tostring(value) }
+		done = true
+	end, ...)
+	while not done do
+		task.wait()
+	end
+	return result
+end
+
+-- An error line in the output that never counts toward a generation's health: it is raised on a kernel thread.
+local function logError(text: string)
+	spawnOnKernel(function()
+		error(text, 0)
+	end)
+end
+
+local clip = Reports.clip
 
 local function folder(parent: Instance, name: string): Folder
 	local existing = parent:FindFirstChild(name)
@@ -78,6 +165,24 @@ local myBranch = nil
 local bootPin = nil -- a private/reserved server's stored pin (Registry private/<id>.pin), read at boot
 local storedPin = false -- whether this server's private/<id> record holds a pin (cleared by reload)
 local lastPin = nil -- 0.2.3: the last pin message this server acted on (status().lastPin)
+-- 0.3.2 (P-K3): artifacts that failed to run on THIS server (start, mount or the health window), by asset id:
+-- { assetId, artifactId, seq, why, at }. The last-known-good chain and automatic deploys skip them; explicit dev actions
+-- (reload, pin, branch) may still run them, and a success clears the mark.
+local failedHere: { [number]: any } = {}
+local startingGeneration = nil -- 0.3.2: the generation being started (its scripts' errors count toward its health)
+local restoring = false -- 0.3.2: restoreLastKnownGood is running (a failed candidate doesn't start another one)
+local lastErrorText, lastErrorAt = nil, nil -- 0.3.2: the newest error worth a look (heartbeat `e`)
+local lastHealthRollback = nil -- 0.3.2: { from, to?, why, at } of the last health-window rollback
+local closing = false -- 0.3.2: BindToClose ran: no more swaps
+local failing = nil -- P-K2: { seq, assetId, attempts, nextAt } of the deploy that failed here (see noteFailure)
+local ownAccessCode = nil -- 0.3.2: a reserved server's own access code (private/<id>.code), for the heartbeat's `k`
+
+local function noteLastError(text: string?)
+	if text then
+		lastErrorText = clip(text, 200)
+		lastErrorAt = os.time()
+	end
+end
 
 local function serverType(): string
 	if RunService:IsStudio() then
@@ -559,6 +664,9 @@ local function mount(payload: Instance, head, policy)
 		startedAt = os.time(),
 		serverTree = serverTree,
 		clientTree = clientTree,
+		-- 0.3.2 (P-F1): errors from this generation's own scripts, a failed onStart (reported by the framework), and
+		-- when it was ready (os.clock); the health window is HEALTH_WINDOW seconds from readyAt.
+		health = { errors = 0, startFailed = nil, lastError = nil, lastErrorAt = nil, readyAt = nil, failed = nil },
 		artifact = {
 			id = artifactId,
 			assetId = head.assetId,
@@ -614,6 +722,9 @@ local function startGeneration(generation): (boolean, string?)
 	if result == nil then
 		return false, "timed out waiting for ready"
 	end
+	if result[1] then
+		generation.health.readyAt = os.clock() -- 0.3.2: the health window starts now
+	end
 	return result[1], result[2]
 end
 
@@ -621,6 +732,7 @@ end
 -- stop function, so it can tell game code what replaces it; older frameworks ignore it.
 local function stopGeneration(generation, info): number
 	local started = os.clock()
+	generation.stopping = true -- 0.3.2: its errors from here on don't count (a stop is not a health failure)
 	Transport.detach()
 	if generation.stop then
 		-- 0.3 (audit P-K4): the stop function gets STOP_DEADLINE seconds; a stop that yields longer is cancelled and
@@ -734,10 +846,222 @@ end
 
 local lastGeneration = nil -- the last generation that started (it may be stopped now), for api.start.previous
 
+-- 0.3.2: reasons that are deploys of this server's branch (reported in TypeTorchReports); dev actions aren't.
+local DEPLOY_REASONS = { deploy = true, registry = true, poll = true, rollback = true }
+-- 0.3.2: reasons that are a dev's explicit choice: they may run an artifact that failed here before.
+local EXPLICIT_REASONS = { reload = true, pin = true, branch = true, ["server-rollback"] = true }
+
+-- 0.3.2 (P-O1): one deploy outcome of `head` ("swapped", "failed", "rolled_back", "skipped", "booted") in
+-- TypeTorchReports. `extra` = { e = error?, d = seconds? }. Heads without a seq aren't deploys: nothing is written.
+local function reportOutcome(head, result: string, extra)
+	if typeof(head) ~= "table" or typeof(head.seq) ~= "number" then
+		return
+	end
+	Reports.report({
+		s = head.seq,
+		b = head.branch or myBranch,
+		a = head.artifactId or (if typeof(head.assetId) == "number" then `asset-{head.assetId}` else nil),
+		r = result,
+		e = extra and extra.e,
+		d = extra and extra.d,
+		g = if current then current.number else 0,
+	})
+end
+
+-- Outcomes the 60 s poll would repeat ("skipped") are written once per seq and result.
+local reportedOnce: { [string]: boolean } = {}
+local function reportOnce(head, result: string, extra)
+	if typeof(head) ~= "table" or typeof(head.seq) ~= "number" then
+		return
+	end
+	local key = `{head.seq}:{result}`
+	if reportedOnce[key] then
+		return
+	end
+	reportedOnce[key] = true
+	reportOutcome(head, result, extra)
+end
+
+-- 0.3.2 (P-K3): marks an artifact as failed on this server (start, mount or health); see failedHere.
+local function markFailed(assetId: any, artifactId: string?, seq: any, why: string)
+	if typeof(assetId) ~= "number" then
+		return
+	end
+	failedHere[assetId] = { assetId = assetId, artifactId = artifactId, seq = if typeof(seq) == "number" then seq else nil, why = clip(why, 300), at = os.time() }
+	noteLastError(why)
+end
+
+-- Why an automatic move to `head` is skipped here (it failed on this server before), or nil.
+local function failedBefore(head): string?
+	local entry = typeof(head) == "table" and typeof(head.assetId) == "number" and failedHere[head.assetId]
+	return if entry then `{entry.artifactId or `asset-{entry.assetId}`} failed on this server: {entry.why}` else nil
+end
+
+-- 0.3.2 (P-F1) health window ----------------------------------------------------------------------------------------
+-- A generation is unhealthy when, from its mount until HEALTH_WINDOW seconds after ready, the framework reports a
+-- failed onStart, or its own scripts (inside its server tree, or its Entry clone) raise HEALTH_ERRORS errors. It is
+-- then rolled back to the last known good artifact and marked failed here. Errors from anything outside the
+-- generation (the kernel, place scripts, other generations, a generation being stopped) never count.
+
+local healthRollback -- (generation, why), defined with the last-known-good chain below
+-- Assets restarted after a health rollback found nothing else to run: no second window (it would loop).
+local healthExempt: { [number]: boolean } = {}
+
+-- Whether `scriptInstance` belongs to `generation` (its server tree, or its Entry clone and what it holds).
+local function owns(generation, scriptInstance): boolean
+	if not generation or generation.stopping then
+		return false
+	end
+	local ok, inside = pcall(function()
+		local entry = generation.entry
+		if entry and (scriptInstance == entry or scriptInstance:IsDescendantOf(entry)) then
+			return true
+		end
+		return scriptInstance:IsDescendantOf(generation.serverTree)
+	end)
+	return ok and inside == true
+end
+
+local function generationOf(scriptInstance)
+	if typeof(scriptInstance) ~= "Instance" then
+		return nil
+	end
+	if owns(current, scriptInstance) then
+		return current
+	end
+	if owns(startingGeneration, scriptInstance) then
+		return startingGeneration
+	end
+	return nil
+end
+
+-- Rolls the running generation back when its health check failed inside the window (once per generation).
+local function checkHealth(generation)
+	local health = generation.health
+	if generation ~= current or health.failed or health.readyAt == nil or closing or healthExempt[generation.artifact.assetId] then
+		return
+	end
+	if localMode then
+		return -- a Studio local payload: errors are counted, the dev's own code is never swapped for an upload
+	end
+	if os.clock() > health.readyAt + Constants.HEALTH_WINDOW then
+		return -- after the window: counted (status, heartbeat "degraded"), never rolled back
+	end
+	local why = nil
+	if health.startFailed then
+		why = `onStart failed: {health.startFailed}`
+	elseif health.errors >= Constants.HEALTH_ERRORS then
+		why = `{health.errors} errors within {Constants.HEALTH_WINDOW} s of ready, last: {health.lastError}`
+	end
+	if why then
+		health.failed = why
+		spawnOnKernel(healthRollback, generation, why)
+	end
+end
+
+local function noteError(generation, message: string, startFailed: boolean?)
+	local health = generation.health
+	local text = clip(message, 200)
+	health.lastError = text
+	health.lastErrorAt = os.time()
+	noteLastError(text)
+	if startFailed then
+		health.startFailed = health.startFailed or text
+	else
+		health.errors += 1
+	end
+	checkHealth(generation)
+end
+
+ScriptContext.Error:Connect(function(message, _trace, scriptInstance)
+	local generation = generationOf(scriptInstance)
+	if generation then
+		noteError(generation, tostring(message))
+	end
+end)
+
+-- Api: the framework reports a failed lifecycle hook ({kind = "onStart" | ..., module, message}). A failed onStart is
+-- a health failure; anything else counts as one error. The kernel prints it as an error line from its own thread (so
+-- it doesn't count twice). Returns whether it was taken.
+local reportsLogged = 0
+local function reportError(generation, info): boolean
+	if typeof(info) ~= "table" or generation.stopping or (generation ~= current and generation ~= startingGeneration) then
+		return false
+	end
+	local kind = if typeof(info.kind) == "string" then clip(info.kind, 40) else "error"
+	local module = if typeof(info.module) == "string" then clip(info.module, 80) else "?"
+	local message = clip(if info.message ~= nil then tostring(info.message) else "?", 2000)
+	if reportsLogged < 200 then
+		reportsLogged += 1
+		logError(`[TypeTorch] {module}.{kind} failed: {message}`)
+	end
+	noteError(generation, `{module}.{kind}: {message}`, kind == "onStart")
+	return true
+end
+
+-- 0.3.2: "ok" | "failed" (nothing runs) | "unverified" (boot fail-safe) | "degraded" (a deploy failed here, or the
+-- running generation failed or keeps erroring). The heartbeat's `h`.
+local function healthState(): string
+	if not current then
+		return "failed"
+	end
+	if current.unverified then
+		return "unverified"
+	end
+	local health = current.health
+	if failing ~= nil or health.failed or health.errors >= Constants.HEALTH_ERRORS then
+		return "degraded"
+	end
+	return "ok"
+end
+
+-- 0.3.2 (P-O1): this server's entry in TypeTorchServers (the contract is in Reports.luau). The framework's admin
+-- heartbeat (kernels before 0.3.2) wrote t..v; the kernel adds q, g, h, e and sv. `e` only while it is recent (15 min)
+-- or the server isn't healthy.
+local function heartbeatEntry()
+	local kind = serverType()
+	local health = healthState()
+	local recentError = lastErrorText ~= nil and (health ~= "ok" or (lastErrorAt ~= nil and os.time() - lastErrorAt <= 900))
+	return {
+		t = kind,
+		b = myBranch,
+		c = if current then current.channel else nil,
+		a = if current then current.artifact.id else nil,
+		n = #Players:GetPlayers(),
+		m = Players.MaxPlayers,
+		s = startedAt,
+		u = os.time(),
+		p = game.PlaceId,
+		k = if kind == "reserved" then ownAccessCode else nil,
+		x = if current and current.head.experiment then 1 else nil,
+		v = Constants.KERNEL_VERSION,
+		q = appliedSeq,
+		g = if current then current.number else 0,
+		h = health,
+		e = if recentError then lastErrorText else nil,
+		sv = 2,
+	}
+end
+
+Reports.configure({
+	memory = MemoryStoreService,
+	jobId = game.JobId,
+	studio = serverType() == "studio",
+	entry = heartbeatEntry,
+	players = function()
+		return #Players:GetPlayers()
+	end,
+	warn = warn,
+})
+
 -- Swap to a registry head { assetId, artifactId?, seq?, ... }. Returns a report table. `by` is the user id that asked
 -- (dev menu, /tt, game code); `announced` means notifyPending already ran for this swap.
+local restoreLastKnownGood -- (excludeAssetId, why) -> report?, defined below
 local swapTo
 swapTo = function(head, reason: string, by: number?, announced: boolean?)
+	if closing then
+		return { ok = false, reason = reason, error = "the server is closing", stage = "gate" }
+	end
 	if busy then
 		pendingHead = { head = head, reason = reason, by = by }
 		return { ok = false, queued = true }
@@ -803,6 +1127,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 
 		local swapStarted = os.clock()
 		report.stage = "start"
+		report.kind = generation.start.kind
 		if old then
 			local artifact = generation.artifact
 			report.stopSeconds = stopGeneration(old, {
@@ -821,18 +1146,22 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 			generation.start.stopSeconds = report.stopSeconds
 		end
 		generation.clientTree.Parent = clientGenerations
+		startingGeneration = generation -- 0.3.2: errors from its scripts count toward its health from now on
 		local started, startError = startGeneration(generation)
+		startingGeneration = nil
 		report.swapSeconds = os.clock() - swapStarted
 		if not started then
 			report.error = startError
 			warn(`[TypeTorch] {generation.name} failed to start: {startError}`)
 			stopGeneration(generation)
-			if old then
-				-- Automatic rollback: load the previous head again (fresh instances, fresh require cache).
-				report.rollbackTo = old.artifact.id
-				Registry.logEvent({ action = "auto_rollback", from = generation.artifact.id, to = old.artifact.id, error = startError, job = game.JobId })
+			-- 0.3.2 (P-K3): never again automatically on this server; then the last known good (the previous head first).
+			markFailed(head.assetId, generation.artifact.id, head.seq, `start: {startError}`)
+			if old and not restoring then
+				report.rollbackTo = if failedHere[old.artifact.assetId] then nil else old.artifact.id
+				report.rollbackScheduled = true
+				local failedAsset = head.assetId
 				task.defer(function()
-					swapTo(old.head, "auto-rollback")
+					restoreLastKnownGood(failedAsset, `{generation.artifact.id} failed to start`)
 				end)
 			end
 			return
@@ -840,6 +1169,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		report.stage = nil
 		-- Same table the generation got as api.start, so it can read the whole swap time once it is running.
 		generation.start.swapSeconds = report.swapSeconds
+		generation.deploy = DEPLOY_REASONS[reason] or reason == "boot" or nil
 		current = generation
 		lastGeneration = generation
 		table.insert(history, {
@@ -860,9 +1190,17 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		report.ok = true
 	end)
 	busy = false
+	startingGeneration = nil
 	if not ok then
 		report.error = tostring(err)
 		warn(`[TypeTorch] swap failed: {err}`)
+		-- 0.3.2: a payload refused at mount (channel, scripts, kernel API, wrong id) fails the same way every time.
+		if report.stage == "mount" then
+			markFailed(head.assetId, head.artifactId, head.seq, `mount: {err}`)
+		end
+	end
+	if not report.ok then
+		noteLastError(report.error)
 	end
 	if not report.ok and old and not oldStopped then
 		notifyPending(head, reason, 0, true) -- load or mount failed: the old generation keeps running
@@ -870,6 +1208,23 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 	print("[TypeTorch] swap " .. HttpService:JSONEncode(report))
 	for _, player in Players:GetPlayers() do
 		sendDevStatus(player)
+	end
+	if report.ok then
+		local generation = current
+		-- 0.3.2: a dev ran it on purpose and it started: no longer "failed here".
+		if EXPLICIT_REASONS[reason] and typeof(head.assetId) == "number" then
+			failedHere[head.assetId] = nil
+			healthExempt[head.assetId] = nil
+		end
+		-- 0.3.2 (P-O1): the server's first generation is a boot report; a heartbeat soon shows the new artifact.
+		if report.kind == "boot" then
+			reportOutcome(head, "booted", { d = (report.loadSeconds or 0) + (report.swapSeconds or 0) })
+		end
+		task.defer(Reports.poke) -- deferred: callers record appliedSeq right after swapTo returns
+		-- 0.3.2 (P-F1): a failure reported before ready (a thrown onStart, early errors) is judged now.
+		if generation then
+			checkHealth(generation)
+		end
 	end
 	if pendingHead then
 		local next = pendingHead
@@ -881,22 +1236,45 @@ end
 
 -- Branch selection and updates --------------------------------------------------------------------------------------
 
+-- The branch a private/reserved server's stored record asks for (and its pin and access code), by the boot rules.
+local function branchFromOverride(override): string
+	local state = Registry.state()
+	if typeof(override.code) == "string" and override.code ~= "" then
+		ownAccessCode = override.code -- 0.3.2: Migrate and newServer store it; the heartbeat's `k`
+	end
+	-- 0.3: private/<id> is written by game servers, so in-universe code could rewrite it. A player-owned private
+	-- server follows a stored branch other than the default only when its owner is a dev; otherwise game code
+	-- could move a server full of players to a dev branch (which takes unsigned deploys).
+	if serverType() == "private" and override.branch ~= state.defaultBranch and not Access.isDevUserId(game.PrivateServerOwnerId) then
+		refuse("private-branch", `the owner ({game.PrivateServerOwnerId}) is not a dev; this server stays on {state.defaultBranch}`, { branch = override.branch })
+		return state.defaultBranch
+	end
+	bootPin = override.pin
+	storedPin = override.pin ~= nil
+	return override.branch
+end
+
+-- 0.3.2 (P-K8): the record couldn't be read at boot (after PRIVATE_READ_RETRY_DELAYS); the sync loop keeps trying.
+local privateReadPending = false
+
 local function chooseBranch(): string
 	local state = Registry.state()
 	local kind = serverType()
 	if kind == "private" or kind == "reserved" then
-		local override = Registry.privateOverride(game.PrivateServerId)
-		if override then
-			-- 0.3: private/<id> is written by game servers, so in-universe code could rewrite it. A player-owned private
-			-- server follows a stored branch other than the default only when its owner is a dev; otherwise game code
-			-- could move a server full of players to a dev branch (which takes unsigned deploys).
-			if kind == "private" and override.branch ~= state.defaultBranch and not Access.isDevUserId(game.PrivateServerOwnerId) then
-				refuse("private-branch", `the owner ({game.PrivateServerOwnerId}) is not a dev; this server stays on {state.defaultBranch}`, { branch = override.branch })
-				return state.defaultBranch
+		local override, readError = Registry.privateOverride(game.PrivateServerId)
+		for _, delay in Constants.PRIVATE_READ_RETRY_DELAYS do
+			if not readError then
+				break
 			end
-			bootPin = override.pin
-			storedPin = override.pin ~= nil
-			return override.branch
+			task.wait(delay)
+			override, readError = Registry.privateOverride(game.PrivateServerId)
+		end
+		if readError then
+			privateReadPending = true
+			warn(`[TypeTorch] this server's stored branch is unreadable ({readError}); booting {state.defaultBranch} and retrying`)
+		end
+		if override then
+			return branchFromOverride(override)
 		end
 	elseif kind == "studio" then
 		local dev = ServerStorage:FindFirstChild("TypeTorchDev")
@@ -916,7 +1294,7 @@ end
 -- start is not retried, and the poll leaves it alone until a newer deploy (`failing`).
 local wanted = nil -- { head, reason, jitter }: the newest deploy this server should move to
 local workerRunning = false
-local failing = nil -- { seq, assetId, attempts, nextAt }
+-- `failing` = { seq, assetId, attempts, nextAt } (declared with the server state above).
 
 local function blockedByFailure(head): boolean
 	return failing ~= nil and failing.seq == head.seq and failing.assetId == head.assetId and os.clock() < failing.nextAt
@@ -948,8 +1326,11 @@ local function noteFailure(head, reason: string, report)
 	if not delay then
 		failing.nextAt = math.huge
 		local what = if report.stage == "load" then `failed to load {failing.attempts} times` else `failed ({report.stage or "swap"})`
-		warn(`[TypeTorch] deploy #{head.seq} ({head.artifactId or head.assetId}) {what}; this server keeps {if current then current.artifact.id else "nothing"} until a newer deploy`)
-		Registry.logEvent({ action = "deploy_failed", seq = head.seq, assetId = head.assetId, artifactId = head.artifactId, stage = report.stage, attempts = failing.attempts, error = report.error, job = game.JobId })
+		local keeps = if current then current.artifact.id elseif report.rollbackScheduled then "its last known good" else "nothing"
+		warn(`[TypeTorch] deploy #{head.seq} ({head.artifactId or head.assetId}) {what}; this server keeps {keeps} until a newer deploy`)
+		Registry.logEvent({ action = "deploy_failed", seq = head.seq, assetId = head.assetId, artifactId = head.artifactId, stage = report.stage, attempts = failing.attempts, error = clip(report.error, 300), job = game.JobId })
+		-- 0.3.2 (P-O1): the deploy's outcome on this server.
+		reportOutcome(head, "failed", { e = `{report.stage or "swap"}: {report.error or "?"}` })
 		return
 	end
 	failing.nextAt = os.clock() + delay
@@ -963,10 +1344,17 @@ local function noteFailure(head, reason: string, report)
 end
 
 runWorker = function()
-	while wanted do
+	while wanted and not closing do
 		local job = wanted
 		local head = job.head
 		local announced = false
+		-- 0.3.2 (P-K3): an artifact that failed on this server isn't run again automatically.
+		local failedWhy = failedBefore(head)
+		if failedWhy then
+			wanted = nil
+			reportOnce(head, "skipped", { e = failedWhy })
+			continue
+		end
 		if job.jitter and serverType() == "public" and current then
 			local delay = math.random() * Constants.PUBLIC_JITTER_SECONDS
 			notifyPending(head, job.reason, delay)
@@ -987,6 +1375,9 @@ runWorker = function()
 		end
 		if current and ((head.artifactId and head.artifactId == current.artifact.id) or head.assetId == current.artifact.assetId) then
 			vouchFor(head)
+			if DEPLOY_REASONS[job.reason] and typeof(seq) == "number" and seq > appliedSeq then
+				reportOutcome(head, "swapped", { d = 0 }) -- 0.3.2: already running it
+			end
 			appliedSeq = math.max(appliedSeq, if typeof(seq) == "number" then seq else appliedSeq)
 			continue
 		end
@@ -999,8 +1390,16 @@ runWorker = function()
 				appliedSeq = math.max(appliedSeq, seq)
 			end
 			failing = nil
+			if DEPLOY_REASONS[job.reason] and report.kind ~= "boot" then
+				reportOutcome(head, "swapped", { d = (report.loadSeconds or 0) + (report.swapSeconds or 0) })
+			end
 		elseif not report.queued then
 			noteFailure(head, job.reason, report)
+			-- 0.3.2 (P-K3): nothing runs (a boot, or an empty server) and swapTo had no previous generation to restore:
+			-- the last known good of this server or its branch, if any. A deploy that failed to LOAD is still retried.
+			if not current and not report.rollbackScheduled and not closing then
+				restoreLastKnownGood(head.assetId, `{head.artifactId or head.assetId} failed ({report.stage or "swap"})`)
+			end
 		end
 	end
 	workerRunning = false
@@ -1067,13 +1466,20 @@ local function followHead(reason: string, jitter: boolean?)
 	-- 0.2.3: a deploy rolled out to some servers only (`ro`). The others keep what they run (appliedSeq stays, so a
 	-- wider rollout of the same deploy, or the next deploy, still reaches them); new servers boot it (no `current`).
 	if current and not inRollout(rollout) then
+		reportOnce(head, "skipped", { e = `outside the {rollout}% rollout` })
+		return
+	end
+	-- 0.3.2 (P-K3): an artifact that failed on this server isn't run again automatically (a newer deploy still is).
+	local failedWhy = failedBefore(head)
+	if failedWhy then
+		reportOnce(head, "skipped", { e = failedWhy })
 		return
 	end
 	want(head, reason, jitter == true)
 end
 
 Registry.onChange(function(state)
-	Access.setConfig(state)
+	Access.setConfig(state, Registry.known())
 	-- Public servers always run the default branch. ConfigService may arrive after boot (P-K5) or change it.
 	if myBranch and serverType() == "public" and typeof(state.defaultBranch) == "string" and state.defaultBranch ~= myBranch then
 		print(`[TypeTorch] default branch is now {state.defaultBranch} (was {myBranch})`)
@@ -1085,6 +1491,19 @@ Registry.onChange(function(state)
 	end
 	task.spawn(followHead, "registry", true)
 end)
+
+-- 0.3.2 (P-O1): a deploy message for this server's branch that a prod server refused (signature, channel) is a
+-- "failed" report, so `deploy --wait` hears about a bad key or channel instead of timing out. At most one per 60 s per
+-- server, since anything in the universe can publish forged messages; a later real outcome of that seq overwrites it.
+local refusalReportAt = -math.huge
+local function reportRefusal(detail, why: string)
+	-- An old seq never: a forged copy must not overwrite the report of a deploy this server already applied.
+	if typeof(detail.seq) ~= "number" or detail.seq <= appliedSeq or os.clock() - refusalReportAt < 60 then
+		return
+	end
+	refusalReportAt = os.clock()
+	reportOutcome(detail, "failed", { e = `refused: {why}` })
+end
 
 -- Deploy messages: {b = branch, a = assetId, i = artifactId, s = seq, c = commit, ch = channel, t = sent ms,
 -- r = rollback?, ro = rollout % (0.2.3, 1-99)?, sig?, sigF? (0.3)}. Every server records the head (any branch) so
@@ -1160,7 +1579,7 @@ local function onDeployMessage(message)
 			sigF = previous.sigF,
 		})
 	end
-	Registry.recordDeployments(entries)
+	-- 0.3.2: the deployment entries go with the head: only the server whose MemoryStore update wins writes them durably.
 	Registry.saveHead(data.b, {
 		assetId = data.a,
 		artifactId = data.i,
@@ -1174,7 +1593,7 @@ local function onDeployMessage(message)
 		t = t,
 		sig = sig,
 		sigF = sigF,
-	})
+	}, entries)
 	if data.b ~= myBranch then
 		return
 	end
@@ -1193,10 +1612,12 @@ local function onDeployMessage(message)
 		local verified, why = verifyDeploy(data, sig, sigF)
 		if not verified then
 			refuse("deploy", why or "bad signature", detail)
+			reportRefusal(detail, why or "bad signature")
 			return
 		end
 		if data.ch ~= "prod" then
 			refuse("deploy", `channel {tostring(data.ch)}, not prod`, detail)
+			reportRefusal(detail, `channel {tostring(data.ch)}, not prod`)
 			return
 		end
 		if typeof(seq) ~= "number" or seq <= appliedSeq then
@@ -1204,6 +1625,7 @@ local function onDeployMessage(message)
 			return
 		end
 	end
+	local reportHead = { seq = seq, branch = data.b, artifactId = data.i, assetId = data.a }
 	if current and (data.i == current.artifact.id or data.a == current.artifact.assetId) then
 		-- Already running it (also a re-signed head, r = "resign": the stored head and appliedSeq move, no swap). A newer
 		-- deploy of the pinned (or experiment) artifact ends the hold: it is the head now.
@@ -1212,6 +1634,9 @@ local function onDeployMessage(message)
 		end
 		if seq and seq > appliedSeq and r == "resign" then
 			print(`[TypeTorch] re-signed head for {data.b}: {data.i} #{seq} (no swap)`)
+		end
+		if typeof(seq) == "number" and seq > appliedSeq then
+			reportOutcome(reportHead, "swapped", { d = 0 }) -- 0.3.2: already running it
 		end
 		if signedOnly then
 			-- Verified above: it vouches for an unverified (boot fail-safe) generation running this asset.
@@ -1227,6 +1652,14 @@ local function onDeployMessage(message)
 	-- Outside a partial rollout: keep the current artifact (pinned or not). appliedSeq stays, see followHead.
 	if current and not inRollout(rollout) then
 		print(`[TypeTorch] deploy {data.i} for {data.b} rolled out to {rollout}%; this server (bucket {jobBucket(game.JobId)}) keeps {current.artifact.id}`)
+		reportOnce(reportHead, "skipped", { e = `outside the {rollout}% rollout` })
+		return
+	end
+	-- 0.3.2 (P-K3): an artifact that failed on this server isn't run again automatically.
+	local failedWhy = failedBefore(reportHead)
+	if failedWhy then
+		print(`[TypeTorch] deploy {data.i} for {data.b} skipped: {failedWhy}`)
+		reportOnce(reportHead, "skipped", { e = failedWhy })
 		return
 	end
 	print(`[TypeTorch] {if r == 1 then "rollback" elseif r == "resign" then "re-signed head" else "deploy"} message for {data.b}: {data.i}{if rollout then ` ({rollout}% rollout)` else ""}{if signedOnly then " (signed)" else ""}`)
@@ -1400,6 +1833,140 @@ local function pinSeq(branch: string, entry): number
 		seq = math.max(seq, entry.seq)
 	end
 	return seq
+end
+
+-- 0.3.2 (P-K3) last-known-good chain ---------------------------------------------------------------------------------
+-- After a failure (a generation that failed to start or failed its health window; a deploy that failed while nothing
+-- ran), the server tries, in order: its own generation history (newest first, so the generation that just ran comes
+-- first), then its branch's deployment history (newest first), then on prod servers the BootstrapHeads entry. It skips
+-- the failing artifact, everything in failedHere, Studio local payloads and repeats, and tries at most LKG_MAX_TRIES.
+-- The prod rules stay exactly as they are: on a signed-only server a history head counts because it was admitted when
+-- it ran ("one this server already ran", the boot fail-safe's head included, as before), a deployment entry only when
+-- it verifies (signed prod, or the exact BootstrapHeads match), and swapTo's gate still checks every head.
+
+local function lkgCandidates(exclude: number?): { any }
+	local list, seen = {}, {}
+	local signedOnly = requiresSignatures(myBranch)
+	local function consider(head)
+		if typeof(head) ~= "table" or localHeads[head] or typeof(head.assetId) ~= "number" then
+			return
+		end
+		if head.assetId == exclude or failedHere[head.assetId] or seen[head.assetId] then
+			return
+		end
+		if current and head.assetId == current.artifact.assetId then
+			return
+		end
+		if signedOnly and not admitted[head] then
+			return
+		end
+		seen[head.assetId] = true
+		table.insert(list, head)
+	end
+	for index = #history, 1, -1 do
+		consider(history[index].head)
+	end
+	local ok, entries = pcall(deploymentEntries)
+	if ok then
+		for _, entry in entries do
+			if entry.branch == myBranch and typeof(entry.assetId) == "number" and not seen[entry.assetId] then
+				local head = pinHead(entry)
+				head.pinned = nil
+				if signedOnly and trustedProd(myBranch, head) then
+					admit(head, if signedProd(myBranch, head) then "signed" else "bootstrap")
+				end
+				consider(head)
+			end
+		end
+	else
+		warn(`[TypeTorch] last-known-good: the deployment history is unreadable: {entries}`)
+	end
+	if signedOnly then
+		consider(bootstrapFor(myBranch))
+	end
+	return list
+end
+
+-- Runs the first last-known-good candidate that starts. Returns its swap report, or nil. Kernel threads only.
+restoreLastKnownGood = function(exclude: number?, why: string)
+	if restoring or closing then
+		return nil
+	end
+	if localMode then
+		warn(`[TypeTorch] the local payload failed ({why}); fix it, then Stop + Play or Reload`)
+		return nil -- Studio local payload: never swapped for an uploaded artifact
+	end
+	restoring = true
+	while busy do
+		task.wait(0.1)
+	end
+	local result, tries = nil, 0
+	local ok, err = pcall(function()
+		for _, head in lkgCandidates(exclude) do
+			if tries >= Constants.LKG_MAX_TRIES or closing then
+				break
+			end
+			tries += 1
+			print(`[TypeTorch] last known good after "{why}": trying {head.artifactId or `asset-{head.assetId}`}`)
+			local report = swapTo(head, "auto-rollback")
+			if report.ok then
+				result = report
+				break
+			elseif report.queued then
+				break -- another swap took over
+			end
+		end
+	end)
+	restoring = false
+	if not ok then
+		warn(`[TypeTorch] last-known-good failed: {err}`)
+	end
+	if result then
+		Registry.logEvent({ action = "auto_rollback", to = result.artifactId, generation = result.generation, why = clip(why, 300), job = game.JobId })
+	else
+		warn(`[TypeTorch] no last-known-good artifact could run (after: {why}); {if current then `{current.artifact.id} keeps running` else "nothing runs"}`)
+		Registry.logEvent({ action = "auto_rollback_failed", tries = tries, why = clip(why, 300), job = game.JobId })
+	end
+	return result
+end
+
+-- 0.3.2 (P-F1): the running generation failed its health window: mark it failed here, never retry its deploy
+-- automatically (a newer deploy still applies), and run the last known good. Kernel threads only.
+healthRollback = function(generation, why: string)
+	while busy do
+		task.wait(0.1)
+	end
+	if generation ~= current or generation.rolledBack or closing then
+		return
+	end
+	generation.rolledBack = true
+	local artifact, head = generation.artifact, generation.head
+	warn(`[TypeTorch] {generation.name} failed its health check ({why}); rolling back`)
+	markFailed(artifact.assetId, artifact.id, head.seq, `health: {why}`)
+	if typeof(head.seq) == "number" then
+		failing = { seq = head.seq, assetId = head.assetId, attempts = 1, nextAt = math.huge }
+	end
+	Registry.logEvent({ action = "health_rollback", from = artifact.id, assetId = artifact.assetId, seq = head.seq, why = clip(why, 300), job = game.JobId })
+	local restored = restoreLastKnownGood(artifact.assetId, `{artifact.id}: {why}`)
+	if not restored and not current and not closing then
+		-- Every candidate failed after the unhealthy generation was stopped: a degraded game beats an empty server. It
+		-- runs without a health window (healthExempt), so this can't loop.
+		warn(`[TypeTorch] nothing else runs: restarting {artifact.id} (degraded)`)
+		if typeof(artifact.assetId) == "number" then
+			healthExempt[artifact.assetId] = true
+		end
+		swapTo(head, "auto-rollback")
+	end
+	local to = restored and (restored.artifactId or restored.generation)
+	lastHealthRollback = { from = artifact.id, to = to, why = clip(why, 300), at = os.time() }
+	if generation.deploy then
+		-- The deploy's outcome here: rolled back, or failed when nothing else could run (it keeps running, degraded).
+		if restored then
+			reportOutcome(head, "rolled_back", { e = `{why}; now {to}` })
+		else
+			reportOutcome(head, "failed", { e = `{why}; no last-known-good, it keeps running` })
+		end
+	end
 end
 
 local function reload(player: Player?)
@@ -1608,12 +2175,8 @@ local function switchBranch(player: Player?, branch: string)
 end
 
 -- 0.2.2: a reload that game code can offer (an admin panel). Only the owner or admins, decided here. The swap runs on
--- a kernel thread (this BindableEvent's handler): the caller is a thread of the generation the reload stops, and the
--- hard stop would kill it, and the swap with it, halfway through.
-local reloadRequests = Instance.new("BindableEvent")
-reloadRequests.Event:Connect(function(player: Player)
-	reload(player)
-end)
+-- a kernel thread (spawnOnKernel): the caller is a thread of the generation the reload stops, and the hard stop would
+-- kill it, and the swap with it, halfway through. Returns at once.
 local function requestReload(player: Player)
 	if typeof(player) ~= "Instance" or not player:IsA("Player") then
 		return { ok = false, error = "bad player" }
@@ -1624,8 +2187,60 @@ local function requestReload(player: Player)
 	if not localMode and not Registry.branchHead(myBranch) then
 		return { ok = false, error = `branch {myBranch} has no artifact` }
 	end
-	reloadRequests:Fire(player)
+	spawnOnKernel(reload, player)
 	return { ok = true, queued = true, reason = "reload" }
+end
+
+-- 0.3.2 (P-K7): client generation reports ------------------------------------------------------------------------------
+-- Each client tells the kernel (channel __tt/client, tagged "*") how its generation start went, after its one retry:
+-- { g = generation name, ok, e = error?, ms, retried? }. Untrusted input: checked field by field, kept per player, shown
+-- in status().clients and the dev menu. It never triggers a rollback (a player could fake it).
+local clientStatus: { [Player]: any } = {}
+local clientFailures = 0
+local clientWarnAt = -math.huge
+local lastClientFailure = nil
+
+local function onClientStatus(player: Player, info)
+	if typeof(info) ~= "table" or typeof(info.g) ~= "string" or #info.g == 0 or #info.g > 120 then
+		return
+	end
+	local ok = info.ok == true
+	local entry = {
+		generation = info.g,
+		ok = ok,
+		error = if not ok and info.e ~= nil then clip(tostring(info.e), 200) else nil,
+		ms = if typeof(info.ms) == "number" and info.ms == info.ms then math.clamp(math.floor(info.ms), 0, 10 ^ 7) else nil,
+		retried = info.retried == true or nil,
+		at = os.time(),
+	}
+	clientStatus[player] = entry
+	if not ok then
+		clientFailures += 1
+		lastClientFailure = { userId = player.UserId, generation = entry.generation, error = entry.error, at = entry.at }
+		if os.clock() - clientWarnAt >= 10 then
+			clientWarnAt = os.clock()
+			warn(`[TypeTorch] {player.Name}'s client failed to start {entry.generation}{if entry.retried then " (after a retry)" else ""}: {entry.error or "?"}`)
+		end
+	end
+end
+Transport.onKernel(Constants.CHANNEL_CLIENT, onClientStatus)
+
+-- { players, reported, ok, failed, behind (reported another generation than the running one), failures (since boot),
+-- lastFailure? }.
+local function clientSummary()
+	local summary = { players = #Players:GetPlayers(), reported = 0, ok = 0, failed = 0, behind = 0, failures = clientFailures, lastFailure = lastClientFailure }
+	for _, entry in clientStatus do
+		summary.reported += 1
+		if entry.ok then
+			summary.ok += 1
+		else
+			summary.failed += 1
+		end
+		if current and entry.generation ~= current.name then
+			summary.behind += 1
+		end
+	end
+	return summary
 end
 
 -- Reserves a server on `branch` and teleports the player there. With `assetId` (a known deployment), the new server
@@ -1662,7 +2277,9 @@ local function newServer(player: Player, branch: string, assetId: number?)
 	if not ok then
 		return { ok = false, error = tostring(code) }
 	end
-	local saved, err = Registry.setPrivateBranch(privateServerId, branch, player.UserId, pin)
+	-- 0.3.2: the access code goes in the record too (server-only), so the new server can publish it in its heartbeat
+	-- (`k`) and Admin > Servers can join it.
+	local saved, err = Registry.setPrivateBranch(privateServerId, branch, player.UserId, pin, code)
 	if not saved then
 		return { ok = false, error = `could not save the branch: {err}` }
 	end
@@ -1693,6 +2310,36 @@ local function branchList()
 			by = head.by,
 		})
 	end
+	return list
+end
+
+-- 0.3.2: the health of the running generation, for status().health.
+local function healthInfo()
+	local info = { state = healthState(), errors = 0, lastRollback = if lastHealthRollback then table.clone(lastHealthRollback) else nil }
+	if current then
+		local health = current.health
+		info.errors = health.errors
+		info.lastError = health.lastError
+		info.lastErrorAt = health.lastErrorAt
+		info.startFailed = health.startFailed
+		info.failed = health.failed
+		if health.readyAt and not health.failed then
+			local left = health.readyAt + Constants.HEALTH_WINDOW - os.clock()
+			info.windowLeft = if left > 0 then math.ceil(left) else nil
+		end
+	end
+	return info
+end
+
+-- 0.3.2: failedHere as a list, newest first.
+local function failedList()
+	local list = {}
+	for _, entry in failedHere do
+		table.insert(list, table.clone(entry))
+	end
+	table.sort(list, function(a, b)
+		return a.at > b.at
+	end)
 	return list
 end
 
@@ -1757,6 +2404,15 @@ local function status()
 		rejected = rejectedInfo(),
 		-- 0.3.1: the running generation is the Studio local payload (ServerStorage.TypeTorchDev.Payload).
 		localPayload = if current and current.localPayload then true else nil,
+		-- 0.3.2 (P-F1): { state = "ok" | "failed" | "unverified" | "degraded", errors, lastError?, lastErrorAt?,
+		-- startFailed?, windowLeft? (seconds of the health window left), lastRollback? = { from, to?, why, at } }.
+		health = healthInfo(),
+		-- 0.3.2 (P-K3): artifacts that failed on this server (never run again automatically), newest first.
+		failed = failedList(),
+		-- 0.3.2 (P-O1): the kernel's heartbeat and report writes ({ enabled, heartbeat, reports } counters).
+		heartbeat = Reports.info(),
+		-- 0.3.2 (P-K7): client generation reports.
+		clients = clientSummary(),
 	}
 end
 
@@ -1897,6 +2553,14 @@ local function onPinMessage(message)
 	print("[TypeTorch] pin message " .. HttpService:JSONEncode(report))
 end
 
+-- 0.3.2: game code (the framework's dev menu, admin panels) calls these from its own threads; each runs on a kernel
+-- thread (busy-flag hazard) and the caller waits for the report, unless its generation is swapped out meanwhile.
+local function onKernel(fn)
+	return function(...)
+		return callOnKernel(fn, ...)
+	end
+end
+
 Api.init({
 	KERNEL_API = Constants.KERNEL_API,
 	KERNEL_VERSION = Constants.KERNEL_VERSION,
@@ -1907,17 +2571,23 @@ Api.init({
 	status = status,
 	branchList = branchList,
 	artifacts = artifacts,
-	reload = reload,
-	rollback = rollback,
-	switchBranch = switchBranch,
-	pinArtifact = pinArtifact,
+	reload = onKernel(reload),
+	rollback = onKernel(rollback),
+	switchBranch = onKernel(switchBranch),
+	pinArtifact = onKernel(pinArtifact),
 	newServer = newServer,
 	requestReload = requestReload,
-	unpin = unpin,
+	unpin = onKernel(unpin),
 	experiment = experimentInfo,
 	-- 0.3
 	KERNEL_BUILD = KERNEL_BUILD,
 	keys = keysInfo,
+	-- 0.3.2
+	reportError = reportError,
+	heartbeat = Reports.info,
+	accessCode = function()
+		return if serverType() == "reserved" then ownAccessCode else nil
+	end,
 })
 
 -- /tt chat commands (TextChatCommand), the fallback when a generation is broken --------------------------------------
@@ -1992,6 +2662,7 @@ Players.PlayerAdded:Connect(function(player)
 end)
 Players.PlayerRemoving:Connect(function(player)
 	lastDev[player] = nil
+	clientStatus[player] = nil
 end)
 
 -- 0.3: the first key asset read runs while the registry loads; a prod server waits for it (bounded) before it checks
@@ -2004,26 +2675,35 @@ end)
 
 local state, err = Registry.start(Constants.CONFIG_BOOT_WAIT)
 registryError = err
-Access.setConfig(state)
+Access.setConfig(state, Registry.known())
 localMode = localPayloadSource() ~= nil -- 0.3.1: Studio only (localPayloadSource checks IsStudio)
 myBranch = chooseBranch()
 
-task.spawn(function()
-	local ok, subscribeError = pcall(function()
-		MessagingService:SubscribeAsync(Constants.DEPLOY_TOPIC, onDeployMessage)
+-- 0.3.2 (P-K8): a subscription that fails is retried (SUBSCRIBE_RETRY_DELAYS, then the last delay) until it works;
+-- until then the 60 s poll is the only way deploys arrive.
+local function subscribe(topic: string, handler, label: string)
+	task.spawn(function()
+		local attempt = 0
+		while not closing do
+			local ok, subscribeError = pcall(function()
+				MessagingService:SubscribeAsync(topic, handler)
+			end)
+			if ok then
+				if attempt > 0 then
+					print(`[TypeTorch] {label}: subscribed after {attempt} failed attempts`)
+				end
+				return
+			end
+			attempt += 1
+			local delays = Constants.SUBSCRIBE_RETRY_DELAYS
+			local delay = delays[math.min(attempt, #delays)]
+			warn(`[TypeTorch] {label} unavailable (attempt {attempt}): {subscribeError}; retrying in {delay} s`)
+			task.wait(delay)
+		end
 	end)
-	if not ok then
-		warn(`[TypeTorch] deploy messages unavailable: {subscribeError}`)
-	end
-end)
-task.spawn(function()
-	local ok, subscribeError = pcall(function()
-		MessagingService:SubscribeAsync(Constants.PIN_TOPIC, onPinMessage)
-	end)
-	if not ok then
-		warn(`[TypeTorch] pin messages unavailable: {subscribeError}`)
-	end
-end)
+end
+subscribe(Constants.DEPLOY_TOPIC, onDeployMessage, "deploy messages")
+subscribe(Constants.PIN_TOPIC, onPinMessage, "pin messages")
 
 -- 0.3: rekey hints (unsigned, content ignored): re-read the key asset now, rate-limited; a hint inside the window is
 -- read when it opens. A key change makes the server look at its branch head again (it may be verifiable now).
@@ -2047,16 +2727,9 @@ local function onRekey()
 		followHead("poll", true)
 	end
 end
-task.spawn(function()
-	local ok, subscribeError = pcall(function()
-		MessagingService:SubscribeAsync(Constants.REKEY_TOPIC, function()
-			task.spawn(onRekey)
-		end)
-	end)
-	if not ok then
-		warn(`[TypeTorch] rekey hints unavailable: {subscribeError}`)
-	end
-end)
+subscribe(Constants.REKEY_TOPIC, function()
+	task.spawn(onRekey)
+end, "rekey hints")
 
 Registry.refreshStoredHead(myBranch, 0)
 Registry.migrateLegacyHead(myBranch)
@@ -2109,21 +2782,42 @@ local function bootSigned()
 	if verified and try(verified, admitted[verified] or "signed") then
 		return
 	end
+	-- The other verified heads, newest first: stored heads, and (0.3.2, P-K3) this branch's deployment history, each
+	-- trusted only when it verifies (signed prod, or the exact bootstrap match). Artifacts that failed here are skipped.
 	local candidates = Registry.bootCandidates(myBranch)
+	local trusted = {}
 	for _, candidate in candidates do
 		if trustedProd(myBranch, candidate) then
-			local head = cloneHead(candidate)
-			if try(admit(head, if signedProd(myBranch, candidate) then "signed" else "bootstrap"), admitted[head]) then
-				return
+			table.insert(trusted, cloneHead(candidate))
+		end
+	end
+	local entriesOk, entries = pcall(deploymentEntries)
+	if entriesOk then
+		for _, entry in entries do
+			if entry.branch == myBranch and typeof(entry.assetId) == "number" then
+				local head = pinHead(entry)
+				head.pinned = nil
+				if trustedProd(myBranch, head) then
+					table.insert(trusted, head)
+				end
 			end
 		end
 	end
+	table.sort(trusted, function(a, b)
+		local seqA, seqB = if typeof(a.seq) == "number" then a.seq else -1, if typeof(b.seq) == "number" then b.seq else -1
+		return seqA > seqB
+	end)
+	for _, head in trusted do
+		if not failedHere[head.assetId] and try(admit(head, if signedProd(myBranch, head) then "signed" else "bootstrap"), admitted[head]) then
+			return
+		end
+	end
 	local bootstrap = bootstrapFor(myBranch)
-	if bootstrap and try(bootstrap, "bootstrap") then
+	if bootstrap and not failedHere[bootstrap.assetId] and try(bootstrap, "bootstrap") then
 		return
 	end
 	for _, candidate in candidates do
-		if not trustedProd(myBranch, candidate) then
+		if not trustedProd(myBranch, candidate) and not failedHere[candidate.assetId] then
 			local head = admit(table.clone(candidate), "blind")
 			if try(head, "blind") then
 				warn(
@@ -2175,14 +2869,80 @@ else
 	warn(`[TypeTorch] branch {myBranch} has no artifact yet{if err then ` (registry: {err})` else ""}; waiting for a deploy`)
 end
 
--- Backup for missed messages: re-read the stored head (ConfigService has its own refresh in Registry.start).
-task.spawn(function()
-	while true do
-		task.wait(Constants.POLL_SECONDS)
-		Registry.refreshStoredHead(myBranch, 0)
-		followHead("poll", true)
+-- 0.3.2 (P-K8): a stored branch that was unreadable at boot is read again by the sync loop and applied late (its pin
+-- isn't: the server already runs).
+local function retryPrivateRead()
+	local override, readError = Registry.privateOverride(game.PrivateServerId)
+	if readError then
+		return
 	end
+	privateReadPending = false
+	if not override then
+		return
+	end
+	local branch = branchFromOverride(override)
+	bootPin = nil
+	if branch ~= myBranch and not localMode then
+		print(`[TypeTorch] this server's stored branch is readable now: moving to {branch}`)
+		myBranch = branch
+		appliedSeq = -1
+		followHead("branch", false)
+	end
+end
+
+-- The one sync loop (0.3.2, Registry.startSync): every POLL_SECONDS the registry refreshes ConfigService (or retries
+-- it), then this re-reads the stored head (the backup for missed messages) and follows it.
+Registry.startSync(Constants.POLL_SECONDS, function()
+	if privateReadPending then
+		retryPrivateRead()
+	end
+	Registry.refreshStoredHead(myBranch, 0)
+	followHead("poll", true)
 end)
+
+-- 0.3.2 (P-O1): the kernel's heartbeat (the first entry right after boot, then every HEARTBEAT_SECONDS +- jitter).
+Reports.startHeartbeat(1 + math.random() * 2)
+
+-- 0.3.2: one BindToClose for the server's lifetime: no more swaps, the heartbeat entry is removed, and the running
+-- generation's onClose handler (api:onClose; the framework runs its modules' onStop) gets CLOSE_DEADLINE seconds.
+local function onClose()
+	closing = true
+	local removed = false
+	task.spawn(function()
+		Reports.close()
+		removed = true
+	end)
+	local generation = current
+	local handler = generation and generation.closeHandler
+	if handler then
+		local done = false
+		local thread = task.spawn(function()
+			local ok, closeError = pcall(handler)
+			if not ok then
+				warn(`[TypeTorch] {generation.name} onClose threw: {closeError}`)
+			end
+			done = true
+		end)
+		local deadline = os.clock() + Constants.CLOSE_DEADLINE
+		while not done and os.clock() < deadline do
+			task.wait()
+		end
+		if not done then
+			pcall(task.cancel, thread)
+			warn(`[TypeTorch] {generation.name} onClose took more than {Constants.CLOSE_DEADLINE} s`)
+		end
+	end
+	local deadline = os.clock() + 3
+	while not removed and os.clock() < deadline do
+		task.wait()
+	end
+end
+local bound, bindError = pcall(function()
+	game:BindToClose(onClose)
+end)
+if not bound then
+	warn(`[TypeTorch] BindToClose failed: {bindError}`)
+end
 
 -- 0.3: the key asset, re-read about every 10 minutes (a rotation without a hint still lands, and shows as a change).
 task.spawn(function()

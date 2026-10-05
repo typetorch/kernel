@@ -2,17 +2,33 @@
 -- Who is a dev (plans/10): a Studio session, OR the experience owner, OR a registry member, OR a dev-badge holder,
 -- AND not revoked.
 -- Decided on the server only. Roblox has no in-game "edit access" API, so this is TypeTorch's own rule.
+--
+-- 0.3.2 (audit S-M2): revocation fails closed. The revocation list comes with the registry; until a registry read has
+-- succeeded on this server (Registry.known()), badge holders are NOT devs (a badge can't be revoked by the game, so the
+-- list is the off switch). Studio and the owner are unaffected (the owner can't be revoked). A later failed read keeps
+-- the last good registry (Registry), so revocations never vanish on an error.
+-- 0.3.2 (audit P-K9): a failed badge, rank or group web call counts as "no" for ACCESS_FAILURE_CACHE seconds instead of
+-- being retried on every check (an outage must not turn every dev check into a web call); successes stay cached.
 
 local BadgeService = game:GetService("BadgeService")
 local RunService = game:GetService("RunService")
+local Constants = require(game:GetService("ReplicatedStorage"):WaitForChild("TypeTorchKernelShared"):WaitForChild("Constants"))
 
 local Access = {}
 
 local config = { members = {}, revoked = {} }
+local known = false -- the registry (and so `revoked`) has been read at least once on this server
 -- userId -> true/false badge ownership for this server's lifetime (cleared when the badge id changes).
 local badgeCache: { [number]: boolean } = {}
 -- userId -> owns the experience (user-owned: the creator; group-owned: rank 255 in the group).
 local ownerCache: { [number]: boolean } = {}
+-- "<kind>:<userId>" -> os.clock() of the last failed web call (P-K9).
+local failedAt: { [string]: number } = {}
+
+local function recentlyFailed(key: string): boolean
+	local at = failedAt[key]
+	return at ~= nil and os.clock() - at < Constants.ACCESS_FAILURE_CACHE
+end
 
 local function isOwner(player: Player): boolean
 	local cached = ownerCache[player.UserId]
@@ -23,9 +39,14 @@ local function isOwner(player: Player): boolean
 	if game.CreatorType == Enum.CreatorType.User then
 		owner = player.UserId == game.CreatorId
 	else
+		local key = `rank:{player.UserId}`
+		if recentlyFailed(key) then
+			return false
+		end
 		local ok, rank = pcall(player.GetRankInGroup, player, game.CreatorId)
 		if not ok then
-			return false -- retried on the next check
+			failedAt[key] = os.clock() -- "no" for a while, then retried
+			return false
 		end
 		owner = rank == 255
 	end
@@ -33,11 +54,18 @@ local function isOwner(player: Player): boolean
 	return owner
 end
 
-function Access.setConfig(newConfig)
+-- `isKnown` (0.3.2): the registry has been read on this server (Registry.known()); see S-M2 above.
+function Access.setConfig(newConfig, isKnown: boolean?)
 	if newConfig.devBadgeId ~= config.devBadgeId then
 		table.clear(badgeCache)
 	end
 	config = newConfig
+	known = isKnown == true
+end
+
+-- Whether the revocation list is known (a registry read succeeded).
+function Access.revocationsKnown(): boolean
+	return known
 end
 
 local function hasBadge(userId: number): boolean
@@ -49,16 +77,23 @@ local function hasBadge(userId: number): boolean
 	if cached ~= nil then
 		return cached
 	end
+	local key = `badge:{userId}`
+	if recentlyFailed(key) then
+		return false
+	end
 	local ok, owns = pcall(BadgeService.UserHasBadgeAsync, BadgeService, userId, badgeId)
 	if not ok then
-		-- A failed web call means "not a dev for now"; it is retried on the next check.
+		-- A failed web call means "not a dev for now"; it is tried again after ACCESS_FAILURE_CACHE seconds.
+		failedAt[key] = os.clock()
 		return false
 	end
 	badgeCache[userId] = owns
 	return owns
 end
 
--- Returns (isDev, reason, role). role is "owner" | "admin" | "dev" | nil.
+-- Returns (isDev, reason, role). role is "owner" | "admin" | "dev" | nil. Reasons: "studio", "owner", "member",
+-- "badge", "revoked", "none", and (0.3.2) "registry-unknown" (a badge or member check while the revocation list is
+-- unknown).
 function Access.check(player: Player): (boolean, string, string?)
 	local key = tostring(player.UserId)
 	if config.revoked[key] then
@@ -69,6 +104,9 @@ function Access.check(player: Player): (boolean, string, string?)
 	end
 	if isOwner(player) then
 		return true, "owner", "owner"
+	end
+	if not known then
+		return false, "registry-unknown", nil -- S-M2: no badge or member access until revocations are known
 	end
 	local role = config.members[key]
 	if typeof(role) == "string" then
@@ -95,7 +133,7 @@ local ownerIdCache: { [number]: boolean } = {}
 
 -- 0.2.3: whether `userId` is the owner or an admin, for messages from other servers (pin messages carry `by`). The
 -- player is usually elsewhere: the registry's members, the user-owned creator, or rank 255 in the owning group (a web
--- call, cached; a failure counts as "no" and is retried next time). Revoked users never are.
+-- call, cached; a failure counts as "no" for a while). Revoked users never are.
 function Access.isAdminUserId(userId: number): boolean
 	if typeof(userId) ~= "number" or userId <= 0 or userId % 1 ~= 0 then
 		return false
@@ -122,8 +160,13 @@ function Access.isAdminUserId(userId: number): boolean
 	if cached ~= nil then
 		return cached
 	end
+	local failKey = `groups:{userId}`
+	if recentlyFailed(failKey) then
+		return false
+	end
 	local ok, groups = pcall(game:GetService("GroupService").GetGroupsAsync, game:GetService("GroupService"), userId)
 	if not ok or typeof(groups) ~= "table" then
+		failedAt[failKey] = os.clock()
 		return false
 	end
 	local owner = false
@@ -139,7 +182,7 @@ end
 
 -- 0.3: whether `userId` is a dev (owner, admin, member or dev-badge holder, not revoked), for users who may not be in
 -- this server. Used at boot to decide whether a player-owned private server may follow its stored (game-written)
--- branch choice. A failed web call counts as "no".
+-- branch choice. A failed web call counts as "no". 0.3.2: badge holders and members only once revocations are known.
 function Access.isDevUserId(userId: number): boolean
 	if typeof(userId) ~= "number" or userId <= 0 or userId % 1 ~= 0 then
 		return false
@@ -147,7 +190,13 @@ function Access.isDevUserId(userId: number): boolean
 	if config.revoked[tostring(userId)] then
 		return false
 	end
-	if typeof(config.members[tostring(userId)]) == "string" or Access.isAdminUserId(userId) then
+	if Access.isAdminUserId(userId) then
+		return true -- before the registry is known, only the creator or the group owner can be one
+	end
+	if not known then
+		return false
+	end
+	if typeof(config.members[tostring(userId)]) == "string" then
 		return true
 	end
 	return hasBadge(userId)

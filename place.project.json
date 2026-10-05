@@ -50,6 +50,7 @@
 				"Access": { "$path": "src/server/Access.luau" },
 				"Logs": { "$path": "src/server/Logs.luau" },
 				"Registry": { "$path": "src/server/Registry.luau" },
+				"Reports": { "$path": "src/server/Reports.luau" },
 				"Transport": { "$path": "src/server/Transport.luau" },
 				"Signing": { "$path": "src/server/Signing.luau" },
 				"vendor": { "$path": "src/server/vendor" },

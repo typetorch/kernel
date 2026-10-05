@@ -16,13 +16,17 @@
 --                                  replaced by an unsigned one; mirrored in MemoryStore HashMap "TypeTorch" for
 --                                  polling; see "Branch heads" below). Game code can write these stores, so prod
 --                                  servers (0.3) only follow heads whose signatures check out (Signing.luau).
---       private/<PrivateServerId>  { branch, setBy, setAt, pin? }   (private and reserved servers' branch; `pin` =
+--       private/<PrivateServerId>  { branch, setBy, setAt, pin?, code? } (private and reserved servers' branch; `pin` =
 --                                  { assetId, artifactId, seq, commit, channel, branch, headSeq } boots that artifact
---                                  until the branch gets a deploy newer than headSeq)
+--                                  until the branch gets a deploy newer than headSeq; `code` (0.3.2) = a reserved
+--                                  server's access code, kept by every later write)
 --       deployments                { list }                   (newest first, at most 100: { seq, branch, channel,
 --                                  artifactId, assetId, commit, at, rollback?, rollout?, t?, sig?, sigF? } from deploy
---                                  messages and known heads; rollout = the deploy's `ro` %, 0.2.3; t/sig/sigF 0.3)
---       events                     { list }                   (automatic and server-local rollbacks, pins)
+--                                  messages and known heads; rollout = the deploy's `ro` %, 0.2.3; t/sig/sigF 0.3;
+--                                  0.3.2: written by the server that won the head's MemoryStore update only)
+--       events/<date>/<job>/<n>    { action, at, ... }        (0.3.2: one key per event, SetAsync: automatic and
+--                                  server-local rollbacks, health rollbacks, pins, refusals; the 0.3.1 `events` list
+--                                  key is no longer written)
 --
 -- Studio without published configs: ServerStorage.TypeTorchDev may carry a "Registry" JSON attribute (same shape) or a
 -- "BootAssetId" number attribute; see Registry.studioOverride. 0.3.1: a "Payload" Model child is mounted instead of any
@@ -88,22 +92,39 @@ end
 -- dev Logs tab. So once the key is missing, it is only read again after a publish (UpdateAvailable, or the key's own
 -- changed signal), never from the periodic refresh.
 local keyMissing = false
+-- 0.3.2 (audit S-M2): whether a registry read has ever succeeded (a missing key counts: no registry, nothing revoked).
+-- Until then `revoked` is unknown and Access denies badge devs. A failed read later keeps the last good registry.
+local known = false
+local lastReadError: string? = nil
 
-local function read()
-	if snapshot and not keyMissing then
-		local ok, value = pcall(function()
-			return snapshot:GetValue(CONFIG_KEY)
-		end)
-		if ok then
-			keyMissing = value == nil
-			return value
-		end
+-- (ok, value): ok = false when the read itself failed (keep what we have); value = nil when the key is missing.
+local function read(): (boolean, any)
+	if not snapshot then
+		return false, nil
 	end
-	return nil
+	if keyMissing then
+		return true, nil
+	end
+	local ok, value = pcall(function()
+		return snapshot:GetValue(CONFIG_KEY)
+	end)
+	if not ok then
+		lastReadError = tostring(value)
+		return false, nil
+	end
+	keyMissing = value == nil
+	return true, value
 end
 
+-- Re-reads the registry; a failed read keeps the last good state (S-M2: a read error never empties `revoked`).
 local function changed()
-	local newState = normalize(read())
+	local ok, value = read()
+	if not ok then
+		return
+	end
+	known = true
+	lastReadError = nil
+	local newState = normalize(value)
 	local before = state
 	state = newState
 	for _, listener in listeners do
@@ -119,38 +140,39 @@ local function watch()
 		keyMissing = false -- a publish may have added the key
 		changed()
 	end)
-	-- Also covers a key added by a Refresh from the loop below (if the engine has the per-key signal).
+	-- Also covers a key added by a Refresh from the sync loop (if the engine has the per-key signal).
 	pcall(function()
 		snapshot:GetValueChangedSignal(CONFIG_KEY):Connect(function()
 			keyMissing = false
 			changed()
 		end)
 	end)
-	task.spawn(function()
-		while true do
-			task.wait(Constants.POLL_SECONDS)
-			pcall(function()
-				snapshot:Refresh()
-			end)
-			if not keyMissing then
-				local value = read()
-				if HttpService:JSONEncode(normalize(value)) ~= HttpService:JSONEncode(state) then
-					changed()
-				end
-			end
-		end
-	end)
 end
 
--- Loads the config and keeps it fresh: UpdateAvailable plus a periodic Refresh as backup. Returns (state, error). In
--- Studio, a TypeTorchDev override wins.
--- 0.3 (audit P-K5): ConfigService is off the boot path. The retries (with backoff, up to about 30 s) run on their own
+-- One GetConfigAsync attempt; on success the snapshot is watched and its value read (listeners fire).
+local function connect(): (boolean, string?)
+	local ok, result = pcall(ConfigService.GetConfigAsync, ConfigService)
+	if not ok then
+		lastReadError = tostring(result)
+		return false, tostring(result)
+	end
+	snapshot = result
+	watch()
+	changed()
+	return true, nil
+end
+
+-- Loads the config and keeps it fresh: UpdateAvailable, plus the sync loop's Refresh (Registry.startSync). Returns
+-- (state, error). In Studio, a TypeTorchDev override wins.
+-- 0.3 (audit P-K5): ConfigService is off the boot path. The first retries (with backoff, about 60 s) run on their own
 -- thread; boot waits at most `bootWait` seconds for the first snapshot and continues with an empty registry (the
--- stored heads still work). A snapshot that arrives later fires the onChange listeners like any update.
+-- stored heads still work). A snapshot that arrives later fires the onChange listeners like any update. 0.3.2: after
+-- those retries the sync loop keeps trying once per tick (S-M2: "retry the boot read").
 function Registry.start(bootWait: number?): (any, string?)
 	local override = Registry.studioOverride()
 	if override then
 		state = override
+		known = true
 		return state, nil
 	end
 	state = normalize(nil)
@@ -158,33 +180,67 @@ function Registry.start(bootWait: number?): (any, string?)
 	task.spawn(function()
 		local delay = 1
 		for attempt = 1, 6 do
-			local ok, result = pcall(ConfigService.GetConfigAsync, ConfigService)
+			local ok, connectError = connect()
 			if ok then
-				snapshot = result
 				break
 			end
-			warn(`[TypeTorch] ConfigService unavailable (attempt {attempt}): {result}`)
+			warn(`[TypeTorch] ConfigService unavailable (attempt {attempt}): {connectError}`)
 			task.wait(delay)
 			delay = math.min(delay * 2, 30)
 		end
 		finished = true
-		if not snapshot then
-			return
-		end
-		local value = read()
-		watch()
-		if value ~= nil then
-			changed() -- also when boot already gave up waiting: listeners get the late snapshot
-		end
 	end)
 	local deadline = os.clock() + (bootWait or 3)
-	while not finished and os.clock() < deadline do
+	while not finished and not snapshot and os.clock() < deadline do
 		task.wait(0.05)
 	end
 	if not snapshot then
 		return state, if finished then "ConfigService unavailable" else "ConfigService slow (still retrying)"
 	end
 	return state, nil
+end
+
+-- 0.3.2 (S-M2): a registry read has succeeded at least once, so `revoked` (and `members`) are known.
+function Registry.known(): boolean
+	return known
+end
+
+-- 0.3.2: the last registry read error since the last success, or nil.
+function Registry.readError(): string?
+	return lastReadError
+end
+
+-- 0.3.2 (audit: one sync loop owner): THE periodic loop of the kernel. Every `interval` seconds it refreshes
+-- ConfigService (or retries connecting to it), then calls `onTick` (the kernel re-reads the stored head and follows
+-- it). Errors in a tick are logged and don't end the loop. Call once.
+local syncStarted = false
+function Registry.startSync(interval: number, onTick: () -> ())
+	assert(not syncStarted, "Registry.startSync runs once")
+	syncStarted = true
+	task.spawn(function()
+		while true do
+			task.wait(interval)
+			if Registry.studioOverride() == nil then
+				if snapshot then
+					pcall(function()
+						snapshot:Refresh()
+					end)
+					if not keyMissing then
+						local ok, value = read()
+						if ok and (not known or HttpService:JSONEncode(normalize(value)) ~= HttpService:JSONEncode(state)) then
+							changed()
+						end
+					end
+				else
+					connect()
+				end
+			end
+			local ok, tickError = pcall(onTick)
+			if not ok then
+				warn(`[TypeTorch] sync tick failed: {tickError}`)
+			end
+		end
+	end)
 end
 
 function Registry.state()
@@ -328,7 +384,8 @@ function Registry.refreshHeads(maxAge: number?)
 	end
 end
 
--- Kernel 0.2.0 stored one key per branch; read this branch's old key once (boot only).
+-- Kernel 0.2.0 stored one key per branch; read this branch's old key once (boot only). 0.3.2: it goes through saveHead,
+-- so the migrated head also lands in the shared `heads` copies (winner-only, and never over a newer or trusted head).
 function Registry.migrateLegacyHead(branch: string)
 	if storedHeads[branch] then
 		return
@@ -337,7 +394,7 @@ function Registry.migrateLegacyHead(branch: string)
 		return getStore():GetAsync("head/" .. branch)
 	end)
 	if ok and isHead(value) then
-		storedHeads[branch] = value
+		Registry.saveHead(branch, value)
 	end
 end
 
@@ -347,7 +404,27 @@ function Registry.refreshStoredHead(branch: string, maxAge: number?)
 	return storedHeads[branch]
 end
 
-function Registry.saveHead(branch: string, head)
+-- A durable DataStore write, retried after 1, 3 and 9 s (only the winner writes, so it must not give up at once).
+local function durably(write: () -> ())
+	for _, delay in { 0, 1, 3, 9 } do
+		if delay > 0 then
+			task.wait(delay)
+		end
+		if pcall(write) then
+			return true
+		end
+	end
+	return false
+end
+
+-- Records a branch head from a deploy message. `deployments` (0.3.2, optional) are the deployment entries that came
+-- with it. Winner-only durable writes: every server that hears the message updates the MemoryStore copy; only the one
+-- whose update wins (the head was new there) writes the DataStore `heads` copy AND the `deployments` list, so a deploy
+-- costs one durable write of each however many servers hear it. MemoryStore down: every server writes them itself.
+function Registry.saveHead(branch: string, head, deployments: { any }?)
+	if deployments then
+		Registry.recordDeployments(deployments, false) -- this server's copy now; the durable list below, winner only
+	end
 	local current = storedHeads[branch]
 	if current and not replaces(current, head, branch) then
 		return
@@ -368,11 +445,11 @@ function Registry.saveHead(branch: string, head)
 				return heads
 			end, HEADS_TTL)
 		end)
-		-- Lost the race: the winner writes the durable copy. MemoryStore down: write it ourselves.
+		-- Lost the race: the winner writes the durable copies. MemoryStore down: write them ourselves.
 		if memoryOk and not won then
 			return
 		end
-		pcall(function()
+		durably(function()
 			getStore():UpdateAsync(HEADS_KEY, function(existing)
 				local heads = if typeof(existing) == "table" then existing else {}
 				local stored = heads[branch]
@@ -383,6 +460,9 @@ function Registry.saveHead(branch: string, head)
 				return heads
 			end)
 		end)
+		if deployments then
+			Registry.writeDeploymentsDurably(deployments)
+		end
 	end)
 end
 
@@ -468,7 +548,8 @@ end
 
 -- In-game DataStore (game-written data) ---------------------------------------------------------------------------
 
--- A private or reserved server's stored choice: { branch, setBy, setAt, pin? } or nil.
+-- A private or reserved server's stored choice: { branch, setBy, setAt, pin?, code? } or nil; (nil, error) when the read
+-- failed. `code` (0.3.2) is a reserved server's access code (newServer and the framework's Migrate store it).
 function Registry.privateOverride(privateServerId: string): (any, string?)
 	local ok, value = pcall(function()
 		return getStore():GetAsync("private/" .. privateServerId)
@@ -482,6 +563,9 @@ function Registry.privateOverride(privateServerId: string): (any, string?)
 	if typeof(value.pin) ~= "table" or typeof(value.pin.assetId) ~= "number" then
 		value.pin = nil
 	end
+	if typeof(value.code) ~= "string" or #value.code > 200 then
+		value.code = nil
+	end
 	return value, nil
 end
 
@@ -490,15 +574,20 @@ function Registry.privateBranch(privateServerId: string): (string?, string?)
 	return if value then value.branch else nil, err
 end
 
--- `pin` (optional) makes the server boot that artifact instead of the branch head; see the header.
-function Registry.setPrivateBranch(privateServerId: string, branch: string, userId: number, pin: any?): (boolean, string?)
+-- `pin` (optional) makes the server boot that artifact instead of the branch head; see the header. `code` (0.3.2,
+-- optional): the reserved server's access code (newServer); a record's existing code is kept when none is given.
+function Registry.setPrivateBranch(privateServerId: string, branch: string, userId: number, pin: any?, code: string?): (boolean, string?)
 	local ok, err = pcall(function()
-		getStore():SetAsync("private/" .. privateServerId, {
-			branch = branch,
-			setBy = userId,
-			setAt = DateTime.now():ToIsoDate(),
-			pin = pin,
-		})
+		getStore():UpdateAsync("private/" .. privateServerId, function(existing)
+			local keep = if typeof(existing) == "table" and typeof(existing.code) == "string" then existing.code else nil
+			return {
+				branch = branch,
+				setBy = userId,
+				setAt = DateTime.now():ToIsoDate(),
+				pin = pin,
+				code = code or keep,
+			}
+		end)
 	end)
 	return ok, if ok then nil else tostring(err)
 end
@@ -603,51 +692,83 @@ function Registry.refreshDeployments(maxAge: number?)
 	end)
 	if ok then
 		deploymentsReadAt = os.clock()
-		storedDeployments = mergeDeployments({ storedList(value) }, Constants.DEPLOYMENTS_KEPT)
+		-- 0.3.2: merged with what this server heard itself (only the head's winner writes the durable list, and a
+		-- message whose head lost to a newer one is never written there).
+		storedDeployments = mergeDeployments({ storedList(value), storedDeployments }, Constants.DEPLOYMENTS_KEPT)
 	end
 end
 
--- Adds entries the stored list doesn't have yet (one UpdateAsync, cancelled when nothing is new). Non-blocking.
-function Registry.recordDeployments(entries: { any })
+-- Merges entries into this server's cached copy; returns the clean entries it didn't have.
+local function rememberDeployments(entries: { any }): { any }
 	local missing = {}
-	local known = {}
+	local listed = {}
 	for _, entry in storedDeployments do
-		known[deploymentKey(entry)] = true
+		listed[deploymentKey(entry)] = true
 	end
 	for _, raw in entries do
 		local entry = cleanDeployment(raw)
-		if entry and not known[deploymentKey(entry)] then
+		if entry and not listed[deploymentKey(entry)] then
 			table.insert(missing, entry)
 		end
 	end
-	if #missing == 0 then
+	if #missing > 0 then
+		storedDeployments = mergeDeployments({ storedDeployments, missing }, Constants.DEPLOYMENTS_KEPT)
+	end
+	return missing
+end
+
+-- Adds entries to the durable list (one UpdateAsync, cancelled when it has them all; retried). Non-blocking.
+local function writeDeployments(entries: { any })
+	local clean = {}
+	for _, raw in entries do
+		local entry = cleanDeployment(raw)
+		if entry then
+			table.insert(clean, entry)
+		end
+	end
+	if #clean == 0 then
 		return
 	end
-	storedDeployments = mergeDeployments({ storedDeployments, missing }, Constants.DEPLOYMENTS_KEPT)
 	task.spawn(function()
-		pcall(function()
+		durably(function()
 			getStore():UpdateAsync("deployments", function(existing)
 				local list = storedList(existing)
 				local have = {}
 				for _, entry in list do
-					local clean = cleanDeployment(entry)
-					if clean then
-						have[deploymentKey(clean)] = true
+					local entryClean = cleanDeployment(entry)
+					if entryClean then
+						have[deploymentKey(entryClean)] = true
 					end
 				end
 				local added = false
-				for _, entry in missing do
+				for _, entry in clean do
 					if not have[deploymentKey(entry)] then
 						added = true
 					end
 				end
 				if not added then
-					return nil -- another server already wrote them
+					return nil -- already there
 				end
-				return { list = mergeDeployments({ list, missing }, Constants.DEPLOYMENTS_KEPT) }
+				return { list = mergeDeployments({ list, clean }, Constants.DEPLOYMENTS_KEPT) }
 			end)
 		end)
 	end)
+end
+
+-- Adds entries this server's copy doesn't have yet, locally and (unless `durable` is false) to the durable list.
+-- Non-blocking. 0.3.2: deploy messages go through saveHead instead (winner-only); this path is for the heads and
+-- history the dev menu lists, which are rare and only written when something is new.
+function Registry.recordDeployments(entries: { any }, durable: boolean?)
+	local missing = rememberDeployments(entries)
+	if #missing > 0 and durable ~= false then
+		writeDeployments(missing)
+	end
+end
+
+-- 0.3.2: the winner of a saveHead writes the deploy's entries whatever this server's copy already has.
+function Registry.writeDeploymentsDurably(entries: { any })
+	rememberDeployments(entries)
+	writeDeployments(entries)
 end
 
 -- Every known deployment, newest first: ConfigService `deployments` (when readable), then the stored list, then
@@ -680,19 +801,24 @@ function Registry.deployments(extra: { any }?, keep: { any }?): { any }
 	return merged
 end
 
--- Automatic and server-local rollbacks, so `typetorch deployments` can show them later (backend phase).
+-- Automatic and server-local rollbacks, pins, refusals: so `typetorch deployments` can show them later (backend phase).
+-- 0.3.2: one unique key per event, `events/<yyyy-mm-dd>/<job>/<n>` (SetAsync, no contention between servers and no
+-- 4 MB list), like the framework's `mod/` records. `<job>` = the JobId without dashes, first 24 characters ("studio" +
+-- the boot time in Studio); `<n>` counts per server. DataStore keys stay under 50 characters. The 0.3.1 `events` list
+-- key is left as it is (nothing reads it).
+local eventCount = 0
+local eventJob: string? = nil
 function Registry.logEvent(entry: { [string]: any })
+	entry.at = entry.at or DateTime.now():ToIsoDate()
+	if not eventJob then
+		local jobId = game.JobId
+		eventJob = if jobId ~= "" then string.sub(string.gsub(jobId, "-", ""), 1, 24) else `studio{os.time()}`
+	end
+	eventCount += 1
+	local key = `events/{string.sub(entry.at, 1, 10)}/{eventJob}/{eventCount}`
 	task.spawn(function()
 		pcall(function()
-			getStore():UpdateAsync("events", function(current)
-				local list = if typeof(current) == "table" and typeof(current.list) == "table" then current.list else {}
-				entry.at = entry.at or DateTime.now():ToIsoDate()
-				table.insert(list, entry)
-				while #list > 200 do
-					table.remove(list, 1)
-				end
-				return { list = list }
-			end)
+			getStore():SetAsync(key, entry)
 		end)
 	end)
 end

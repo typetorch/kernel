@@ -9,7 +9,8 @@ local Api = {}
 local persistStore: { [string]: any } = {}
 local entries: { [Script]: any } = {}
 local services = nil -- set by the kernel: { Access, Transport, Logs, status, branchList, artifacts, reload, rollback,
--- switchBranch, pinArtifact, newServer, requestReload, unpin, experiment, KERNEL_BUILD, keys }
+-- switchBranch, pinArtifact, newServer, requestReload, unpin, experiment, KERNEL_BUILD, keys, reportError, heartbeat,
+-- accessCode }. 0.3.2: reload, rollback, switchBranch, pinArtifact and unpin run on a kernel thread (the caller waits).
 
 function Api.init(kernelServices)
 	services = kernelServices
@@ -158,6 +159,31 @@ function Api.forEntry(entry: Script)
 	-- rejected = { total, byKind, last }, refusals }. Its presence marks a 0.3 kernel. Public keys aren't secret.
 	function api:keys()
 		return services.keys()
+	end
+
+	-- Kernel 0.3.2+ (additive): bad deploys are safe.
+	-- The framework reports a failed lifecycle hook: { kind = "onStart" | "onPlayerAdded" | ..., module, message }. A
+	-- failed onStart within the health window rolls this generation back; other kinds count as one error each. The
+	-- kernel prints it (as an error line from its own thread). Returns whether it was taken (false once this
+	-- generation is stopping). Its presence marks a 0.3.2 kernel.
+	function api:reportError(info)
+		return services.reportError(generation, info)
+	end
+	-- fn() runs from the kernel's BindToClose (server shutdown) while this generation is the running one, for at most
+	-- CLOSE_DEADLINE seconds. One handler per generation; the framework installs it.
+	function api:onClose(fn)
+		generation.closeHandler = if typeof(fn) == "function" then fn else nil
+	end
+	-- The kernel writes this server's heartbeat (TypeTorchServers) and deploy reports (TypeTorchReports): { enabled,
+	-- map, reportsMap, heartbeat = counters, reports = counters }. Its presence tells the framework not to write the
+	-- server list itself.
+	function api:heartbeat()
+		return services.heartbeat()
+	end
+	-- A reserved server's own access code (stored in its private/<id> record by newServer or Migrate), or nil.
+	-- Server-only data: never send it to a client.
+	function api:accessCode()
+		return services.accessCode()
 	end
 
 	-- Entry-only (not on the TS interface).
