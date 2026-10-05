@@ -5,12 +5,20 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/typetorch/kernel"
+		"url": "git+https://github.com/typetorch/kernel.git"
+	},
+	"homepage": "https://github.com/typetorch/kernel#readme",
+	"bugs": {
+		"url": "https://github.com/typetorch/kernel/issues"
 	},
 	"publishConfig": {
 		"access": "public"
 	},
-	"files": ["src", "scripts", "place.project.json", "rokit.toml", "README.md", "LICENSE"],
+	"files": ["src", "scripts/check.luau", "place.project.json", "rokit.toml", "README.md", "LICENSE"],
+	"scripts": {
+		"check": "lune run scripts/check.luau",
+		"prepublishOnly": "lune run scripts/check.luau"
+	},
 	"typetorch": {
 		"kernelApi": 1,
 		"placeProject": "place.project.json"
