@@ -5,8 +5,8 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
 
 - `src/server/` → `ServerScriptService.TypeTorchKernel`: boot, branch choice, LoadAsset + side-by-side mounting,
   swaps with soft + hard stop, automatic rollback, registry (ConfigService + in-game DataStore), dev access,
-  stable transport, logs, heartbeat and deploy reports (`Reports`), `/tt` chat commands. A place project that maps
-  these files one by one must map `Reports` too (0.3.2; without it the kernel boots without reports).
+  stable transport, logs, the fleet API sender (`Fleet`), `/tt` chat commands. A place project that maps these files
+  one by one must map `Fleet` too (0.3.2; without it the kernel boots without the fleet API).
 - `src/shared/` → `ReplicatedStorage.TypeTorchKernelShared`: constants, client API, ClientEntry template.
 - `src/client/` → `ReplicatedFirst.TypeTorchKernelClient`: follows `ActiveGeneration`, swaps client generations.
 - `place.project.json`: the whole place (kernel + baseplate + spawn, HTTP on). `rojo build place.project.json -o
@@ -54,19 +54,24 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
     count.
   - **Last known good:** this server's history, then the branch's deployments (prod: only verified ones, or heads
     this server already ran), skipping artifacts that failed here. Also at boot when the head fails to start.
-  - **Heartbeat and reports:** the kernel writes the server list (MemoryStore SortedMap `TypeTorchServers`, every
-    60 s, also when the game is broken) and one report per deploy outcome (`TypeTorchReports`, key
-    `<seq, 10 digits>/<JobId>`), so `typetorch servers` and `deploy --wait` work. The contract is in
-    `src/server/Reports.luau`.
+  - **Fleet status and deploy reports:** `api:fleetStatus()` (this server's heartbeat), `api:onDeployReport(fn)` (one
+    report per deploy outcome, the last 20 replayed) and `api:deployReports()`; the kernel writes nothing to
+    MemoryStore for them. With the server-only ConfigService key `TypeTorchFleet` = `{url, token}` the kernel also
+    posts heartbeats (every 30 s and on changes), reports, alerts and a closing notice to that fleet API itself, live
+    and also while the generation is broken (`src/server/Fleet.luau`; the token is never logged).
+  - **Boot budget:** a new server runs a playable generation within 15 s of start in every path (about 2 s
+    normally): the boot reads run in parallel behind one 3 s gate, the key asset gets 3 s, and boot attempts get short
+    load and ready caps; a head that runs out of boot time is retried in the background and swapped to when it works.
   - Client generation reports with one retry, `api:onClose(fn)` from the kernel's BindToClose, and every swap game
-    code starts runs on a kernel thread. `status()` adds `health`, `failed`, `heartbeat` and `clients`.
+    code starts runs on a kernel thread. `status()` adds `health`, `failed`, `reports`, `fleet` and `clients`.
   - Messages across a swap: with a `ProtocolHash` attribute on the payload, client events of the previous artifact
     of the same hash reach the new generation; the resync names the dropped artifact and reaches only that client
     generation (`onResync`).
 - Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
-  `--health-prod`, `--lkg-boot`, `--client`).
+  `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, and `--boot-budget`, which runs 21 boot scenarios with
+  simulated slow or failing dependencies and checks each one runs a generation within 15 s).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.
 
