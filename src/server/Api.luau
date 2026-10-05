@@ -9,8 +9,9 @@ local Api = {}
 local persistStore: { [string]: any } = {}
 local entries: { [Script]: any } = {}
 local services = nil -- set by the kernel: { Access, Transport, Logs, status, branchList, artifacts, reload, rollback,
--- switchBranch, pinArtifact, newServer, requestReload, unpin, experiment, KERNEL_BUILD, keys, reportError, heartbeat,
--- accessCode }. 0.3.2: reload, rollback, switchBranch, pinArtifact and unpin run on a kernel thread (the caller waits).
+-- switchBranch, pinArtifact, newServer, requestReload, unpin, experiment, KERNEL_BUILD, keys, reportError, fleetStatus,
+-- addReportListener, deployReports, accessCode }. 0.3.2: reload, rollback, switchBranch, pinArtifact and unpin run
+-- on a kernel thread (the caller waits).
 
 function Api.init(kernelServices)
 	services = kernelServices
@@ -176,11 +177,23 @@ function Api.forEntry(entry: Script)
 	function api:onClose(fn)
 		generation.closeHandler = if typeof(fn) == "function" then fn else nil
 	end
-	-- The kernel writes this server's heartbeat (TypeTorchServers) and deploy reports (TypeTorchReports): { enabled,
-	-- map, reportsMap, heartbeat = counters, reports = counters }. Its presence tells the framework not to write the
-	-- server list itself.
-	function api:heartbeat()
-		return services.heartbeat()
+	-- This server's fleet status: { t, b, c?, a?, n, m, s, u, p, k?, x?, v, q, g, h, e?, sv = 2 } (plans/01 "Fleet
+	-- status and deploy reports"). Cheap, no yield. The kernel writes it nowhere: the framework's analytics engine sends
+	-- it as a heartbeat and Admin > Servers' roll call answers with it. `k` (a reserved server's access code) is
+	-- server-only data: never send it to a client.
+	function api:fleetStatus()
+		return services.fleetStatus()
+	end
+	-- fn(report) once per deploy outcome on this server: { s, b, a, j, r, e?, d?, t, g, k, p }, r = "swapped" |
+	-- "failed" | "rolled_back" | "skipped" | "booted". The last 20 are replayed to fn at once (oldest first), since a
+	-- generation attaches after its own boot report. Each call runs on its own kernel thread; the listener is dropped
+	-- when this generation stops. Returns a disconnect function.
+	function api:onDeployReport(fn)
+		return services.addReportListener(fn, generation)
+	end
+	-- The last 20 deploy reports, oldest first (copies).
+	function api:deployReports()
+		return services.deployReports()
 	end
 	-- A reserved server's own access code (stored in its private/<id> record by newServer or Migrate), or nil.
 	-- Server-only data: never send it to a client.

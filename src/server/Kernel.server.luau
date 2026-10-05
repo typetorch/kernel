@@ -16,12 +16,12 @@
 --
 -- 0.3.2 (bad deploys are safe): a health window after ready (a failed onStart, or HEALTH_ERRORS errors from the new
 -- generation's own scripts, rolls the server back; P-F1), a last-known-good chain that skips artifacts that failed
--- here (P-K3), a kernel-owned heartbeat and per-deploy reports in MemoryStore (P-O1, Reports.luau), client generation
--- reports (P-K7), onClose per generation, and every swap game code starts runs on a kernel thread (busy-flag hazard).
+-- here (P-K3), the fleet status and per-deploy reports on the API (P-O1: api:fleetStatus, api:onDeployReport; the kernel
+-- writes nothing itself), client generation reports (P-K7), onClose per generation, and every swap game code starts
+-- runs on a kernel thread (busy-flag hazard).
 
 local HttpService = game:GetService("HttpService")
 local InsertService = game:GetService("InsertService")
-local MemoryStoreService = game:GetService("MemoryStoreService")
 local MessagingService = game:GetService("MessagingService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -52,36 +52,6 @@ local Api = require(script.Parent.Api)
 local Logs = require(script.Parent.Logs)
 local Registry = require(script.Parent.Registry)
 local Transport = require(script.Parent.Transport)
-
--- 0.3.2: Reports.luau is a new file. A place project that doesn't map it yet (an older template studio.project.json
--- lists the kernel's files one by one) still boots, without heartbeat and reports, and says so.
-local Reports
-do
-	local module = script.Parent:FindFirstChild("Reports")
-	if module then
-		Reports = require(module)
-	else
-		warn("[TypeTorch] TypeTorchKernel.Reports is missing (map src/server/Reports.luau in the place project): no heartbeat or deploy reports on this server")
-		local function noop() end
-		Reports = {
-			clip = function(text, max)
-				return if text == nil then nil else string.sub(tostring(text), 1, max)
-			end,
-			configure = noop,
-			heartbeat = noop,
-			poke = noop,
-			startHeartbeat = noop,
-			close = noop,
-			report = noop,
-			enabled = function()
-				return false
-			end,
-			info = function()
-				return { enabled = false, missing = true }
-			end,
-		}
-	end
-end
 
 Logs.start()
 
@@ -133,7 +103,23 @@ local function logError(text: string)
 	end)
 end
 
-local clip = Reports.clip
+-- `text` cut to at most `max` bytes, control characters flattened, never splitting a UTF-8 character. nil stays nil.
+local function clip(text: any, max: number): string?
+	if text == nil then
+		return nil
+	end
+	local flat = string.gsub(tostring(text), "%c", " ")
+	if #flat > max then
+		flat = string.sub(flat, 1, max)
+	end
+	for _ = 1, 3 do
+		if utf8.len(flat) then
+			return flat
+		end
+		flat = string.sub(flat, 1, -2) -- a character cut in half at the end
+	end
+	return if utf8.len(flat) then flat else (string.gsub(flat, "[\128-\255]", "?"))
+end
 
 local function folder(parent: Instance, name: string): Folder
 	local existing = parent:FindFirstChild(name)
@@ -171,11 +157,11 @@ local lastPin = nil -- 0.2.3: the last pin message this server acted on (status(
 local failedHere: { [number]: any } = {}
 local startingGeneration = nil -- 0.3.2: the generation being started (its scripts' errors count toward its health)
 local restoring = false -- 0.3.2: restoreLastKnownGood is running (a failed candidate doesn't start another one)
-local lastErrorText, lastErrorAt = nil, nil -- 0.3.2: the newest error worth a look (heartbeat `e`)
+local lastErrorText, lastErrorAt = nil, nil -- 0.3.2: the newest error worth a look (fleet status `e`)
 local lastHealthRollback = nil -- 0.3.2: { from, to?, why, at } of the last health-window rollback
 local closing = false -- 0.3.2: BindToClose ran: no more swaps
 local failing = nil -- P-K2: { seq, assetId, attempts, nextAt } of the deploy that failed here (see noteFailure)
-local ownAccessCode = nil -- 0.3.2: a reserved server's own access code (private/<id>.code), for the heartbeat's `k`
+local ownAccessCode = nil -- 0.3.2: a reserved server's own access code (private/<id>.code), for its fleet status `k`
 
 local function noteLastError(text: string?)
 	if text then
@@ -850,26 +836,94 @@ end
 
 local lastGeneration = nil -- the last generation that started (it may be stopped now), for api.start.previous
 
--- 0.3.2: reasons that are deploys of this server's branch (reported in TypeTorchReports); dev actions aren't.
+-- 0.3.2: reasons that are deploys of this server's branch (they get deploy reports); dev actions don't.
 local DEPLOY_REASONS = { deploy = true, registry = true, poll = true, rollback = true }
 -- 0.3.2: reasons that are a dev's explicit choice: they may run an artifact that failed here before.
 local EXPLICIT_REASONS = { reload = true, pin = true, branch = true, ["server-rollback"] = true }
 
--- 0.3.2 (P-O1): one deploy outcome of `head` ("swapped", "failed", "rolled_back", "skipped", "booted") in
--- TypeTorchReports. `extra` = { e = error?, d = seconds? }. Heads without a seq aren't deploys: nothing is written.
+-- 0.3.2 (P-O1) deploy reports ---------------------------------------------------------------------------------------
+-- One report per deploy outcome on this server, given to listeners (api:onDeployReport; the framework's analytics
+-- engine forwards them to the dev's analytics backend). The kernel writes nothing anywhere. Contract (shared with the
+-- analytics engine and the CLI; plans/01 "Fleet status and deploy reports"):
+--   { s = seq, b = branch, a = artifact id, j = JobId, r = "swapped" | "failed" | "rolled_back" | "skipped" | "booted",
+--     e = error (<= 300 bytes)?, d = seconds?, t = unix s, g = generation number, k = kernel version, p = players }
+-- The last REPORTS_KEPT are kept (api:deployReports()) and replayed, oldest first, to each new listener: the framework
+-- attaches after the boot report. A listener belongs to the generation that added it and is dropped when it stops; each
+-- call runs on its own thread (pcall), so a slow or broken listener can't hold a swap.
+local RESULTS = { swapped = true, failed = true, rolled_back = true, skipped = true, booted = true }
+local recentReports = {} -- oldest first, at most REPORTS_KEPT
+local reportListeners = {} -- { fn, owner (a generation), on }
+local reportsTotal = 0
+
+local function callListener(listener, report)
+	task.spawn(function()
+		local ok, err = pcall(listener.fn, table.clone(report))
+		if not ok then
+			warn(`[TypeTorch] a deploy report listener threw: {err}`)
+		end
+	end)
+end
+
+-- Adds a listener owned by `owner` (a generation, or nil for the kernel); replays the kept reports. Returns a
+-- disconnect function.
+local function addReportListener(fn, owner)
+	if typeof(fn) ~= "function" then
+		return function() end
+	end
+	local listener = { fn = fn, owner = owner, on = true }
+	table.insert(reportListeners, listener)
+	for _, report in recentReports do
+		callListener(listener, report)
+	end
+	return function()
+		listener.on = false
+		local index = table.find(reportListeners, listener)
+		if index then
+			table.remove(reportListeners, index)
+		end
+	end
+end
+
+-- A stopped generation's listeners go with it (they would hold its code alive and run it after the hard stop).
+local function dropReportListeners(owner)
+	for index = #reportListeners, 1, -1 do
+		if reportListeners[index].owner == owner then
+			reportListeners[index].on = false
+			table.remove(reportListeners, index)
+		end
+	end
+end
+
+-- 0.3.2 (P-O1): one deploy outcome of `head`. `extra` = { e = error?, d = seconds? }. Heads without a seq aren't
+-- deploys: no report.
 local function reportOutcome(head, result: string, extra)
-	if typeof(head) ~= "table" or typeof(head.seq) ~= "number" then
+	if typeof(head) ~= "table" or typeof(head.seq) ~= "number" or head.seq < 0 or not RESULTS[result] then
 		return
 	end
-	Reports.report({
+	local seconds = extra and extra.d
+	local report = {
 		s = head.seq,
-		b = head.branch or myBranch,
-		a = head.artifactId or (if typeof(head.assetId) == "number" then `asset-{head.assetId}` else nil),
+		b = clip(head.branch or myBranch, 100),
+		a = clip(head.artifactId or (if typeof(head.assetId) == "number" then `asset-{head.assetId}` else nil), 100),
+		j = game.JobId,
 		r = result,
-		e = extra and extra.e,
-		d = extra and extra.d,
+		e = clip(extra and extra.e, 300),
+		d = if typeof(seconds) == "number" and seconds == seconds then math.floor(seconds * 1000 + 0.5) / 1000 else nil,
+		t = os.time(),
 		g = if current then current.number else 0,
-	})
+		k = Constants.KERNEL_VERSION,
+		p = #Players:GetPlayers(),
+	}
+	reportsTotal += 1
+	table.insert(recentReports, report)
+	while #recentReports > Constants.REPORTS_KEPT do
+		table.remove(recentReports, 1)
+	end
+	for _, listener in table.clone(reportListeners) do
+		if listener.on then
+			callListener(listener, report)
+		end
+	end
 end
 
 -- Outcomes the 60 s poll would repeat ("skipped") are written once per seq and result.
@@ -949,7 +1003,7 @@ local function checkHealth(generation)
 		return -- a Studio local payload: errors are counted, the dev's own code is never swapped for an upload
 	end
 	if os.clock() > health.readyAt + Constants.HEALTH_WINDOW then
-		return -- after the window: counted (status, heartbeat "degraded"), never rolled back
+		return -- after the window: counted (status, fleet status "degraded"), never rolled back
 	end
 	local why = nil
 	if health.startFailed then
@@ -1004,7 +1058,7 @@ local function reportError(generation, info): boolean
 end
 
 -- 0.3.2: "ok" | "failed" (nothing runs) | "unverified" (boot fail-safe) | "degraded" (a deploy failed here, or the
--- running generation failed or keeps erroring). The heartbeat's `h`.
+-- running generation failed or keeps erroring). The fleet status `h`.
 local function healthState(): string
 	if not current then
 		return "failed"
@@ -1019,10 +1073,15 @@ local function healthState(): string
 	return "ok"
 end
 
--- 0.3.2 (P-O1): this server's entry in TypeTorchServers (the contract is in Reports.luau). The framework's admin
--- heartbeat (kernels before 0.3.2) wrote t..v; the kernel adds q, g, h, e and sv. `e` only while it is recent (15 min)
--- or the server isn't healthy.
-local function heartbeatEntry()
+-- 0.3.2 (P-O1): this server's fleet status (api:fleetStatus()), the heartbeat the analytics engine sends and the
+-- framework's Admin > Servers roll call answers with. Contract (plans/01 "Fleet status and deploy reports"):
+--   { t = server type, b = branch, c = effective channel?, a = artifact id?, n = players, m = max players,
+--     s = server start (unix s), u = now (unix s), p = place id, k = reserved access code (server-only data)?,
+--     x = 1 during an A/B experiment?, v = kernel version, q = applied seq, g = generation number (0 = none),
+--     h = "ok" | "failed" | "unverified" | "degraded", e = last error (<= 200 bytes)?, sv = 2 }
+-- t..v are the fields the framework's admin heartbeat had before 0.3.2. `e` only while it is recent (15 min) or the
+-- server isn't healthy. Cheap: no yield, no web call.
+local function fleetStatus()
 	local kind = serverType()
 	local health = healthState()
 	local recentError = lastErrorText ~= nil and (health ~= "ok" or (lastErrorAt ~= nil and os.time() - lastErrorAt <= 900))
@@ -1047,16 +1106,6 @@ local function heartbeatEntry()
 	}
 end
 
-Reports.configure({
-	memory = MemoryStoreService,
-	jobId = game.JobId,
-	studio = serverType() == "studio",
-	entry = heartbeatEntry,
-	players = function()
-		return #Players:GetPlayers()
-	end,
-	warn = warn,
-})
 
 -- Swap to a registry head { assetId, artifactId?, seq?, ... }. Returns a report table. `by` is the user id that asked
 -- (dev menu, /tt, game code); `announced` means notifyPending already ran for this swap.
@@ -1146,6 +1195,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 				},
 			})
 			oldStopped = true
+			dropReportListeners(old)
 			current = nil
 			generation.start.stopSeconds = report.stopSeconds
 		end
@@ -1158,6 +1208,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 			report.error = startError
 			warn(`[TypeTorch] {generation.name} failed to start: {startError}`)
 			stopGeneration(generation)
+			dropReportListeners(generation)
 			-- 0.3.2 (P-K3): never again automatically on this server; then the last known good (the previous head first).
 			markFailed(head.assetId, generation.artifact.id, head.seq, `start: {startError}`)
 			if old and not restoring then
@@ -1220,11 +1271,10 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 			failedHere[head.assetId] = nil
 			healthExempt[head.assetId] = nil
 		end
-		-- 0.3.2 (P-O1): the server's first generation is a boot report; a heartbeat soon shows the new artifact.
+		-- 0.3.2 (P-O1): the server's first generation is a boot report.
 		if report.kind == "boot" then
 			reportOutcome(head, "booted", { d = (report.loadSeconds or 0) + (report.swapSeconds or 0) })
 		end
-		task.defer(Reports.poke) -- deferred: callers record appliedSeq right after swapTo returns
 		-- 0.3.2 (P-F1): a failure reported before ready (a thrown onStart, early errors) is judged now.
 		if generation then
 			checkHealth(generation)
@@ -1244,7 +1294,7 @@ end
 local function branchFromOverride(override): string
 	local state = Registry.state()
 	if typeof(override.code) == "string" and override.code ~= "" then
-		ownAccessCode = override.code -- 0.3.2: Migrate and newServer store it; the heartbeat's `k`
+		ownAccessCode = override.code -- 0.3.2: Migrate and newServer store it; fleet status `k`
 	end
 	-- 0.3: private/<id> is written by game servers, so in-universe code could rewrite it. A player-owned private
 	-- server follows a stored branch other than the default only when its owner is a dev; otherwise game code
@@ -2281,7 +2331,7 @@ local function newServer(player: Player, branch: string, assetId: number?)
 	if not ok then
 		return { ok = false, error = tostring(code) }
 	end
-	-- 0.3.2: the access code goes in the record too (server-only), so the new server can publish it in its heartbeat
+	-- 0.3.2: the access code goes in the record too (server-only), so the new server can give it in its fleet status
 	-- (`k`) and Admin > Servers can join it.
 	local saved, err = Registry.setPrivateBranch(privateServerId, branch, player.UserId, pin, code)
 	if not saved then
@@ -2413,8 +2463,8 @@ local function status()
 		health = healthInfo(),
 		-- 0.3.2 (P-K3): artifacts that failed on this server (never run again automatically), newest first.
 		failed = failedList(),
-		-- 0.3.2 (P-O1): the kernel's heartbeat and report writes ({ enabled, heartbeat, reports } counters).
-		heartbeat = Reports.info(),
+		-- 0.3.2 (P-O1): deploy reports given out ({ total, kept, listeners }; api:deployReports() has them).
+		reports = { total = reportsTotal, kept = #recentReports, listeners = #reportListeners },
 		-- 0.3.2 (P-K7): client generation reports.
 		clients = clientSummary(),
 	}
@@ -2588,7 +2638,15 @@ Api.init({
 	keys = keysInfo,
 	-- 0.3.2
 	reportError = reportError,
-	heartbeat = Reports.info,
+	fleetStatus = fleetStatus,
+	addReportListener = addReportListener,
+	deployReports = function()
+		local list = {}
+		for index, report in recentReports do
+			list[index] = table.clone(report)
+		end
+		return list
+	end,
 	accessCode = function()
 		return if serverType() == "reserved" then ownAccessCode else nil
 	end,
@@ -2904,18 +2962,10 @@ Registry.startSync(Constants.POLL_SECONDS, function()
 	followHead("poll", true)
 end)
 
--- 0.3.2 (P-O1): the kernel's heartbeat (the first entry right after boot, then every HEARTBEAT_SECONDS +- jitter).
-Reports.startHeartbeat(1 + math.random() * 2)
-
--- 0.3.2: one BindToClose for the server's lifetime: no more swaps, the heartbeat entry is removed, and the running
--- generation's onClose handler (api:onClose; the framework runs its modules' onStop) gets CLOSE_DEADLINE seconds.
+-- 0.3.2: one BindToClose for the server's lifetime: no more swaps, and the running generation's onClose handler
+-- (api:onClose; the framework runs its modules' onStop and its analytics engine's last flush) gets CLOSE_DEADLINE s.
 local function onClose()
 	closing = true
-	local removed = false
-	task.spawn(function()
-		Reports.close()
-		removed = true
-	end)
 	local generation = current
 	local handler = generation and generation.closeHandler
 	if handler then
@@ -2935,10 +2985,6 @@ local function onClose()
 			pcall(task.cancel, thread)
 			warn(`[TypeTorch] {generation.name} onClose took more than {Constants.CLOSE_DEADLINE} s`)
 		end
-	end
-	local deadline = os.clock() + 3
-	while not removed and os.clock() < deadline do
-		task.wait()
 	end
 end
 local bound, bindError = pcall(function()

@@ -3,7 +3,7 @@
 -- `--bootstrap`, `--bootstrap-only` (BootstrapHeads), `--blind` (the boot fail-safe), `--empty` (nothing usable) and
 -- `--studio-local` (0.3.1: a Studio session mounting ServerStorage.TypeTorchDev.Payload; every other mode has the same
 -- folder in ServerStorage and checks that a non-Studio server ignores it), and 0.3.2's `--health` (a reserved dev
--- server: the health window, the last-known-good chain, heartbeat and deploy reports, the busy-flag hazard, client
+-- server: the health window, the last-known-good chain, fleet status and deploy reports, the busy-flag hazard, client
 -- reports, onClose, subscribe and private-read retries, revocations unknown), `--health-prod` (the same failures on a
 -- signed public server) and `--lkg-boot` (a prod head that fails to start at boot: the signed deployment history,
 -- never an unsigned entry). Every mode also checks that no swap ran on a thread its own stopped generation owned.
@@ -349,7 +349,7 @@ end
 
 -- Scripts and require ----------------------------------------------------------------------------------------------
 
-local SMOKE = { boots = {}, stops = {}, closed = {}, behave = {}, messages = {}, task = ownedTask }
+local SMOKE = { boots = {}, stops = {}, closed = {}, behave = {}, messages = {}, heard = {}, disconnects = {}, task = ownedTask }
 local moduleCache = {}
 local game
 
@@ -543,30 +543,12 @@ end
 
 local dataStore = keyValueStore()
 local memoryStore = keyValueStore()
--- 0.3.2: MemoryStore sorted maps (heartbeat, reports): data[key] = { value, ttl }; `failWrites` makes SetAsync throw.
-local sortedMaps = {}
+-- 0.3.2: the kernel never uses a MemoryStore sorted map (fleet status and deploy reports are API only); finish()
+-- checks that nothing asked for one.
+local sortedMapRequests = {}
 local function sortedMap(name: string)
-	local existing = sortedMaps[name]
-	if existing then
-		return existing
-	end
-	local map = { data = {}, writes = 0, failWrites = 0 }
-	function map:SetAsync(key, value, ttl)
-		assert(type(key) == "string" and #key <= 128, "bad sorted map key")
-		assert(type(ttl) == "number" and ttl > 0, "SetAsync needs an expiration")
-		if self.failWrites > 0 then
-			self.failWrites -= 1
-			error("MemoryStore throttled (smoke)")
-		end
-		self.writes += 1
-		self.data[key] = { value = deepCopy(value), ttl = ttl }
-		return true
-	end
-	function map:RemoveAsync(key)
-		self.data[key] = nil
-	end
-	sortedMaps[name] = map
-	return map
+	table.insert(sortedMapRequests, name)
+	error(`smoke: the kernel asked for MemoryStore sorted map {name}`)
 end
 local topics = {}
 local subscribeFailures = {} -- topic -> number of SubscribeAsync calls that fail first
@@ -714,7 +696,7 @@ end
 
 local kernelFolder = newInstance("Folder", "TypeTorchKernel")
 kernelFolder.Parent = services.ServerScriptService
-for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Reports = "Reports.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
+for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
 	sourceInstance(if name == "Kernel" then "Script" else "ModuleScript", name, `src/server/{file}`).Parent = kernelFolder
 end
 local entryTemplate = sourceInstance("Script", "Entry", "src/server/Entry.server.luau")
@@ -806,6 +788,14 @@ local BOOT_SOURCE = [[
 return {
 	boot = function(kernel)
 		SMOKE.kernel = kernel
+		if kernel.onDeployReport then
+			local reports = {}
+			local name = kernel.artifact.id .. "#" .. kernel.generation
+			SMOKE.heard[name] = reports
+			SMOKE.disconnects[name] = kernel:onDeployReport(function(report)
+				table.insert(reports, report)
+			end)
+		end
 		kernel:onMessage(function(player, channel, ...)
 			table.insert(SMOKE.messages, { kernel.artifact.id, channel })
 		end)
@@ -999,13 +989,9 @@ Constants.LOAD_RETRY_DELAYS = { 0.1, 0.1, 0.1 }
 Constants.STOP_DEADLINE = 0.3
 Constants.SUBSCRIBE_RETRY_DELAYS = { 0.05 }
 Constants.PRIVATE_READ_RETRY_DELAYS = { 0.05, 0.05, 0.05 }
-Constants.WRITE_RETRY_DELAYS = { 0.05, 0.05 }
-Constants.HEARTBEAT_MIN_GAP = 0.1
 Constants.CLOSE_DEADLINE = 1
 if HEALTH_MODE or HEALTH_PROD_MODE or LKG_BOOT_MODE then
 	Constants.HEALTH_WINDOW = 1.5
-	Constants.HEARTBEAT_SECONDS = 0.4
-	Constants.HEARTBEAT_JITTER = 0.05
 	Constants.POLL_SECONDS = 0.3
 end
 if BLIND_MODE then
@@ -1078,6 +1064,7 @@ local function finish()
 	end
 	check(`no unexpected errors on kernel threads{if #unexpected > 0 then ": " .. unexpected[1] else ""}`, #unexpected == 0)
 	check(`no swap ran on a thread its own stopped generation owned (busy-flag hazard){if #hazards > 0 then ": " .. hazards[1] else ""}`, #hazards == 0)
+	check("the kernel never used a MemoryStore sorted map (0.3.2: fleet status and reports are API only)", #sortedMapRequests == 0)
 	for _, line in output do
 		if line.kind == "warn" and string.find(line.text, "swap failed", 1, true) and not string.find(line.text, "eeeeeee", 1, true) and not string.find(line.text, "1006", 1, true) and not string.find(line.text, "ccccccc", 1, true) and not string.find(line.text, "Sneaky", 1, true) then
 			check(`unexpected: {line.text}`, false)
@@ -1350,21 +1337,32 @@ if STUDIO_MODE then
 	local missing = SMOKE.kernel:reload(owner)
 	check("studio: Reload without a source fails cleanly", missing.ok == false and string.find(missing.error or "", "TypeTorchDev.Payload", 1, true) ~= nil and isLocalId(running()))
 	localSource.Parent = devFolder
-	check("studio: no heartbeat or deploy reports (0.3.2: Studio writes nothing)", sortedMaps.TypeTorchServers == nil and sortedMaps.TypeTorchReports == nil and SMOKE.kernel:heartbeat().enabled == false)
+	check("studio: fleet status and deploy reports on the API, nothing written", #sortedMapRequests == 0 and SMOKE.kernel:fleetStatus().t == "studio" and typeof(SMOKE.kernel:deployReports()) == "table")
 	finish()
 end
 
--- 0.3.2 helpers: this server's report of a seq, its heartbeat entry (value, ttl), and the running Entry clone.
+-- 0.3.2 helpers: the newest kept report of a seq (api:deployReports()), this server's fleet status, what a
+-- generation's report listener heard, and the running Entry clone.
 local JOB = GAME_ROOT_PROPS.JobId
 local function reportOf(seq: number)
-	local map = sortedMaps.TypeTorchReports
-	local item = map and map.data[string.format("%010d/%s", seq, JOB)]
-	return if item then item.value else nil, if item then item.ttl else nil
+	local list = SMOKE.kernel:deployReports()
+	for index = #list, 1, -1 do
+		if list[index].s == seq then
+			return list[index]
+		end
+	end
+	return nil
 end
-local function heartbeatOf()
-	local map = sortedMaps.TypeTorchServers
-	local item = map and map.data[JOB]
-	return if item then item.value else nil, if item then item.ttl else nil
+local function fleet()
+	return SMOKE.kernel:fleetStatus()
+end
+local function heard(name: string, seq: number, result: string): boolean
+	for _, report in SMOKE.heard[name] or {} do
+		if report.s == seq and report.r == result then
+			return true
+		end
+	end
+	return false
 end
 local function reported(seq: number, result: string): boolean
 	local value = reportOf(seq)
@@ -1392,24 +1390,24 @@ if HEALTH_MODE then
 		return said("deploy messages: subscribed after 2 failed attempts")
 	end))
 
-	-- P-O1: reports and the heartbeat, written by the kernel.
+	-- P-O1: deploy reports and the fleet status on the API (the kernel writes nothing).
 	check("P-O1: a booted report for seq 5", waitFor("booted report", function()
 		return reported(5, "booted")
 	end))
-	local booted, bootedTtl = reportOf(5)
+	local booted = reportOf(5)
 	check(
-		"P-O1: report fields {s,b,a,j,r,d,t,g,k,p}, TTL = Constants.REPORTS_TTL (1 day)",
-		booted ~= nil and booted.s == 5 and booted.b == "dev" and booted.a == "ddddddd-444444" and booted.j == JOB and typeof(booted.t) == "number" and booted.g == 1 and booted.k == Constants.KERNEL_VERSION and booted.p == 0 and typeof(booted.d) == "number" and booted.e == nil and bootedTtl == Constants.REPORTS_TTL and Constants.REPORTS_TTL == 24 * 3600
+		"P-O1: report fields {s,b,a,j,r,d,t,g,k,p}",
+		booted ~= nil and booted.s == 5 and booted.b == "dev" and booted.a == "ddddddd-444444" and booted.j == JOB and typeof(booted.t) == "number" and booted.g == 1 and booted.k == Constants.KERNEL_VERSION and booted.p == 0 and typeof(booted.d) == "number" and booted.e == nil
 	)
-	check("P-O1: the kernel writes the heartbeat", waitFor("heartbeat", function()
-		return heartbeatOf() ~= nil
+	check("P-O1: the boot generation's listener got its own boot report (replayed)", waitFor("replay", function()
+		return heard("ddddddd-444444#1", 5, "booted")
 	end))
-	local hb, hbTtl = heartbeatOf()
+	local hb = fleet()
 	check(
-		"P-O1: heartbeat {t,b,c,a,n,m,s,u,p,k,v} plus q, g, h, sv = 2, TTL 150 s",
-		hb ~= nil and hb.t == "reserved" and hb.b == "dev" and hb.c == status().channel and hb.c ~= nil and hb.a == "ddddddd-444444" and hb.n == 0 and hb.m == 10 and typeof(hb.s) == "number" and typeof(hb.u) == "number" and hb.p == 42 and hb.k == "smoke-access-code" and hb.x == nil and hb.v == Constants.KERNEL_VERSION and hb.q == 5 and hb.g == 1 and hb.h == "ok" and hb.sv == 2 and hbTtl == 150
+		"P-O1: fleetStatus {t,b,c,a,n,m,s,u,p,k,v} plus q, g, h, sv = 2",
+		hb ~= nil and hb.t == "reserved" and hb.b == "dev" and hb.c == status().channel and hb.c ~= nil and hb.a == "ddddddd-444444" and hb.n == 0 and hb.m == 10 and typeof(hb.s) == "number" and typeof(hb.u) == "number" and hb.p == 42 and hb.k == "smoke-access-code" and hb.x == nil and hb.v == Constants.KERNEL_VERSION and hb.q == 5 and hb.g == 1 and hb.h == "ok" and hb.sv == 2
 	)
-	check("api: heartbeat() and accessCode() (from the private record)", SMOKE.kernel:heartbeat().enabled == true and SMOKE.kernel:accessCode() == "smoke-access-code")
+	check("api: accessCode() (from the private record)", SMOKE.kernel:accessCode() == "smoke-access-code")
 
 	-- S-M2: the registry never loaded (ConfigService is down here), so revocations are unknown.
 	local stranger = newInstance("Player", "Stranger")
@@ -1433,6 +1431,9 @@ if HEALTH_MODE then
 	check("deploy B swaps and reports swapped", waitFor("B", function()
 		return running() == "bbbbbbb-222222" and status().appliedSeq == 20 and reported(20, "swapped")
 	end))
+	check("P-O1: the new generation hears the replay and the live report; the stopped one was dropped", waitFor("listeners", function()
+		return heard("bbbbbbb-222222#2", 5, "booted") and heard("bbbbbbb-222222#2", 20, "swapped")
+	end) and not heard("ddddddd-444444#1", 20, "swapped"))
 	local generationBefore = status().generation.number
 	check("busy flag: a reload from the generation's own thread finishes on a kernel thread", waitFor("reload", function()
 		return status().generation.number > generationBefore and running() == "bbbbbbb-222222"
@@ -1447,9 +1448,9 @@ if HEALTH_MODE then
 	end, 6))
 	local failed = status().failed
 	check("P-F1: G is marked failed here; report rolled_back; event health_rollback", failed[1] ~= nil and failed[1].assetId == 1007 and reported(21, "rolled_back") and string.find(reportOf(21).e or "", "errors", 1, true) ~= nil and hasEvent("health_rollback", "assetId", 1007))
-	check("P-O1: the heartbeat says degraded after the rollback", waitFor("degraded", function()
-		local entry = heartbeatOf()
-		return entry ~= nil and entry.h == "degraded" and entry.a == "bbbbbbb-222222" and entry.e ~= nil
+	check("P-O1: the fleet status says degraded after the rollback", waitFor("degraded", function()
+		local entry = fleet()
+		return entry.h == "degraded" and entry.a == "bbbbbbb-222222" and entry.e ~= nil
 	end))
 
 	-- Errors from outside the generation never count.
@@ -1491,16 +1492,23 @@ if HEALTH_MODE then
 	task.wait(0.3)
 	check("P-F1: after the window errors are counted, never rolled back", running() == "bbbbbbb-222222" and status().health.errors == 3 and status().health.state == "degraded")
 
-	-- P-O1: a report write that fails is retried; a good deploy brings the heartbeat back to ok.
-	sortedMaps.TypeTorchReports.failWrites = 1
+	-- P-O1: a good deploy brings the fleet status back to ok; a disconnected listener hears nothing more.
 	devDeploy(1004, "ddddddd-444444", 25)
-	check("P-O1: a failed report write is retried", waitFor("D", function()
-		return running() == "ddddddd-444444" and reported(25, "swapped")
-	end) and SMOKE.kernel:heartbeat().reports.failures >= 1)
-	check("P-O1: the heartbeat is ok again after a good deploy", waitFor("ok", function()
-		local hbNow = heartbeatOf()
-		return hbNow ~= nil and hbNow.h == "ok" and hbNow.q == 25 and hbNow.a == "ddddddd-444444"
+	check("P-O1: a good deploy: swapped report, fleet status ok again", waitFor("D", function()
+		local now = fleet()
+		return running() == "ddddddd-444444" and reported(25, "swapped") and now.h == "ok" and now.q == 25 and now.a == "ddddddd-444444"
 	end))
+	local name = status().generation.name
+	waitFor("D listener", function()
+		return heard(name, 25, "swapped")
+	end)
+	local heardBefore = #SMOKE.heard[name]
+	SMOKE.disconnects[name]()
+	devDeploy(1004, "ddddddd-444444", 26) -- already running: a "swapped" report without a swap
+	check("P-O1: a disconnected listener hears nothing more", waitFor("26", function()
+		return reported(26, "swapped")
+	end) and #SMOKE.heard[name] == heardBefore and status().generation.name == name)
+	check("P-O1: the kernel keeps the last 20 reports", #SMOKE.kernel:deployReports() <= 20 and status().reports.total >= 10)
 
 	-- P-K7: client generation reports (kernel channel "*" / __tt/client), checked field by field.
 	local client = newInstance("Player", "Client1")
@@ -1524,12 +1532,12 @@ if HEALTH_MODE then
 		closeCallbacks[1]()
 		closeDone = true
 	end)
-	check("onClose: the generation's handler runs and the heartbeat entry is removed", waitFor("close", function()
+	check("onClose: the generation's handler runs", waitFor("close", function()
 		return closeDone
-	end) and table.find(SMOKE.closed, "ddddddd-444444") ~= nil and heartbeatOf() == nil)
-	devDeploy(1002, "bbbbbbb-222222", 26)
+	end) and table.find(SMOKE.closed, "ddddddd-444444") ~= nil)
+	devDeploy(1002, "bbbbbbb-222222", 27)
 	task.wait(0.4)
-	check("onClose: no swaps after BindToClose", running() == "ddddddd-444444" and heartbeatOf() == nil)
+	check("onClose: no swaps after BindToClose", running() == "ddddddd-444444")
 	finish()
 end
 

@@ -55,19 +55,10 @@ return {
 	-- next call (a Roblox outage must not turn every dev check into a web call).
 	ACCESS_FAILURE_CACHE = 30,
 
-	-- 0.3.2 (audit P-O1): the kernel's heartbeat and deploy reports (contract shared with the CLI; plans/01).
-	-- Heartbeat: MemoryStore SortedMap SERVERS_MAP, key = JobId, written every HEARTBEAT_SECONDS +- HEARTBEAT_JITTER.
-	SERVERS_MAP = "TypeTorchServers",
-	SERVERS_TTL = 150,
-	HEARTBEAT_SECONDS = 60,
-	HEARTBEAT_JITTER = 10,
-	-- An extra heartbeat after a swap (so `typetorch servers` sees it), at most one per this many seconds.
-	HEARTBEAT_MIN_GAP = 10,
-	-- Reports: MemoryStore SortedMap REPORTS_MAP, key = "<seq, 10 digits>/<JobId>", one per deploy outcome per server.
-	REPORTS_MAP = "TypeTorchReports",
-	REPORTS_TTL = 24 * 3600, -- 1 day: reports are read minutes after a deploy; 7 days could fill the experience's MemoryStore quota (shared with the game) at low CCU
-	-- A failed heartbeat or report write is retried after these delays (seconds), then dropped.
-	WRITE_RETRY_DELAYS = { 1, 3, 9 },
+	-- 0.3.2 (audit P-O1): the kernel writes nothing itself. api:fleetStatus() gives this server's heartbeat table and
+	-- api:onDeployReport(fn) one report per deploy outcome (the framework's analytics engine forwards them); the last
+	-- REPORTS_KEPT reports are kept and replayed to each new listener (api:deployReports()).
+	REPORTS_KEPT = 20,
 	-- Old client trees stay this long after a swap so clients can stop their old generation first.
 	CLIENT_TREE_GRACE = 30,
 	-- Random delay before a public server fetches a new deploy, so all servers don't hit LoadAsset at once.
