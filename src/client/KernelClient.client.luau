@@ -56,6 +56,8 @@ local handler = nil
 local devStatus = { dev = false }
 local eventListeners = {}
 local current = nil -- the running client generation (see Generations below)
+local overrideReplies = {} -- 0.3.3: answers to this player's switch requests, by id
+local nextOverrideId = 0
 
 local function systemMessage(text: string)
 	local channels = TextChatService:FindFirstChild("TextChannels")
@@ -84,6 +86,12 @@ local function onClientEvent(artifactId, channel, ...)
 			local info = ...
 			if typeof(info) == "table" and current and current.pendingHandler then
 				task.spawn(current.pendingHandler, info)
+			end
+		elseif channel == Constants.CHANNEL_OVERRIDE then
+			-- 0.3.3: the answer to this player's own switch request (requestOverride below).
+			local reply = ...
+			if typeof(reply) == "table" and typeof(reply.id) == "number" then
+				overrideReplies[reply.id] = reply
 			end
 		elseif channel == Constants.CHANNEL_EVENT then
 			local name = ...
@@ -121,6 +129,30 @@ function transport.sendUnreliable(channel, ...)
 	netU:FireServer(acceptArtifact, channel, ...)
 end
 
+-- 0.3.3 (owner override): asks the server to switch itself in place ({ branch } | { assetId } | { back = true }). The
+-- server decides (the owner or admins only) for THIS player; nothing else can ask in their name. Yields until it
+-- answers (at most 30 s): { ok, error?, generation?, queued? }.
+local function requestOverride(request)
+	if typeof(request) ~= "table" then
+		return { ok = false, error = "bad request" }
+	end
+	nextOverrideId += 1
+	local id = nextOverrideId
+	net:FireServer("*", Constants.CHANNEL_OVERRIDE, {
+		id = id,
+		branch = if typeof(request.branch) == "string" then request.branch else nil,
+		assetId = if typeof(request.assetId) == "number" then request.assetId else nil,
+		back = request.back == true or nil,
+	})
+	local deadline = os.clock() + 30
+	while overrideReplies[id] == nil and os.clock() < deadline do
+		task.wait()
+	end
+	local reply = overrideReplies[id]
+	overrideReplies[id] = nil
+	return reply or { ok = false, error = "no answer from the server" }
+end
+
 ClientApi.init({
 	KERNEL_API = Constants.KERNEL_API,
 	KERNEL_VERSION = Constants.KERNEL_VERSION,
@@ -132,6 +164,7 @@ ClientApi.init({
 	pinned = function()
 		return root:GetAttribute("Pinned") == true
 	end,
+	requestOverride = requestOverride,
 	onKernelEvent = function(fn)
 		table.insert(eventListeners, fn)
 		return function()

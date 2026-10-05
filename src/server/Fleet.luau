@@ -318,14 +318,15 @@ function Fleet.report(report)
 end
 
 -- `fields` = { s?, a?, b?, g? } (the kernel fills them). One alert per code per FLEET_ALERT_GAP seconds
--- (error_spike: FLEET_SPIKE_GAP), so a flood (forged messages, a crash loop) can't flood the API.
-function Fleet.alert(level: string, code: string, message: string, fields)
+-- (error_spike: FLEET_SPIKE_GAP), so a flood (forged messages, a crash loop) can't flood the API. `force` (0.3.3): no gap,
+-- for alerts a person caused on purpose (owner_override; the kernel limits those requests itself).
+function Fleet.alert(level: string, code: string, message: string, fields, force: boolean?)
 	if not accepting() or (level ~= "critical" and level ~= "warning") then
 		return
 	end
 	local now = os.clock()
 	local gap = if code == "error_spike" then Constants.FLEET_SPIKE_GAP else Constants.FLEET_ALERT_GAP
-	if alertAt[code] and now - alertAt[code] < gap then
+	if not force and alertAt[code] and now - alertAt[code] < gap then
 		return
 	end
 	alertAt[code] = now

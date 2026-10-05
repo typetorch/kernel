@@ -7,7 +7,7 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.3.2",
+	KERNEL_VERSION = "0.3.3",
 
 	-- Interim registry (until the backend exists): a DataStore written by the CLI through Open Cloud.
 	DATASTORE = "TypeTorch",
@@ -113,4 +113,8 @@ return {
 	CHANNEL_CLIENT = "__tt/client",
 	-- 0.3.2 (P-K7): a client generation that failed to start is tried once more after this many seconds.
 	CLIENT_RETRY_SECONDS = 2,
+	-- 0.3.3 (owner override): client -> server, tagged "*": { id, branch? | assetId? | back? } asks to switch THIS server in
+	-- place; server -> client: { id, ok, error?, generation? }. One request per player per OVERRIDE_GAP seconds.
+	CHANNEL_OVERRIDE = "__tt/override",
+	OVERRIDE_GAP = 5,
 }

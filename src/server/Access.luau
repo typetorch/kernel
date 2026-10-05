@@ -118,6 +118,23 @@ function Access.check(player: Player): (boolean, string, string?)
 	return false, "none", nil
 end
 
+-- 0.3.3 (owner override): the place may make in-place switches owner-only (the OverrideOwnerOnly attribute, stamped
+-- by kernel deploy from typetorch.json). Default: the owner and admins.
+local overrideOwnerOnly = false
+function Access.setOverrideOwnerOnly(value: boolean)
+	overrideOwnerOnly = value == true
+end
+function Access.overrideOwnerOnly(): boolean
+	return overrideOwnerOnly
+end
+
+-- 0.3.3: whether `player` may switch THIS server in place (an owner override): the owner always (Studio counts as the
+-- owner), admins unless owner-only; the same roles as experiment pins. Revoked users never.
+function Access.mayOverride(player: Player): boolean
+	local dev, _, role = Access.check(player)
+	return dev and (role == "owner" or (role == "admin" and not overrideOwnerOnly))
+end
+
 function Access.isDev(player: Player): boolean
 	local dev = Access.check(player)
 	return dev
