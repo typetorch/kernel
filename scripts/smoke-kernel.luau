@@ -140,7 +140,8 @@ local function signal(noErrorEvent: boolean?)
 	return object
 end
 
-local SIGNALS = { Event = true, OnServerEvent = true, Triggered = true }
+local SIGNALS = { Event = true, OnServerEvent = true, OnClientEvent = true, Triggered = true }
+local firedToServer = {} -- 0.3.2 `--client`: every RemoteEvent:FireServer call ({ remote name, args... })
 
 local function newInstance(className: string, name: string?)
 	local self = setmetatable({}, instanceMeta)
@@ -285,7 +286,24 @@ function Methods.Destroy(self)
 end
 
 function Methods.SetAttribute(self, name, value)
-	internals[self].attributes[name] = value
+	local inner = internals[self]
+	local before = inner.attributes[name]
+	inner.attributes[name] = value
+	local changed = inner.attributeSignals and inner.attributeSignals[name]
+	if changed and before ~= value then
+		changed:Fire()
+	end
+end
+
+function Methods.GetAttributeChangedSignal(self, name)
+	local inner = internals[self]
+	inner.attributeSignals = inner.attributeSignals or {}
+	inner.attributeSignals[name] = inner.attributeSignals[name] or signal()
+	return inner.attributeSignals[name]
+end
+
+function Methods.FireServer(self, ...)
+	table.insert(firedToServer, { internals[self].props.Name, ... })
 end
 
 function Methods.GetAttribute(self, name)
@@ -749,6 +767,9 @@ local VIP_MODE = table.find(process.args, "--vip") ~= nil
 -- 0.3.2: `--health` (a reserved dev server: health window, last known good, reports, heartbeat, busy flag, client
 -- reports, onClose, retries), `--health-prod` (the same rules on a signed public server), `--lkg-boot` (a public
 -- server whose head fails to start at boot: the branch's signed deployment history, never an unsigned entry).
+-- `--client` (0.3.2, P-K7): runs the CLIENT kernel instead: a generation that fails once is retried on a fresh copy
+-- of its tree and reported to the server; one that keeps failing is reported as failed.
+local CLIENT_MODE = table.find(process.args, "--client") ~= nil
 local HEALTH_MODE = table.find(process.args, "--health") ~= nil
 local HEALTH_PROD_MODE = table.find(process.args, "--health-prod") ~= nil
 local LKG_BOOT_MODE = table.find(process.args, "--lkg-boot") ~= nil
@@ -1002,9 +1023,11 @@ local function waitFor(what: string, condition: () -> boolean, timeout: number?)
 end
 
 local kernelErrors = {}
-runScript(kernelFolder.Kernel, function(err)
-	table.insert(kernelErrors, err)
-end)
+if not CLIENT_MODE then
+	runScript(kernelFolder.Kernel, function(err)
+		table.insert(kernelErrors, err)
+	end)
+end
 
 local function status()
 	return SMOKE.kernel:status()
@@ -1066,9 +1089,81 @@ local function finish()
 			end
 		end
 	end
-	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" else "public server"
+	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
+end
+
+if CLIENT_MODE then
+	-- The client half of the place: TypeTorchKernelShared (Constants, ClientApi, ClientEntry), ReplicatedStorage.TypeTorch
+	-- (Generations, Net, NetU), a LocalPlayer with PlayerScripts, and the client kernel script.
+	sourceInstance("ModuleScript", "ClientApi", "src/shared/ClientApi.luau").Parent = shared
+	local clientEntry = sourceInstance("Script", "ClientEntry", "src/shared/ClientEntry.client.luau") -- a LocalScript on Roblox
+	clientEntry.Enabled = false
+	clientEntry.Parent = shared
+	local root = newInstance("Folder", "TypeTorch")
+	root.Parent = services.ReplicatedStorage
+	local generations = newInstance("Folder", "Generations")
+	generations.Parent = root
+	newInstance("RemoteEvent", "Net").Parent = root
+	newInstance("UnreliableRemoteEvent", "NetU").Parent = root
+	local localPlayer = newInstance("Player", "LocalPlayer")
+	newInstance("Folder", "PlayerScripts").Parent = localPlayer
+	services.Players.LocalPlayer = localPlayer
+	services.ReplicatedFirst = newInstance("ReplicatedFirst")
+	-- A client tree whose Client.boot fails `failures` times when required (each copy of the tree requires it anew).
+	local function clientTree(name: string, failures: number)
+		SMOKE.clientFailures = SMOKE.clientFailures or {}
+		SMOKE.clientFailures[name] = failures
+		local tree = newInstance("Folder", name)
+		tree:SetAttribute("ArtifactId", string.split(name, "#")[1])
+		for _, part in { "Shared", "Client", "include" } do
+			local folder = newInstance("Folder", part)
+			folder.Parent = tree
+			if part == "Client" then
+				local boot = newInstance("ModuleScript", "boot")
+				local source = [[
+					if SMOKE.clientFailures["NAME"] > 0 then
+						SMOKE.clientFailures["NAME"] -= 1
+						error("client boot boom")
+					end
+					return { boot = function(kernel) SMOKE.clientKernel = kernel return function() end end }]]
+				internals[boot].sourceText = (string.gsub(source, "NAME", name))
+				boot.Parent = folder
+			end
+		end
+		tree.Parent = generations
+	end
+	clientTree("aaaaaaa-111111#1", 1)
+	clientTree("bbbbbbb-222222#2", 5)
+	local clientScript = sourceInstance("Script", "TypeTorchKernelClient", "src/client/KernelClient.client.luau")
+	clientScript.Parent = services.ReplicatedFirst
+	runScript(clientScript, function(err)
+		table.insert(kernelErrors, err)
+	end)
+	local function lastReport()
+		for index = #firedToServer, 1, -1 do
+			local call = firedToServer[index]
+			if call[1] == "Net" and call[2] == "*" and call[3] == "__tt/client" then
+				return call[4]
+			end
+		end
+		return nil
+	end
+	Constants.CLIENT_RETRY_SECONDS = 0.1
+	task.wait(0.1)
+	root:SetAttribute("ActiveGeneration", "aaaaaaa-111111#1")
+	check("client: a generation that fails once starts on the retry (fresh copy of its tree)", waitFor("client A", function()
+		local report = lastReport()
+		return report ~= nil and report.g == "aaaaaaa-111111#1" and report.ok == true and report.retried == true and typeof(report.ms) == "number"
+	end) and SMOKE.clientKernel ~= nil and localPlayer.PlayerScripts:FindFirstChild("TypeTorchRetry") ~= nil)
+	root:SetAttribute("ActiveGeneration", "bbbbbbb-222222#2")
+	check("client: a generation that keeps failing is reported failed after its one retry", waitFor("client B", function()
+		local report = lastReport()
+		return report ~= nil and report.g == "bbbbbbb-222222#2" and report.ok == false and report.retried == true and string.find(report.e or "", "client boot boom", 1, true) ~= nil
+	end) and SMOKE.clientFailures["bbbbbbb-222222#2"] == 3)
+	check("client: the retry copy of the stopped generation was destroyed", #localPlayer.PlayerScripts.TypeTorchRetry:GetChildren() == 0)
+	finish()
 end
 
 if DEV_MODE then

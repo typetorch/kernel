@@ -142,6 +142,7 @@ local playerScripts = player:WaitForChild("PlayerScripts")
 local lastGeneration = nil -- the last client generation that started, for api.start.previous
 local generationCount = 0
 local switching = false
+local retryFolder = nil -- 0.3.2: fresh copies of client trees for the one retry (client-only)
 
 -- `info` (0.2.2: {reason, branch, next}) goes to the generation's stop function; older frameworks ignore it.
 local function stopCurrent(info)
@@ -158,15 +159,51 @@ local function stopCurrent(info)
 	current.entry.Enabled = false
 	ClientApi.unregister(current.entry)
 	current.entry:Destroy()
+	if current.copy then
+		current.copy:Destroy()
+	end
 	current = nil
 end
 
-local function start(name: string)
+-- 0.3.2 (P-K7): tells the server how this client's generation start went ({g, ok, e?, ms, retried?}, kernel channel
+-- tagged "*"). The server records it per player (status().clients); it is never trusted for anything else.
+local function reportStart(name: string, ok: boolean, err: string?, seconds: number, retried: boolean)
+	pcall(function()
+		net:FireServer("*", Constants.CHANNEL_CLIENT, {
+			g = name,
+			ok = ok,
+			e = if ok then nil else string.sub(tostring(err or "?"), 1, 200),
+			ms = math.floor(seconds * 1000),
+			retried = retried or nil,
+		})
+	end)
+end
+
+-- Starts the client generation `name`. Returns (ok, error). `fresh` (0.3.2, the retry): run a client-side copy of the
+-- tree, since a module that failed to load stays failed in the require cache of the replicated one.
+local function start(name: string, fresh: boolean?): (boolean, string?)
 	local started = os.clock()
 	local tree = generations:WaitForChild(name, 30)
 	if not tree then
 		warn(`[TypeTorch] generation {name} never replicated`)
-		return
+		return false, "never replicated"
+	end
+	local copy = nil
+	if fresh then
+		local cloned, result = pcall(function()
+			return tree:Clone()
+		end)
+		if not cloned or not result then
+			return false, `could not copy the tree: {result}`
+		end
+		if not retryFolder or retryFolder.Parent == nil then
+			retryFolder = Instance.new("Folder")
+			retryFolder.Name = "TypeTorchRetry"
+			retryFolder.Parent = playerScripts
+		end
+		copy = result
+		copy.Parent = retryFolder
+		tree = copy
 	end
 	generationCount += 1
 	local artifactId = tree:GetAttribute("ArtifactId") or name
@@ -190,6 +227,7 @@ local function start(name: string)
 		channel = root:GetAttribute("Channel"),
 		serverType = root:GetAttribute("ServerType"),
 		number = generationCount,
+		copy = copy,
 		readyEvent = Instance.new("BindableEvent"),
 		-- 0.2.2: how this client generation starts. A player's first one is a boot, whatever the server swapped for.
 		start = {
@@ -232,18 +270,25 @@ local function start(name: string)
 	end
 	connection:Disconnect()
 	if result == nil or not result[1] then
-		warn(`[TypeTorch] client generation {name} failed: {if result then result[2] else "timed out"}`)
+		local err = if result then tostring(result[2]) else "timed out"
+		warn(`[TypeTorch] client generation {name} failed{if fresh then " (retry)" else ""}: {err}`)
 		entry.Enabled = false
 		ClientApi.unregister(entry)
 		entry:Destroy()
-		return
+		if copy then
+			copy:Destroy()
+		end
+		return false, err
 	end
 	current = generation
 	lastGeneration = generation
-	print(`[TypeTorch] client running {name} ({math.floor((os.clock() - started) * 1000)} ms)`)
+	print(`[TypeTorch] client running {name}{if fresh then " (retry)" else ""} ({math.floor((os.clock() - started) * 1000)} ms)`)
+	return true, nil
 end
 
--- Coalesces bursts: if the attribute changes mid-switch, the loop runs again for the latest value.
+-- Coalesces bursts: if the attribute changes mid-switch, the loop runs again for the latest value. 0.3.2 (P-K7): a
+-- generation that fails to start is tried once more (CLIENT_RETRY_SECONDS later, on a fresh copy of its tree), and the
+-- outcome is reported to the server.
 local function follow()
 	if switching then
 		return
@@ -264,7 +309,17 @@ local function follow()
 		if wanted == nil then
 			break
 		end
-		start(wanted)
+		local began = os.clock()
+		local ok, err = start(wanted)
+		local retried = false
+		if not ok and root:GetAttribute("ActiveGeneration") == wanted then
+			task.wait(Constants.CLIENT_RETRY_SECONDS or 2)
+			if root:GetAttribute("ActiveGeneration") == wanted and current == nil then
+				retried = true
+				ok, err = start(wanted, true)
+			end
+		end
+		reportStart(wanted, ok, err, os.clock() - began, retried)
 		if current == nil or current.name == root:GetAttribute("ActiveGeneration") then
 			break
 		end
