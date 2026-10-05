@@ -21,6 +21,9 @@
 -- reports, alerts, closing), client generation reports (P-K7), onClose per generation, and every swap game code starts
 -- runs on a kernel thread (busy-flag hazard).
 
+-- 0.3.2 (boot budget): every boot wait and cap counts from here.
+local kernelStartedAt = os.clock()
+
 local HttpService = game:GetService("HttpService")
 local InsertService = game:GetService("InsertService")
 local MessagingService = game:GetService("MessagingService")
@@ -122,6 +125,24 @@ local function callOnKernel(fn, ...)
 		task.wait()
 	end
 	return result
+end
+
+-- 0.3.2 (boot budget): runs fn(...) on its own thread and waits at most `seconds`. Returns (true, results...) when it
+-- finished without an error in time, else false (a slow call keeps running; its result is dropped).
+local function within(seconds: number, fn, ...)
+	local args = table.pack(...)
+	local result = nil
+	task.spawn(function()
+		result = table.pack(pcall(fn, table.unpack(args, 1, args.n)))
+	end)
+	local deadline = os.clock() + seconds
+	while result == nil and os.clock() < deadline do
+		task.wait()
+	end
+	if result == nil or not result[1] then
+		return false
+	end
+	return true, table.unpack(result, 2, result.n)
 end
 
 -- An error line in the output that never counts toward a generation's health: it is raised on a kernel thread.
@@ -403,9 +424,6 @@ end
 -- Refused messages and heads: a warning (at most one per kind per 3 s) and an event (one per kind per 60 s), so a
 -- flood of forged messages can't flood the logs or the DataStore. status().refusals keeps the last 10.
 local refusals = {}
-local refusalWarnAt: { [string]: number } = {}
-local refusalEventAt: { [string]: number } = {}
-local refusalsSuppressed: { [string]: number } = {} -- warnings held back per kind since its last warning
 local rejectedTotal = 0
 local rejectedByKind: { [string]: number } = {}
 
@@ -424,37 +442,43 @@ local function fleetAlert(level: string, code: string, message: string, head)
 	})
 end
 
-local function refuse(kind: string, why: string, detail)
-	rejectedTotal += 1
-	rejectedByKind[kind] = (rejectedByKind[kind] or 0) + 1
-	local entry = { kind = kind, why = why, at = os.time() }
-	for key, value in detail or {} do
-		entry[key] = value
-	end
-	table.insert(refusals, entry)
-	while #refusals > 10 do
-		table.remove(refusals, 1)
-	end
-	local now = os.clock()
-	if not refusalWarnAt[kind] or now - refusalWarnAt[kind] >= 3 then
-		refusalWarnAt[kind] = now
-		local held = refusalsSuppressed[kind] or 0
-		local suppressed = if held > 0 then ` ({held} more not shown)` else ""
-		refusalsSuppressed[kind] = 0
-		warn(`[TypeTorch] refused {kind}: {why}{suppressed} {HttpService:JSONEncode(detail or {})}`)
-	else
-		refusalsSuppressed[kind] = (refusalsSuppressed[kind] or 0) + 1
-	end
-	if kind == "deploy" or kind == "head" or kind == "pin" or kind == "swap" then
-		fleetAlert("warning", `refused_{kind}`, `refused {kind}: {why}`, detail)
-	end
-	if not refusalEventAt[kind] or now - refusalEventAt[kind] >= 60 then
-		refusalEventAt[kind] = now
-		local event = table.clone(entry)
-		event.at = nil
-		event.action = "refused"
-		event.job = game.JobId
-		Registry.logEvent(event)
+local refuse -- (kind, why, detail)
+do -- (scoped: the main chunk is near Luau's 200-local limit)
+	local refusalWarnAt: { [string]: number } = {}
+	local refusalEventAt: { [string]: number } = {}
+	local refusalsSuppressed: { [string]: number } = {} -- warnings held back per kind since its last warning
+	refuse = function(kind: string, why: string, detail)
+		rejectedTotal += 1
+		rejectedByKind[kind] = (rejectedByKind[kind] or 0) + 1
+		local entry = { kind = kind, why = why, at = os.time() }
+		for key, value in detail or {} do
+			entry[key] = value
+		end
+		table.insert(refusals, entry)
+		while #refusals > 10 do
+			table.remove(refusals, 1)
+		end
+		local now = os.clock()
+		if not refusalWarnAt[kind] or now - refusalWarnAt[kind] >= 3 then
+			refusalWarnAt[kind] = now
+			local held = refusalsSuppressed[kind] or 0
+			local suppressed = if held > 0 then ` ({held} more not shown)` else ""
+			refusalsSuppressed[kind] = 0
+			warn(`[TypeTorch] refused {kind}: {why}{suppressed} {HttpService:JSONEncode(detail or {})}`)
+		else
+			refusalsSuppressed[kind] = (refusalsSuppressed[kind] or 0) + 1
+		end
+		if kind == "deploy" or kind == "head" or kind == "pin" or kind == "swap" then
+			fleetAlert("warning", `refused_{kind}`, `refused {kind}: {why}`, detail)
+		end
+		if not refusalEventAt[kind] or now - refusalEventAt[kind] >= 60 then
+			refusalEventAt[kind] = now
+			local event = table.clone(entry)
+			event.at = nil
+			event.action = "refused"
+			event.job = game.JobId
+			Registry.logEvent(event)
+		end
 	end
 end
 
@@ -607,9 +631,34 @@ local function findPayloadRoot(container: Instance): Instance?
 end
 
 -- Loader adapter: InsertService today; AssetService:LoadAssetAsync later (plans/01). Fresh instances every call, so a
--- generation never shares ModuleScripts (or require caches) with another.
-local function loadPayload(assetId: number): Instance
-	local ok, container = pcall(InsertService.LoadAsset, InsertService, assetId)
+-- generation never shares ModuleScripts (or require caches) with another. 0.3.2 (boot budget): with `cap`, a LoadAsset
+-- that takes longer is abandoned (its result is destroyed when it lands) and the error says it may work later
+-- ({ transient = true }).
+local function loadPayload(assetId: number, cap: number?): Instance
+	local ok, container
+	if cap then
+		local state = "waiting"
+		task.spawn(function()
+			local loaded, value = pcall(InsertService.LoadAsset, InsertService, assetId)
+			if state == "abandoned" then
+				if loaded and typeof(value) == "Instance" then
+					value:Destroy()
+				end
+				return
+			end
+			ok, container, state = loaded, value, "done"
+		end)
+		local deadline = os.clock() + cap
+		while state ~= "done" and os.clock() < deadline do
+			task.wait()
+		end
+		if state ~= "done" then
+			state = "abandoned"
+			error({ transient = true, message = `LoadAsset({assetId}) took more than {math.floor(cap * 10 + 0.5) / 10} s at boot` }, 0)
+		end
+	else
+		ok, container = pcall(InsertService.LoadAsset, InsertService, assetId)
+	end
 	if not ok then
 		error(`LoadAsset({assetId}) failed: {container}`)
 	end
@@ -722,7 +771,8 @@ local function mount(payload: Instance, head, policy)
 	return generation
 end
 
-local function startGeneration(generation): (boolean, string?)
+-- Returns (started, error, timedOut). `readyCap` (0.3.2): the boot's shorter ready timeout instead of READY_TIMEOUT.
+local function startGeneration(generation, readyCap: number?): (boolean, string?, boolean?)
 	generation.readyEvent = Instance.new("BindableEvent")
 	local entry = script.Parent.Entry:Clone()
 	entry.Name = generation.name
@@ -745,13 +795,14 @@ local function startGeneration(generation): (boolean, string?)
 	end)
 	entry.Parent = entries
 	entry.Enabled = true
-	local deadline = os.clock() + Constants.READY_TIMEOUT
+	local timeout = readyCap or Constants.READY_TIMEOUT
+	local deadline = os.clock() + timeout
 	while result == nil and os.clock() < deadline do
 		task.wait()
 	end
 	connection:Disconnect()
 	if result == nil then
-		return false, "timed out waiting for ready"
+		return false, `timed out waiting for ready ({math.floor(timeout * 10 + 0.5) / 10} s{if readyCap then ", boot" else ""})`, true
 	end
 	if result[1] then
 		generation.health.readyAt = os.clock() -- 0.3.2: the health window starts now
@@ -1181,6 +1232,17 @@ Fleet.configure({
 -- Swap to a registry head { assetId, artifactId?, seq?, ... }. Returns a report table. `by` is the user id that asked
 -- (dev menu, /tt, game code); `announced` means notifyPending already ran for this swap.
 local restoreLastKnownGood -- (excludeAssetId, why) -> report?, defined below
+
+-- 0.3.2 (boot budget): (load cap, ready cap) for a swap while nothing has run on this server yet and the boot budget
+-- isn't over; nil, nil afterwards (swaps keep READY_TIMEOUT and an uncapped LoadAsset).
+local function bootCaps(): (number?, number?)
+	if lastGeneration ~= nil or os.clock() - kernelStartedAt > Constants.BOOT_BUDGET then
+		return nil, nil
+	end
+	local left = kernelStartedAt + Constants.BOOT_DEADLINE - os.clock()
+	return math.clamp(left, Constants.BOOT_LATE_LOAD, Constants.BOOT_LOAD_TIMEOUT), math.clamp(left, Constants.BOOT_LATE_READY, Constants.BOOT_READY_TIMEOUT)
+end
+
 local swapTo
 swapTo = function(head, reason: string, by: number?, announced: boolean?)
 	if closing then
@@ -1217,7 +1279,9 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 	local ok, err = pcall(function()
 		local loadStarted = os.clock()
 		report.stage = "load"
-		local payload = if isLocal then loadLocalPayload(head) else loadPayload(head.assetId)
+		local loadCap, readyCap = bootCaps()
+		report.bootCaps = if loadCap then { load = loadCap, ready = readyCap } else nil
+		local payload = if isLocal then loadLocalPayload(head) else loadPayload(head.assetId, loadCap)
 		report.loadSeconds = os.clock() - loadStarted
 		report.stage = "mount"
 		-- Signed deploys and heads (and bootstrap heads) on prod servers: Channel exactly "prod"; pins keep their own rule
@@ -1273,7 +1337,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		end
 		generation.clientTree.Parent = clientGenerations
 		startingGeneration = generation -- 0.3.2: errors from its scripts count toward its health from now on
-		local started, startError = startGeneration(generation)
+		local started, startError, timedOut = startGeneration(generation, readyCap)
 		startingGeneration = nil
 		report.swapSeconds = os.clock() - swapStarted
 		if not started then
@@ -1281,8 +1345,14 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 			warn(`[TypeTorch] {generation.name} failed to start: {startError}`)
 			stopGeneration(generation)
 			dropReportListeners(generation)
-			-- 0.3.2 (P-K3): never again automatically on this server; then the last known good (the previous head first).
-			markFailed(head.assetId, generation.artifact.id, head.seq, `start: {startError}`)
+			if timedOut and readyCap then
+				-- 0.3.2 (boot budget): out of boot time, not proven broken: retried in the background with the normal
+				-- timeout (noteFailure) while the next candidate boots.
+				report.transient = true
+			else
+				-- 0.3.2 (P-K3): never again automatically on this server; then the last known good (the previous head).
+				markFailed(head.assetId, generation.artifact.id, head.seq, `start: {startError}`)
+			end
 			if old and not restoring then
 				report.rollbackTo = if failedHere[old.artifact.assetId] then nil else old.artifact.id
 				report.rollbackScheduled = true
@@ -1319,6 +1389,10 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 	busy = false
 	startingGeneration = nil
 	if not ok then
+		if typeof(err) == "table" then
+			report.transient = err.transient == true or nil -- 0.3.2: a boot-capped LoadAsset
+			err = err.message
+		end
 		report.error = tostring(err)
 		warn(`[TypeTorch] swap failed: {err}`)
 		-- 0.3.2: a payload refused at mount (channel, scripts, kernel API, wrong id) fails the same way every time.
@@ -1365,8 +1439,13 @@ end
 
 -- Branch selection and updates --------------------------------------------------------------------------------------
 
+-- 0.3.2 (P-K8): the record couldn't be read (or the owner check was slow) at boot; the sync loop keeps trying.
+local privateReadPending = false
+
 -- The branch a private/reserved server's stored record asks for (and its pin and access code), by the boot rules.
-local function branchFromOverride(override): string
+-- `ownerCap` (0.3.2, boot): the owner dev check (web calls) gets at most this long; slower counts as "not a dev for
+-- now" and the sync loop checks again.
+local function branchFromOverride(override, ownerCap: number?): string
 	local state = Registry.state()
 	if typeof(override.code) == "string" and override.code ~= "" then
 		ownAccessCode = override.code -- 0.3.2: Migrate and newServer store it; fleet status `k`
@@ -1374,22 +1453,42 @@ local function branchFromOverride(override): string
 	-- 0.3: private/<id> is written by game servers, so in-universe code could rewrite it. A player-owned private
 	-- server follows a stored branch other than the default only when its owner is a dev; otherwise game code
 	-- could move a server full of players to a dev branch (which takes unsigned deploys).
-	if serverType() == "private" and override.branch ~= state.defaultBranch and not Access.isDevUserId(game.PrivateServerOwnerId) then
-		refuse("private-branch", `the owner ({game.PrivateServerOwnerId}) is not a dev; this server stays on {state.defaultBranch}`, { branch = override.branch })
-		return state.defaultBranch
+	if serverType() == "private" and override.branch ~= state.defaultBranch then
+		local isDev = false
+		if ownerCap then
+			local finished, result = within(ownerCap, Access.isDevUserId, game.PrivateServerOwnerId)
+			if not finished then
+				privateReadPending = true
+				warn(`[TypeTorch] the owner dev check is slow; this server boots {state.defaultBranch} and checks again`)
+				return state.defaultBranch
+			end
+			isDev = result == true
+		else
+			isDev = Access.isDevUserId(game.PrivateServerOwnerId)
+		end
+		if not isDev then
+			refuse("private-branch", `the owner ({game.PrivateServerOwnerId}) is not a dev; this server stays on {state.defaultBranch}`, { branch = override.branch })
+			return state.defaultBranch
+		end
 	end
 	bootPin = override.pin
 	storedPin = override.pin ~= nil
 	return override.branch
 end
 
--- 0.3.2 (P-K8): the record couldn't be read at boot (after PRIVATE_READ_RETRY_DELAYS); the sync loop keeps trying.
-local privateReadPending = false
+-- 0.3.2 (boot budget): a private/reserved server's record is read from the kernel start, in the background, with its
+-- retries (PRIVATE_READ_RETRY_DELAYS). Boot uses it when it came within BOOT_READS_WAIT; a later answer is applied
+-- with a swap (applyLatePrivate), and a failure leaves it to the sync loop.
+local privateBoot = { done = false, override = nil, err = nil, late = false }
+local applyLatePrivate -- (override), defined with the sync loop below
 
-local function chooseBranch(): string
-	local state = Registry.state()
+local function startPrivateRead()
 	local kind = serverType()
-	if kind == "private" or kind == "reserved" then
+	if kind ~= "private" and kind ~= "reserved" then
+		privateBoot.done = true
+		return
+	end
+	task.spawn(function()
 		local override, readError = Registry.privateOverride(game.PrivateServerId)
 		for _, delay in Constants.PRIVATE_READ_RETRY_DELAYS do
 			if not readError then
@@ -1398,12 +1497,29 @@ local function chooseBranch(): string
 			task.wait(delay)
 			override, readError = Registry.privateOverride(game.PrivateServerId)
 		end
-		if readError then
-			privateReadPending = true
-			warn(`[TypeTorch] this server's stored branch is unreadable ({readError}); booting {state.defaultBranch} and retrying`)
+		privateBoot.override, privateBoot.err, privateBoot.done = override, readError, true
+		if privateBoot.late then
+			if readError then
+				privateReadPending = true
+			elseif override then
+				applyLatePrivate(override)
+			end
 		end
-		if override then
-			return branchFromOverride(override)
+	end)
+end
+
+local function chooseBranch(): string
+	local state = Registry.state()
+	local kind = serverType()
+	if kind == "private" or kind == "reserved" then
+		if not privateBoot.done then
+			privateBoot.late = true
+			warn(`[TypeTorch] this server's stored branch isn't read yet; booting {state.defaultBranch}, the stored one applies when it arrives`)
+		elseif privateBoot.err then
+			privateReadPending = true
+			warn(`[TypeTorch] this server's stored branch is unreadable ({privateBoot.err}); booting {state.defaultBranch} and retrying`)
+		elseif privateBoot.override then
+			return branchFromOverride(privateBoot.override, Constants.BOOT_OWNER_CHECK)
 		end
 	elseif kind == "studio" then
 		local dev = ServerStorage:FindFirstChild("TypeTorchDev")
@@ -1451,7 +1567,8 @@ local function noteFailure(head, reason: string, report)
 	else
 		failing = { seq = head.seq, assetId = head.assetId, attempts = 1, nextAt = 0 }
 	end
-	local delay = if report.stage == "load" then Constants.LOAD_RETRY_DELAYS[failing.attempts] else nil
+	-- A failed LOAD, or (0.3.2) a boot attempt that ran out of boot time, is retried; anything else is final.
+	local delay = if report.stage == "load" or report.transient then Constants.LOAD_RETRY_DELAYS[failing.attempts] else nil
 	if not delay then
 		failing.nextAt = math.huge
 		local what = if report.stage == "load" then `failed to load {failing.attempts} times` else `failed ({report.stage or "swap"})`
@@ -1464,11 +1581,14 @@ local function noteFailure(head, reason: string, report)
 		return
 	end
 	failing.nextAt = os.clock() + delay
-	print(`[TypeTorch] deploy #{head.seq} failed to load (attempt {failing.attempts}); retrying in {delay} s`)
+	print(`[TypeTorch] deploy #{head.seq} {if report.transient then "ran out of boot time" else "failed to load"} (attempt {failing.attempts}); retrying in {delay} s`)
 	local record = failing
+	-- 0.3.2 (boot budget): a head that failed at boot is retried as a deploy: if something else booted meanwhile, the
+	-- retry is a normal swap (normal timeouts) and players get it without waiting.
+	local retryReason = if reason == "boot" then "deploy" else reason
 	task.delay(delay, function()
 		if failing == record and head.seq > appliedSeq then
-			want(head, reason, false)
+			want(head, retryReason, false)
 		end
 	end)
 end
@@ -2581,53 +2701,56 @@ end
 -- window (the signed `t`), and `by` must be the owner or an admin by the registry. The framework's Admin > Servers
 -- publishes unsigned pins (admin.ab, owner/admin only, rate-limited), so those reach dev servers only.
 
-local JOB_ID_PATTERN = "^[%w%-]+$"
+local checkPinMessage -- (data) -> (ok, why?)
+do -- (scoped: the main chunk is near Luau's 200-local limit)
+	local JOB_ID_PATTERN = "^[%w%-]+$"
 
-local function wholeNumber(value, low: number, high: number): boolean
-	return typeof(value) == "number" and value == value and value % 1 == 0 and value >= low and value <= high
-end
+	local function wholeNumber(value, low: number, high: number): boolean
+		return typeof(value) == "number" and value == value and value % 1 == 0 and value >= low and value <= high
+	end
 
--- Returns (ok, why).
-local function checkPinMessage(data): (boolean, string?)
-	if typeof(data.b) ~= "string" or #data.b == 0 or #data.b > 64 or string.find(data.b, "%c") then
-		return false, "bad branch"
-	end
-	if not wholeNumber(data.by, 1, 2 ^ 53) then
-		return false, "bad by"
-	end
-	if typeof(data.t) ~= "number" or math.abs(DateTime.now().UnixTimestampMillis - data.t) > Constants.PIN_MAX_AGE * 1000 then
-		return false, "stale or bad t"
-	end
-	if data.unpin ~= nil and typeof(data.unpin) ~= "boolean" then
-		return false, "bad unpin"
-	end
-	if data.a ~= nil or data.unpin ~= true then
-		if not wholeNumber(data.a, 1, 2 ^ 53) then
-			return false, "bad asset id"
+	-- Returns (ok, why).
+	checkPinMessage = function(data): (boolean, string?)
+		if typeof(data.b) ~= "string" or #data.b == 0 or #data.b > 64 or string.find(data.b, "%c") then
+			return false, "bad branch"
 		end
-	end
-	if data.pct ~= nil and not wholeNumber(data.pct, 1, 100) then
-		return false, "bad pct"
-	end
-	if data.j ~= nil then
-		if typeof(data.j) ~= "table" then
-			return false, "bad j"
+		if not wholeNumber(data.by, 1, 2 ^ 53) then
+			return false, "bad by"
 		end
-		local count = 0
-		for key, jobId in data.j do
-			count += 1
-			if typeof(key) ~= "number" or typeof(jobId) ~= "string" or #jobId == 0 or #jobId > 64 or not string.match(jobId, JOB_ID_PATTERN) then
-				return false, "bad job id"
+		if typeof(data.t) ~= "number" or math.abs(DateTime.now().UnixTimestampMillis - data.t) > Constants.PIN_MAX_AGE * 1000 then
+			return false, "stale or bad t"
+		end
+		if data.unpin ~= nil and typeof(data.unpin) ~= "boolean" then
+			return false, "bad unpin"
+		end
+		if data.a ~= nil or data.unpin ~= true then
+			if not wholeNumber(data.a, 1, 2 ^ 53) then
+				return false, "bad asset id"
 			end
 		end
-		if count == 0 or count ~= #data.j or count > 100 then
-			return false, "bad j"
+		if data.pct ~= nil and not wholeNumber(data.pct, 1, 100) then
+			return false, "bad pct"
 		end
+		if data.j ~= nil then
+			if typeof(data.j) ~= "table" then
+				return false, "bad j"
+			end
+			local count = 0
+			for key, jobId in data.j do
+				count += 1
+				if typeof(key) ~= "number" or typeof(jobId) ~= "string" or #jobId == 0 or #jobId > 64 or not string.match(jobId, JOB_ID_PATTERN) then
+					return false, "bad job id"
+				end
+			end
+			if count == 0 or count ~= #data.j or count > 100 then
+				return false, "bad j"
+			end
+		end
+		if data.j == nil and data.pct == nil then
+			return false, "no target"
+		end
+		return true, nil
 	end
-	if data.j == nil and data.pct == nil then
-		return false, "no target"
-	end
-	return true, nil
 end
 
 local function onPinMessage(message)
@@ -2815,17 +2938,33 @@ Players.PlayerRemoving:Connect(function(player)
 	clientStatus[player] = nil
 end)
 
--- 0.3: the first key asset read runs while the registry loads; a prod server waits for it (bounded) before it checks
--- any signature, because it decides between `sig` (loaded) and `sigF` (not loaded).
+-- 0.3.2 BOOT BUDGET (user requirement; plans/01 "Boot budget"): a new server runs a playable generation within
+-- BOOT_BUDGET (15) seconds of the kernel start in every path, about 1-3 s normally. Every boot read starts now, in
+-- parallel: the key asset, ConfigService, both copies of the heads, the private record and the deployment list. Boot
+-- waits for them at most BOOT_READS_WAIT seconds from the kernel start (a read that already failed isn't waited for);
+-- slow ones land later: a late private record moves the server with a swap, late heads boot a server that runs nothing
+-- (or move it to a newer head). Before 0.3.2 these waits were serial (config 3 s, the private record with 1+2+4 s of
+-- retries, the heads, then the key asset up to 10 s).
 local keysRead = false
 task.spawn(function()
 	Signing.refresh("boot")
 	keysRead = true
 end)
+Registry.start(0) -- ConfigService: connects and retries in the background
+Registry.startBootReads() -- the MemoryStore and DataStore copies of the heads, in parallel
+task.spawn(Registry.refreshDeployments, 0) -- the deployment list (last-known-good candidates)
+startPrivateRead()
 
-local state, err = Registry.start(Constants.CONFIG_BOOT_WAIT)
+do -- (scoped: the main chunk is near Luau's 200-local limit)
+	local readsDeadline = kernelStartedAt + Constants.BOOT_READS_WAIT
+	while os.clock() < readsDeadline and not (Registry.configSettled() and Registry.headsSettled() and privateBoot.done) do
+		task.wait()
+	end
+	local state = Registry.state()
+	Access.setConfig(state, Registry.known())
+end
+local err = if Registry.connected() then nil else Registry.readError() or "ConfigService slow or unavailable (still retrying)"
 registryError = err
-Access.setConfig(state, Registry.known())
 localMode = localPayloadSource() ~= nil -- 0.3.1: Studio only (localPayloadSource checks IsStudio)
 myBranch = chooseBranch()
 
@@ -2857,37 +2996,102 @@ subscribe(Constants.PIN_TOPIC, onPinMessage, "pin messages")
 
 -- 0.3: rekey hints (unsigned, content ignored): re-read the key asset now, rate-limited; a hint inside the window is
 -- read when it opens. A key change makes the server look at its branch head again (it may be verifiable now).
-local hintRetryScheduled = false
-local function onRekey()
-	Signing.noteHint()
-	local read, changed = Signing.refresh("hint")
-	if not read then
-		local due = Signing.hintDue()
-		if due and not hintRetryScheduled then
-			hintRetryScheduled = true
-			task.delay(due + 0.1, function()
-				hintRetryScheduled = false
-				local _, laterChanged = Signing.refresh("hint")
-				if laterChanged then
-					followHead("poll", true)
-				end
-			end)
+do -- (scoped: the main chunk is near Luau's 200-local limit)
+	local hintRetryScheduled = false
+	local function onRekey()
+		Signing.noteHint()
+		local read, changed = Signing.refresh("hint")
+		if not read then
+			local due = Signing.hintDue()
+			if due and not hintRetryScheduled then
+				hintRetryScheduled = true
+				task.delay(due + 0.1, function()
+					hintRetryScheduled = false
+					local _, laterChanged = Signing.refresh("hint")
+					if laterChanged then
+						followHead("poll", true)
+					end
+				end)
+			end
+		elseif changed then
+			followHead("poll", true)
 		end
-	elseif changed then
-		followHead("poll", true)
+	end
+	subscribe(Constants.REKEY_TOPIC, function()
+		task.spawn(onRekey)
+	end, "rekey hints")
+end
+
+-- 0.3.2: the kernel's own fleet API sender (off without TypeTorchFleet) and its watch: a health change sends a heartbeat,
+-- and failed / unverified / degraded (or no trusted head on a signed-only server) an alert.
+Fleet.start()
+task.spawn(function()
+	local lastHealth = "ok" -- a server that boots unhealthy alerts too
+	local lastNoTrusted = false
+	while not closing do
+		task.wait(Constants.FLEET_WATCH_SECONDS)
+		if Fleet.enabled() then
+			local health = healthState()
+			if health ~= lastHealth then
+				Fleet.heartbeat("health")
+				if health ~= "ok" then
+					local detail = if current and current.health.lastError then `: {current.health.lastError}` else ""
+					fleetAlert(if health == "degraded" then "warning" else "critical", `health_{health}`, `health {lastHealth} -> {health}{detail}`, nil)
+				end
+				lastHealth = health
+			end
+			local noTrusted = requiresSignatures(myBranch) and myBranch ~= nil and headFor(myBranch) == nil
+			if noTrusted and not lastNoTrusted then
+				fleetAlert("critical", "no_trusted_head", `branch {myBranch}: no trusted prod head`, nil)
+			end
+			lastNoTrusted = noTrusted
+		end
+	end
+end)
+
+-- 0.3.2: one BindToClose for the server's lifetime: no more swaps, and the running generation's onClose handler
+-- (api:onClose; the framework runs its modules' onStop and its analytics engine's last flush) gets CLOSE_DEADLINE s.
+do -- (scoped: the main chunk is near Luau's 200-local limit)
+	local function onClose()
+		closing = true
+		-- The fleet API hears a clean close (not a lost server), in parallel with the generation's handler.
+		task.spawn(Fleet.closing, 3)
+		local generation = current
+		local handler = generation and generation.closeHandler
+		if handler then
+			local done = false
+			local thread = task.spawn(function()
+				local ok, closeError = pcall(handler)
+				if not ok then
+					warn(`[TypeTorch] {generation.name} onClose threw: {closeError}`)
+				end
+				done = true
+			end)
+			local deadline = os.clock() + Constants.CLOSE_DEADLINE
+			while not done and os.clock() < deadline do
+				task.wait()
+			end
+			if not done then
+				pcall(task.cancel, thread)
+				warn(`[TypeTorch] {generation.name} onClose took more than {Constants.CLOSE_DEADLINE} s`)
+			end
+		end
+	end
+	local bound, bindError = pcall(function()
+		game:BindToClose(onClose)
+	end)
+	if not bound then
+		warn(`[TypeTorch] BindToClose failed: {bindError}`)
 	end
 end
-subscribe(Constants.REKEY_TOPIC, function()
-	task.spawn(onRekey)
-end, "rekey hints")
 
-Registry.refreshStoredHead(myBranch, 0)
-Registry.migrateLegacyHead(myBranch)
-
-if serverType() ~= "studio" then
-	local deadline = os.clock() + Constants.KEYS_BOOT_WAIT
-	while not keysRead and os.clock() < deadline do
-		task.wait(0.05)
+-- 0.3.2 (boot budget): a prod server waits for the key asset at most KEYS_BOOT_WAIT seconds from the kernel start (it
+-- was read in parallel with everything else); after that the fallback key decides, by the strict rule, until the key
+-- asset loads.
+if serverType() ~= "studio" and requiresSignatures(myBranch) then
+	local keysDeadline = kernelStartedAt + Constants.KEYS_BOOT_WAIT
+	while not keysRead and os.clock() < keysDeadline do
+		task.wait()
 	end
 end
 local signedBoot = requiresSignatures(myBranch)
@@ -3021,17 +3225,33 @@ else
 	warn(`[TypeTorch] branch {myBranch} has no artifact yet{if err then ` (registry: {err})` else ""}; waiting for a deploy`)
 end
 
--- 0.3.2 (P-K8): a stored branch that was unreadable at boot is read again by the sync loop and applied late (its pin
--- isn't: the server already runs).
-local function retryPrivateRead()
-	local override, readError = Registry.privateOverride(game.PrivateServerId)
-	if readError then
+-- 0.3.2 (boot budget): heads that were still on their way at the gate. When both copies are in: a server that runs
+-- nothing boots again (a usable head may have come), one that runs something follows the head now instead of at the
+-- next poll. The 0.2.0 per-branch head key is looked at then too (it never holds the boot).
+task.spawn(function()
+	local deadline = os.clock() + 120
+	while not Registry.headsDone() and os.clock() < deadline do
+		task.wait(0.1)
+	end
+	Registry.migrateLegacyHead(myBranch)
+	if closing or localMode then
 		return
 	end
-	privateReadPending = false
-	if not override then
-		return
+	if not current and not busy and not workerRunning then
+		print("[TypeTorch] the stored heads are in: booting again")
+		if requiresSignatures(myBranch) then
+			bootSigned()
+		else
+			followHead("boot", false)
+		end
+	elseif current then
+		followHead("poll", true)
 	end
+end)
+
+-- 0.3.2 (P-K8, boot budget): a stored branch that arrived after the boot gate, or was unreadable then, is applied late
+-- with a swap (its pin isn't: the server already runs). The sync loop retries unreadable ones.
+applyLatePrivate = function(override)
 	local branch = branchFromOverride(override)
 	bootPin = nil
 	if branch ~= myBranch and not localMode then
@@ -3039,6 +3259,17 @@ local function retryPrivateRead()
 		myBranch = branch
 		appliedSeq = -1
 		followHead("branch", false)
+	end
+end
+
+local function retryPrivateRead()
+	local override, readError = Registry.privateOverride(game.PrivateServerId)
+	if readError then
+		return
+	end
+	privateReadPending = false
+	if override then
+		applyLatePrivate(override)
 	end
 end
 
@@ -3052,66 +3283,6 @@ Registry.startSync(Constants.POLL_SECONDS, function()
 	followHead("poll", true)
 end)
 
--- 0.3.2: the kernel's own fleet API sender (off without TypeTorchFleet) and its watch: a health change sends a heartbeat,
--- and failed / unverified / degraded (or no trusted head on a signed-only server) an alert.
-Fleet.start()
-task.spawn(function()
-	local lastHealth = "ok" -- a server that boots unhealthy alerts too
-	local lastNoTrusted = false
-	while not closing do
-		task.wait(Constants.FLEET_WATCH_SECONDS)
-		if Fleet.enabled() then
-			local health = healthState()
-			if health ~= lastHealth then
-				Fleet.heartbeat("health")
-				if health ~= "ok" then
-					local detail = if current and current.health.lastError then `: {current.health.lastError}` else ""
-					fleetAlert(if health == "degraded" then "warning" else "critical", `health_{health}`, `health {lastHealth} -> {health}{detail}`, nil)
-				end
-				lastHealth = health
-			end
-			local noTrusted = requiresSignatures(myBranch) and myBranch ~= nil and headFor(myBranch) == nil
-			if noTrusted and not lastNoTrusted then
-				fleetAlert("critical", "no_trusted_head", `branch {myBranch}: no trusted prod head`, nil)
-			end
-			lastNoTrusted = noTrusted
-		end
-	end
-end)
-
--- 0.3.2: one BindToClose for the server's lifetime: no more swaps, and the running generation's onClose handler
--- (api:onClose; the framework runs its modules' onStop and its analytics engine's last flush) gets CLOSE_DEADLINE s.
-local function onClose()
-	closing = true
-	-- The fleet API hears a clean close (not a lost server), in parallel with the generation's handler.
-	task.spawn(Fleet.closing, 3)
-	local generation = current
-	local handler = generation and generation.closeHandler
-	if handler then
-		local done = false
-		local thread = task.spawn(function()
-			local ok, closeError = pcall(handler)
-			if not ok then
-				warn(`[TypeTorch] {generation.name} onClose threw: {closeError}`)
-			end
-			done = true
-		end)
-		local deadline = os.clock() + Constants.CLOSE_DEADLINE
-		while not done and os.clock() < deadline do
-			task.wait()
-		end
-		if not done then
-			pcall(task.cancel, thread)
-			warn(`[TypeTorch] {generation.name} onClose took more than {Constants.CLOSE_DEADLINE} s`)
-		end
-	end
-end
-local bound, bindError = pcall(function()
-	game:BindToClose(onClose)
-end)
-if not bound then
-	warn(`[TypeTorch] BindToClose failed: {bindError}`)
-end
 
 -- 0.3: the key asset, re-read about every 10 minutes (a rotation without a hint still lands, and shows as a change).
 task.spawn(function()

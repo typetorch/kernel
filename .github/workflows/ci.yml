@@ -33,7 +33,7 @@ jobs:
       - name: Kernel smoke, every mode (server and client)
         run: |
           set -euo pipefail
-          for mode in "" --fallback --dev --vip --bootstrap --bootstrap-only --blind --empty --studio-local --health --health-prod --lkg-boot --client --fleet; do
+          for mode in "" --fallback --dev --vip --bootstrap --bootstrap-only --blind --empty --studio-local --health --health-prod --lkg-boot --client --fleet --boot-budget; do
             echo "::group::smoke-kernel ${mode:-(public server)}"
             lune run scripts/smoke-kernel.luau $mode
             echo "::endgroup::"

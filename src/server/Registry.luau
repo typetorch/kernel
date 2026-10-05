@@ -96,6 +96,7 @@ local keyMissing = false
 -- Until then `revoked` is unknown and Access denies badge devs. A failed read later keeps the last good registry.
 local known = false
 local lastReadError: string? = nil
+local configFirstFailed = false -- 0.3.2 (boot budget): the first GetConfigAsync failed (boot doesn't wait for retries)
 
 -- (ok, value): ok = false when the read itself failed (keep what we have); value = nil when the key is missing.
 local function read(): (boolean, any)
@@ -184,6 +185,7 @@ function Registry.start(bootWait: number?): (any, string?)
 			if ok then
 				break
 			end
+			configFirstFailed = true
 			warn(`[TypeTorch] ConfigService unavailable (attempt {attempt}): {connectError}`)
 			task.wait(delay)
 			delay = math.min(delay * 2, 30)
@@ -198,6 +200,17 @@ function Registry.start(bootWait: number?): (any, string?)
 		return state, if finished then "ConfigService unavailable" else "ConfigService slow (still retrying)"
 	end
 	return state, nil
+end
+
+-- 0.3.2 (boot budget): whether boot may stop waiting for ConfigService: a snapshot came, the first attempt already
+-- failed (a place without configs answers at once; the retries go on in the background), or a Studio override.
+function Registry.configSettled(): boolean
+	return snapshot ~= nil or configFirstFailed or Registry.studioOverride() ~= nil
+end
+
+-- A ConfigService snapshot (or the Studio override) is there.
+function Registry.connected(): boolean
+	return snapshot ~= nil or Registry.studioOverride() ~= nil
 end
 
 -- 0.3.2 (S-M2): a registry read has succeeded at least once, so `revoked` (and `members`) are known.
@@ -422,6 +435,46 @@ function Registry.refreshHeads(maxAge: number?)
 	end
 end
 
+-- 0.3.2 (boot budget): at boot both copies are read at once, in parallel, and kept as they came (the boot fail-safe
+-- looks at each copy's own head of the branch). Boot waits until `headsSettled()` (MemoryStore answered with nothing
+-- that needs the durable copy, or the DataStore copy answered), at most BOOT_READS_WAIT; slow reads keep going and merge
+-- when they land. Later refreshes (the sync loop) skip while these are recent.
+local bootMemory = { done = false, ok = false, value = nil }
+local bootDurable = { done = false, ok = false, value = nil }
+function Registry.startBootReads()
+	headsReadAt = os.clock()
+	task.spawn(function()
+		local ok, value = pcall(function()
+			return getMemory():GetAsync(HEADS_KEY)
+		end)
+		bootMemory.ok, bootMemory.value, bootMemory.done = ok and typeof(value) == "table", value, true
+		if bootMemory.ok then
+			mergeHeads(storedHeads, value)
+		end
+	end)
+	task.spawn(function()
+		local ok, value = pcall(function()
+			return getStore():GetAsync(HEADS_KEY)
+		end)
+		bootDurable.ok, bootDurable.value, bootDurable.done = ok and typeof(value) == "table", value, true
+		if bootDurable.ok then
+			mergeHeads(storedHeads, value)
+		end
+	end)
+end
+
+function Registry.headsSettled(): boolean
+	if bootDurable.done then
+		return true
+	end
+	return bootMemory.done and bootMemory.ok and not needsDurable(bootMemory.value)
+end
+
+-- Both boot reads are over (whatever they found).
+function Registry.headsDone(): boolean
+	return bootMemory.done and bootDurable.done
+end
+
 -- Kernel 0.2.0 stored one key per branch; read this branch's old key once (boot only). 0.3.2: it goes through saveHead,
 -- so the migrated head also lands in the shared `heads` copies (winner-only, and never over a newer or trusted head).
 function Registry.migrateLegacyHead(branch: string)
@@ -536,9 +589,9 @@ function Registry.branchHead(name: string, accept: ((any) -> boolean)?)
 	return fromConfig or fromStore
 end
 
--- 0.3 boot fail-safe: every head this server can find for `branch` (ConfigService, the cached copy, and fresh reads of
--- the MemoryStore and DataStore copies), distinct by asset and seq, newest seq first. Yields. Untrusted: the kernel
--- checks each one.
+-- 0.3 boot fail-safe: every head this server can find for `branch` (ConfigService, the cached copy, and what the boot
+-- reads of the MemoryStore and DataStore copies brought), distinct by asset and seq, newest seq first. 0.3.2: no yield.
+-- Untrusted: the kernel checks each one.
 function Registry.bootCandidates(branch: string): { any }
 	local list, seen = {}, {}
 	local function add(head)
@@ -552,17 +605,12 @@ function Registry.bootCandidates(branch: string): { any }
 	end
 	add(Registry.state().branches[branch])
 	add(storedHeads[branch])
-	local memoryOk, memory = pcall(function()
-		return getMemory():GetAsync(HEADS_KEY)
-	end)
-	if memoryOk and typeof(memory) == "table" then
-		add(memory[branch])
+	-- 0.3.2 (boot budget): the copies the boot reads brought (no new read here, so a slow store can't hold the boot).
+	if bootMemory.ok then
+		add(bootMemory.value[branch])
 	end
-	local durableOk, durable = pcall(function()
-		return getStore():GetAsync(HEADS_KEY)
-	end)
-	if durableOk and typeof(durable) == "table" then
-		add(durable[branch])
+	if bootDurable.ok then
+		add(bootDurable.value[branch])
 	end
 	table.sort(list, function(a, b)
 		local seqA, seqB = if typeof(a.seq) == "number" then a.seq else -1, if typeof(b.seq) == "number" then b.seq else -1
@@ -721,13 +769,17 @@ local function storedList(value): { any }
 end
 
 -- Re-reads the stored list (yields; at most once per `maxAge` seconds, default 30).
+local deploymentsReading = false
 function Registry.refreshDeployments(maxAge: number?)
-	if os.clock() - deploymentsReadAt < (maxAge or 30) then
+	-- 0.3.2 (boot budget): a read in flight (the boot prefetch) isn't waited for: callers use what is cached.
+	if deploymentsReading or os.clock() - deploymentsReadAt < (maxAge or 30) then
 		return
 	end
+	deploymentsReading = true
 	local ok, value = pcall(function()
 		return getStore():GetAsync("deployments")
 	end)
+	deploymentsReading = false
 	if ok then
 		deploymentsReadAt = os.clock()
 		-- 0.3.2: merged with what this server heard itself (only the head's winner writes the durable list, and a

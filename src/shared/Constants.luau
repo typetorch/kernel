@@ -21,11 +21,26 @@ return {
 	REKEY_TOPIC = "TypeTorch/rekey",
 	-- 0.3: the key asset is re-read about this often anyway.
 	KEYS_REFRESH_SECONDS = 600,
-	-- 0.3: at boot, a prod server waits at most this long for the first key asset read before it checks signatures
-	-- (after that, the fallback key decides until the key asset loads).
-	KEYS_BOOT_WAIT = 10,
-	-- 0.3 (P-K5): boot waits at most this long for ConfigService; it keeps retrying in the background.
-	CONFIG_BOOT_WAIT = 3,
+	-- 0.3.2 BOOT BUDGET (user requirement): a new server runs a playable generation within BOOT_BUDGET seconds of the
+	-- kernel starting, in every path (plans/01 "Boot budget"). The boot reads (key asset, ConfigService, both copies of
+	-- the heads, the private record, the deployment list) all start at once; boot waits for them at most BOOT_READS_WAIT
+	-- seconds from the kernel start (a read that already failed isn't waited for; slow ones land later).
+	BOOT_BUDGET = 15,
+	BOOT_READS_WAIT = 3,
+	-- A prod server waits at most this long (from the kernel start) for the key asset before it checks signatures;
+	-- after that the fallback key decides until the key asset loads (the strict rule, unchanged). 0.3.0: 10.
+	KEYS_BOOT_WAIT = 3,
+	-- A player-owned private server's owner dev check (web calls) at boot; slower: the default branch, then re-checked.
+	BOOT_OWNER_CHECK = 2,
+	-- Boot attempts (while nothing has run yet, within BOOT_BUDGET): LoadAsset at most BOOT_LOAD_TIMEOUT and ready() at
+	-- most BOOT_READY_TIMEOUT seconds, both cut to the time left before BOOT_DEADLINE, but never below BOOT_LATE_LOAD /
+	-- BOOT_LATE_READY. A head that ran out of time is retried in the background (normal timeouts) and swapped to when it
+	-- works; the next candidate boots meanwhile.
+	BOOT_DEADLINE = 12,
+	BOOT_LOAD_TIMEOUT = 4,
+	BOOT_READY_TIMEOUT = 6,
+	BOOT_LATE_LOAD = 2,
+	BOOT_LATE_READY = 3,
 	-- 0.3 (P-K4): a generation's stop function gets this many seconds, then the hard stop runs anyway.
 	STOP_DEADLINE = 5,
 	-- 0.3 (P-K2): a deploy whose payload failed to LOAD is retried after these delays (seconds), then reported.
@@ -34,7 +49,7 @@ return {
 	-- Deployment history entries kept in the in-game DataStore key "deployments" (dev menu artifact picker).
 	DEPLOYMENTS_KEPT = 100,
 
-	-- A generation must call ready() within this long or the kernel rolls back.
+	-- A generation must call ready() within this long or the kernel rolls back (swaps; boot: BOOT_READY_TIMEOUT).
 	READY_TIMEOUT = 20,
 	-- 0.3.2 (audit P-F1): the health window. A generation whose onStart failed (reported by the framework), or whose
 	-- own scripts raised HEALTH_ERRORS errors, within HEALTH_WINDOW seconds of ready is rolled back to the last known
@@ -48,8 +63,8 @@ return {
 	-- 0.3.2 (audit P-K8): MessagingService subscriptions that fail are retried after these delays (seconds), then
 	-- every last delay for as long as the server runs.
 	SUBSCRIBE_RETRY_DELAYS = { 5, 15, 30, 60 },
-	-- 0.3.2 (audit P-K8): a private/reserved server's stored branch is read at boot with these retry delays; after
-	-- that the sync loop keeps trying and applies the branch late.
+	-- 0.3.2 (audit P-K8): a private/reserved server's stored branch is read at boot with these retry delays (in the
+	-- background: boot waits BOOT_READS_WAIT at most, then a late answer is applied with a swap).
 	PRIVATE_READ_RETRY_DELAYS = { 1, 2, 4 },
 	-- 0.3.2 (audit P-K9): a failed badge, group rank or group list web call counts as "no" for this long before the
 	-- next call (a Roblox outage must not turn every dev check into a web call).

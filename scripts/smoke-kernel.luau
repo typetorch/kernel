@@ -36,6 +36,30 @@ end
 local output = {} -- everything the kernel printed or warned
 local VERBOSE = table.find(process.args, "--verbose") ~= nil
 
+-- 0.3.2 boot budget: `--boot-scenario <name>` runs one boot with simulated latencies, and time runs 1/SCALE times
+-- faster (the kernel's timing constants and every simulated delay are scaled the same way), so 15 simulated seconds
+-- take 7.5 s. Faster distorts: every wait on this machine takes at least ~15 ms of real time. LATENCY[op] = simulated seconds, or { hang = true } (never answers), or { fail = true, after = s }.
+local BOOT_SCENARIO = (function()
+	local index = table.find(process.args, "--boot-scenario")
+	return if index then process.args[index + 1] else nil
+end)()
+local SCALE = if BOOT_SCENARIO then 0.5 else 1
+local LATENCY = {}
+local function simWait(op: string)
+	local value = LATENCY[op]
+	if value == nil then
+		return
+	end
+	if type(value) == "number" then
+		task.wait(value * SCALE)
+	elseif value.hang then
+		task.wait(1e6)
+	elseif value.fail then
+		task.wait((value.after or 0) * SCALE)
+		error(`{op} failed (smoke)`)
+	end
+end
+
 -- Thread ownership (0.3.2), as on Roblox: a thread belongs to the script whose thread started it (task.spawn/defer/
 -- delay inherit it; a signal handler belongs to the script that connected it), and disabling a Script kills its
 -- threads. The kernel's hard stop (Entry.Enabled = false) relies on this, and the busy-flag hazard is a swap running on
@@ -522,6 +546,7 @@ local function keyValueStore()
 	local data = {}
 	local store = { data = data, failGets = {} } -- failGets[key] = n: the next n reads of key throw
 	function store:GetAsync(key)
+		simWait(if self.latencyName == "memory" then "memoryGet" elseif string.sub(tostring(key), 1, 8) == "private/" then "privateGet" else "datastoreGet")
 		if (self.failGets[key] or 0) > 0 then
 			self.failGets[key] -= 1
 			error("DataStore request failed (smoke)")
@@ -543,6 +568,7 @@ end
 
 local dataStore = keyValueStore()
 local memoryStore = keyValueStore()
+memoryStore.latencyName = "memory"
 -- 0.3.2: the kernel never uses a MemoryStore sorted map (fleet status and deploy reports are API only); finish()
 -- checks that nothing asked for one.
 local sortedMapRequests = {}
@@ -630,6 +656,7 @@ local services = {
 	ScriptContext = { Error = signal(true) },
 	ConfigService = {
 		GetConfigAsync = function()
+			simWait("config")
 			if not table.find(process.args, "--fleet") then
 				error("ConfigService unavailable (smoke)")
 			end
@@ -660,11 +687,13 @@ local services = {
 	},
 	BadgeService = {
 		UserHasBadgeAsync = function()
+			simWait("badge")
 			return false
 		end,
 	},
 	GroupService = {
 		GetGroupsAsync = function()
+			simWait("groups")
 			return {}
 		end,
 	},
@@ -673,6 +702,15 @@ local services = {
 		LoadAsset = function(_, id)
 			local asset = assets[id] or error(`smoke: asset {id} not found`)
 			asset.loads = (asset.loads or 0) + 1
+			if id == 500 then
+				simWait("keyLoad")
+			else
+				simWait("payloadLoad")
+				if (asset.hangLoads or 0) > 0 then
+					asset.hangLoads -= 1
+					task.wait(1e6)
+				end
+			end
 			if asset.failLoads > 0 then
 				asset.failLoads -= 1
 				error("HTTP 500 (smoke)")
@@ -682,6 +720,9 @@ local services = {
 			return container
 		end,
 		GetLatestAssetVersionAsync = function(_, id)
+			if id == 500 then
+				simWait("keyVersion")
+			end
 			local asset = assets[id] or error(`smoke: asset {id} not found`)
 			return asset.version
 		end,
@@ -838,6 +879,9 @@ return {
 			kernel:onClose(function()
 				table.insert(SMOKE.closed, kernel.artifact.id)
 			end)
+		end
+		if SMOKE.startDelay then
+			SMOKE.task.wait(SMOKE.startDelay) -- 0.3.2 boot scenarios: the time a generation takes to start
 		end
 		local behave = SMOKE.behave[kernel.artifact.id]
 		if behave and behave(kernel) == "fail" then
@@ -1017,6 +1061,107 @@ SMOKE.behave["iiiiiii-999999"] = function()
 	return "fail"
 end
 
+-- 0.3.2 boot budget scenarios ------------------------------------------------------------------------------------------
+-- Each: `setup` (fixtures and latencies), `first` = the artifact expected first, `final` = the artifact expected once
+-- background retries and late reads settle (optional), `within` = a tighter bound than the 15 s budget (optional).
+-- A public prod server unless the setup says otherwise. Normal latencies (simulated seconds): key asset 0.3 + 0.5,
+-- ConfigService 0.5, MemoryStore 0.15, DataStore 0.4 (private record too), LoadAsset 0.6, generation start 0.3.
+local NORMAL = { keyVersion = 0.3, keyLoad = 0.5, config = 0.5, memoryGet = 0.15, datastoreGet = 0.4, privateGet = 0.4, payloadLoad = 0.6, groups = 0.3, badge = 0.3 }
+local HANG = { hang = true }
+local function signedStoredHead(name: string)
+	local fields = FIELDS[name]
+	return { assetId = fields.a, artifactId = fields.i, seq = fields.s, commit = fields.c, channel = fields.ch, t = fields.t, sig = SIGS[name].sig, sigF = SIGS[name].sigF, deployedAt = "2026-10-04T00:00:00Z" }
+end
+local function signedEntry(name: string)
+	local head = signedStoredHead(name)
+	head.branch = FIELDS[name].b
+	head.at = head.deployedAt
+	head.deployedAt = nil
+	return head
+end
+local function reservedDev()
+	GAME_ROOT_PROPS.PrivateServerId = "ps-boot"
+	GAME_ROOT_PROPS.PrivateServerOwnerId = 0
+	dataStore.data["private/ps-boot"] = { branch = "dev", setBy = 1, setAt = "2026-10-04T00:00:00Z" }
+end
+local BOOT_SCENARIOS = {
+	{ name = "normal", first = "bbbbbbb-222222", within = 3 },
+	{ name = "keys-slow", first = "bbbbbbb-222222", setup = function() LATENCY.keyVersion = HANG end },
+	{ name = "keys-fail", first = "bbbbbbb-222222", within = 3, setup = function() LATENCY.keyVersion = { fail = true, after = 0.2 }; assets[500].failLoads = math.huge end },
+	{ name = "config-slow", first = "bbbbbbb-222222", setup = function() LATENCY.config = HANG end },
+	{ name = "config-fail", first = "bbbbbbb-222222", within = 3, setup = function() LATENCY.config = { fail = true, after = 0.3 } end },
+	{ name = "memory-slow", first = "aaaaaaa-111111", setup = function() LATENCY.memoryGet = HANG end },
+	{ name = "stores-slow", first = "aaaaaaa-111111", final = "bbbbbbb-222222", setup = function()
+		LATENCY.memoryGet, LATENCY.datastoreGet = 8, 8
+		kernelFolder:SetAttribute("BootstrapHeads", '{"prod":{"a":1001,"s":10,"i":"aaaaaaa-111111"}}')
+	end },
+	{ name = "stores-slow-nobootstrap", first = "bbbbbbb-222222", setup = function() LATENCY.memoryGet, LATENCY.datastoreGet = 8, 8 end },
+	{ name = "stores-fail", first = "aaaaaaa-111111", within = 5, setup = function()
+		LATENCY.memoryGet, LATENCY.datastoreGet = { fail = true, after = 1 }, { fail = true, after = 1 }
+		kernelFolder:SetAttribute("BootstrapHeads", '{"prod":{"a":1001,"s":10,"i":"aaaaaaa-111111"}}')
+	end },
+	{ name = "head-load-fails", first = "aaaaaaa-111111", final = "bbbbbbb-222222", setup = function() assets[1002].failLoads = 1 end },
+	{ name = "head-load-hangs", first = "aaaaaaa-111111", final = "bbbbbbb-222222", setup = function() assets[1002].hangLoads = 1 end },
+	{ name = "head-mount-refused", first = "aaaaaaa-111111", setup = function() assets[1002].build = payload("bbbbbbb-222222", "prod", true) end },
+	{ name = "head-start-fails", first = "aaaaaaa-111111", setup = function() SMOKE.behave["bbbbbbb-222222"] = function() return "fail" end end },
+	{ name = "head-never-ready", first = "aaaaaaa-111111", setup = function() SMOKE.behave["bbbbbbb-222222"] = function() SMOKE.task.wait(1e6) end end },
+	{ name = "two-broken-then-good", first = "bbbbbbb-222222", setup = function()
+		memoryStore.data.heads.prod = signedStoredHead("Q5")
+		dataStore.data.deployments = { list = { signedEntry("Q5"), signedEntry("Q1"), signedEntry("M2"), signedEntry("H1") } }
+		SMOKE.behave["ddddddd-444444"] = function() SMOKE.task.wait(1e6) end -- D never calls ready
+		assets[1007].hangLoads = 1 -- G's LoadAsset never answers
+	end },
+	{ name = "bootstrap-only", first = "aaaaaaa-111111", within = 3, setup = function()
+		memoryStore.data.heads, dataStore.data.heads, dataStore.data.deployments = {}, {}, nil
+		kernelFolder:SetAttribute("BootstrapHeads", '{"prod":{"a":1001,"s":10,"i":"aaaaaaa-111111"}}')
+	end },
+	{ name = "blind-fail-safe", first = "aaaaaaa-111111", within = 3, setup = function()
+		memoryStore.data.heads = { prod = { assetId = 1001, artifactId = "aaaaaaa-111111", seq = 10, commit = "aaaaaaa", channel = "prod", deployedAt = "2026-10-04T00:00:00Z" } }
+		dataStore.data.heads, dataStore.data.deployments = {}, nil
+	end },
+	{ name = "private-record-slow", first = "bbbbbbb-222222", final = "ddddddd-444444", setup = function()
+		reservedDev()
+		LATENCY.privateGet = 8
+	end },
+	{ name = "owner-check-slow", first = "bbbbbbb-222222", setup = function()
+		GAME_ROOT_PROPS.PrivateServerId = "ps-boot"
+		GAME_ROOT_PROPS.PrivateServerOwnerId = 777
+		GAME_ROOT_PROPS.CreatorType = Enum.CreatorType.Group
+		dataStore.data["private/ps-boot"] = { branch = "dev", setBy = 777, setAt = "2026-10-04T00:00:00Z" }
+		LATENCY.groups = HANG
+	end },
+	{ name = "dev-head-load-fails", first = "bbbbbbb-222222", final = "ddddddd-444444", setup = function()
+		reservedDev()
+		assets[1004].failLoads = 1
+		local entry = { seq = 4, branch = "dev", channel = "dev", artifactId = "bbbbbbb-222222", assetId = 1002, commit = "bbbbbbb", at = "2026-10-03T00:00:00Z" }
+		dataStore.data.deployments = { list = { entry } }
+	end },
+	{ name = "studio-local", first = "local", within = 1 },
+}
+local scenario = nil
+if BOOT_SCENARIO then
+	for _, candidate in BOOT_SCENARIOS do
+		if candidate.name == BOOT_SCENARIO then
+			scenario = candidate
+		end
+	end
+	assert(scenario, `unknown boot scenario {BOOT_SCENARIO}`)
+	-- The base: signed B (seq 11) in MemoryStore, signed A (seq 10) in the DataStore and both in the deployment list.
+	memoryStore.data.heads = { prod = signedStoredHead("M2"), dev = { assetId = 1004, artifactId = "ddddddd-444444", seq = 5, commit = "ddddddd", channel = "dev", t = 1759580000000, deployedAt = "2026-10-04T00:00:00Z" } }
+	dataStore.data.heads = { prod = signedStoredHead("H1") }
+	dataStore.data.deployments = { list = { signedEntry("M2"), signedEntry("H1") } }
+	if scenario.name ~= "studio-local" then
+		devFolder.Parent = nil -- no local payload outside the Studio scenario
+	end
+	for op, value in NORMAL do
+		LATENCY[op] = value
+	end
+	SMOKE.startDelay = 0.3 * SCALE
+	if scenario.setup then
+		scenario.setup()
+	end
+end
+
 -- Boot ---------------------------------------------------------------------------------------------------------------
 
 local Constants = requireInstance(shared.Constants)
@@ -1027,6 +1172,19 @@ Constants.STOP_DEADLINE = 0.3
 Constants.SUBSCRIBE_RETRY_DELAYS = { 0.05 }
 Constants.PRIVATE_READ_RETRY_DELAYS = { 0.05, 0.05, 0.05 }
 Constants.CLOSE_DEADLINE = 1
+if BOOT_SCENARIO then
+	-- Real kernel timing, SCALE times faster (and the same constants an older kernel had, for before/after runs).
+	for _, name in { "BOOT_BUDGET", "BOOT_READS_WAIT", "KEYS_BOOT_WAIT", "CONFIG_BOOT_WAIT", "BOOT_OWNER_CHECK", "BOOT_DEADLINE", "BOOT_LOAD_TIMEOUT", "BOOT_READY_TIMEOUT", "BOOT_LATE_LOAD", "BOOT_LATE_READY", "READY_TIMEOUT", "POLL_SECONDS", "STOP_DEADLINE", "PUBLIC_JITTER_SECONDS" } do
+		if type(Constants[name]) == "number" then
+			Constants[name] *= SCALE
+		end
+	end
+	Constants.CONFIG_BOOT_WAIT = 3 * SCALE
+	Constants.KEYS_BOOT_WAIT = (if Constants.BOOT_BUDGET then 3 else 10) * SCALE
+	Constants.LOAD_RETRY_DELAYS = { 5 * SCALE, 15 * SCALE, 60 * SCALE }
+	Constants.PRIVATE_READ_RETRY_DELAYS = { 1 * SCALE, 2 * SCALE, 4 * SCALE }
+	Constants.POLL_SECONDS = 60 * SCALE
+end
 if FLEET_MODE then
 	Constants.FLEET_HEARTBEAT_SECONDS = 0.5
 	Constants.FLEET_PLAYERS_GAP = 0.2
@@ -1062,6 +1220,33 @@ local function waitFor(what: string, condition: () -> boolean, timeout: number?)
 	return false
 end
 
+if table.find(process.args, "--boot-budget") then
+	-- One process per scenario (each is a fresh server); the table says when the first generation ran.
+	print("boot budget (simulated seconds from the kernel start to a running generation; budget 15 s)")
+	print(string.format("%-26s %8s  %-16s %s", "path", "first", "artifact", "then"))
+	local bad = 0
+	for _, entry in BOOT_SCENARIOS do
+		local args = { "run", "scripts/smoke-kernel.luau", "--boot-scenario", entry.name }
+		if entry.name == "studio-local" then
+			table.insert(args, "--studio-local")
+		end
+		local result = process.exec("lune", args)
+		local line = string.match(result.stdout, "BOOT [^\n]+")
+		local first, artifact, final = nil, nil, nil
+		if line then
+			first, artifact, final = string.match(line, "first=(%S+) artifact=(%S+) final=(%S+)")
+		end
+		print(string.format("%-26s %8s  %-16s %s%s", entry.name, first or "?", artifact or "?", final or "?", if result.ok then "" else "   FAIL"))
+		if not result.ok then
+			bad += 1
+			print(result.stdout)
+		end
+	end
+	print(`{#BOOT_SCENARIOS - bad} passed, {bad} failed (--boot-budget)`)
+	process.exit(if bad == 0 then 0 else 1)
+end
+
+local kernelStartClock = os.clock()
 local kernelErrors = {}
 if not CLIENT_MODE then
 	runScript(kernelFolder.Kernel, function(err)
@@ -1121,7 +1306,7 @@ local function finish()
 	end
 	check("the fleet token never appears in any output", not leaked)
 	for _, line in output do
-		if line.kind == "warn" and string.find(line.text, "swap failed", 1, true) and not string.find(line.text, "eeeeeee", 1, true) and not string.find(line.text, "1006", 1, true) and not string.find(line.text, "ccccccc", 1, true) and not string.find(line.text, "Sneaky", 1, true) then
+		if not BOOT_SCENARIO and line.kind == "warn" and string.find(line.text, "swap failed", 1, true) and not string.find(line.text, "eeeeeee", 1, true) and not string.find(line.text, "1006", 1, true) and not string.find(line.text, "ccccccc", 1, true) and not string.find(line.text, "Sneaky", 1, true) then
 			check(`unexpected: {line.text}`, false)
 		end
 	end
@@ -1138,9 +1323,43 @@ local function finish()
 			end
 		end
 	end
-	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" else "public server"
+	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
+end
+
+if scenario then
+	-- The first running generation, then (with `final`) what it settles on.
+	local firstAt, firstArtifact = nil, nil
+	local limit = os.clock() + 60 * SCALE
+	while os.clock() < limit do
+		local ok, generation = pcall(function()
+			return SMOKE.kernel:status().generation
+		end)
+		if ok and generation then
+			firstAt, firstArtifact = (os.clock() - kernelStartClock) / SCALE, generation.artifact.id
+			break
+		end
+		task.wait(0.002)
+	end
+	local finalArtifact = firstArtifact
+	if scenario.final and firstArtifact then
+		local settle = os.clock() + 30 * SCALE
+		while os.clock() < settle and running() ~= scenario.final do
+			task.wait(0.01)
+		end
+		finalArtifact = running()
+	end
+	local shown = if firstAt then string.format("%.1f", firstAt) else ">60"
+	print(`BOOT {scenario.name} first={shown} artifact={firstArtifact or "-"} final={finalArtifact or "-"}`)
+	local expected = if scenario.first == "local" then firstArtifact ~= nil and string.sub(firstArtifact, 1, 6) == "local-" else firstArtifact == scenario.first
+	check(`{scenario.name}: a generation runs within 15 s (simulated)`, firstAt ~= nil and firstAt <= 15)
+	check(`{scenario.name}: within {scenario.within or 15} s`, firstAt ~= nil and firstAt <= (scenario.within or 15))
+	check(`{scenario.name}: first {scenario.first}`, expected)
+	if scenario.final then
+		check(`{scenario.name}: then {scenario.final}`, finalArtifact == scenario.final)
+	end
+	finish()
 end
 
 if CLIENT_MODE then
