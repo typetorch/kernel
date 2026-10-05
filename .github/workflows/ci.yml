@@ -30,10 +30,10 @@ jobs:
         run: lune run scripts/check.luau
       - name: Ed25519 verifier and Signing specs (RFC 8032 vectors, plans/03 vectors)
         run: lune run scripts/test-ed25519.luau
-      - name: Kernel smoke, every server mode
+      - name: Kernel smoke, every mode (server and client)
         run: |
           set -euo pipefail
-          for mode in "" --fallback --dev --vip --bootstrap --bootstrap-only --blind --empty --studio-local; do
+          for mode in "" --fallback --dev --vip --bootstrap --bootstrap-only --blind --empty --studio-local --health --health-prod --lkg-boot --client; do
             echo "::group::smoke-kernel ${mode:-(public server)}"
             lune run scripts/smoke-kernel.luau $mode
             echo "::endgroup::"
