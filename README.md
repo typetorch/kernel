@@ -67,10 +67,23 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   - Messages across a swap: with a `ProtocolHash` attribute on the payload, client events of the previous artifact
     of the same hash reach the new generation; the resync names the dropped artifact and reaches only that client
     generation (`onResync`).
+- Owner override (0.3.3): the owner, and admins unless the place is owner-only (attribute `OverrideOwnerOnly` on
+  `ServerScriptService.TypeTorchKernel`, stamped by `typetorch kernel deploy`, read at boot), switch ANY server in
+  place, public and prod ones included: to a branch (the server then follows that branch's head; a dev branch under
+  dev rules) or to a known build (this server's history or the deployment list; it holds through every deploy). Only
+  the requesting player's own client asks (kernel transport `__tt/override`, one request per player per 2 s;
+  `ClientApi:requestOverride({branch | assetId | back})`) or `/tt branch <name>`, `/tt pin <assetId>`, `/tt back` on
+  a public or overridden server; no server API starts one, so payload code can't act for another player. It changes
+  this server only: nothing is stored (no head, no private override, no BootstrapHeads), new servers boot the signed
+  prod head, a prod deploy doesn't move an overridden server and a deploy of the branch it follows does. "Back"
+  returns to the verified head of the server's own branch under the signed rules. `status().ov` / `fleetStatus().ov`
+  = `{by, at, branch | artifact}`, the server prints `OWNER OVERRIDE: ...`, logs an `owner_override` event and posts
+  an `owner_override` fleet alert (warning) on switch and switch-back. Pins, rollbacks and branch switches answer
+  "switch back first" while an override holds. On private and reserved servers `/tt branch` keeps the stored switch.
 - Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
-  `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, and `--boot-budget`, which runs 21 boot scenarios with
+  `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--override`, and `--boot-budget`, which runs 21 boot scenarios with
   simulated slow or failing dependencies and checks each one runs a generation within 15 s).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.

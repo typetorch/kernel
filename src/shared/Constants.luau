@@ -114,7 +114,8 @@ return {
 	-- 0.3.2 (P-K7): a client generation that failed to start is tried once more after this many seconds.
 	CLIENT_RETRY_SECONDS = 2,
 	-- 0.3.3 (owner override): client -> server, tagged "*": { id, branch? | assetId? | back? } asks to switch THIS server in
-	-- place; server -> client: { id, ok, error?, generation? }. One request per player per OVERRIDE_GAP seconds.
+	-- place; server -> client: { id, ok, error?, generation? }. One request per player per OVERRIDE_GAP seconds (2 s, like
+	-- the dev menu's swaps).
 	CHANNEL_OVERRIDE = "__tt/override",
-	OVERRIDE_GAP = 5,
+	OVERRIDE_GAP = 2,
 }
