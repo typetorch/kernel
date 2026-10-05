@@ -205,6 +205,44 @@ function Registry.known(): boolean
 	return known
 end
 
+-- 0.3.2: another server-only ConfigService key of the same snapshot (e.g. "TypeTorchFleet"). Returns (ok, value): ok =
+-- false while ConfigService is unavailable (keep what you have), value = nil when the key is missing. A missing key is
+-- read again only after a publish (UpdateAvailable or the key's own changed signal): the engine warns on every read of
+-- a missing key.
+local otherMissing: { [string]: boolean } = {}
+local otherWatched: { [string]: boolean } = {}
+function Registry.readKey(key: string): (boolean, any)
+	if not snapshot then
+		return false, nil
+	end
+	if not otherWatched[key] then
+		otherWatched[key] = true
+		pcall(function()
+			snapshot:GetValueChangedSignal(key):Connect(function()
+				otherMissing[key] = nil
+			end)
+		end)
+		pcall(function()
+			snapshot.UpdateAvailable:Connect(function()
+				otherMissing[key] = nil
+			end)
+		end)
+	end
+	if otherMissing[key] then
+		return true, nil
+	end
+	local ok, value = pcall(function()
+		return snapshot:GetValue(key)
+	end)
+	if not ok then
+		return false, nil
+	end
+	if value == nil then
+		otherMissing[key] = true
+	end
+	return true, value
+end
+
 -- 0.3.2: the last registry read error since the last success, or nil.
 function Registry.readError(): string?
 	return lastReadError

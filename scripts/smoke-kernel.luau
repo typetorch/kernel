@@ -555,6 +555,13 @@ local subscribeFailures = {} -- topic -> number of SubscribeAsync calls that fai
 local assets = {}
 local assetVersions = {} -- version -> asset id
 local closeCallbacks = {} -- game:BindToClose
+local SMOKE_CONFIG = nil -- the ConfigService snapshot in `--fleet`
+-- 0.3.2 fleet API: every RequestAsync ({ url, method, headers, body (decoded), status }); `httpScript` = status codes
+-- (or "error") for the next requests, then 200.
+local httpRequests = {}
+local httpScript = {}
+local FLEET_TOKEN = "smoke-fleet-token-0123456789abcdef"
+local configValues = {} -- ConfigService keys in `--fleet` (the "TypeTorch" registry key stays missing)
 
 local GAME_ROOT_PROPS = {
 	JobId = "smoke-job-0001",
@@ -589,6 +596,15 @@ local services = {
 		JSONDecode = function(_, text)
 			return serde.decode("json", text)
 		end,
+		RequestAsync = function(_, request)
+			local scripted = table.remove(httpScript, 1)
+			local entry = { url = request.Url, method = request.Method, headers = request.Headers, body = serde.decode("json", request.Body), status = if scripted == "error" then 0 else scripted or 200 }
+			table.insert(httpRequests, entry)
+			if scripted == "error" then
+				error("HttpError: ConnectFail (smoke)")
+			end
+			return { Success = entry.status >= 200 and entry.status < 300, StatusCode = entry.status, Body = "{}" }
+		end,
 	},
 	Players = {
 		MaxPlayers = 10,
@@ -614,7 +630,19 @@ local services = {
 	ScriptContext = { Error = signal(true) },
 	ConfigService = {
 		GetConfigAsync = function()
-			error("ConfigService unavailable (smoke)")
+			if not table.find(process.args, "--fleet") then
+				error("ConfigService unavailable (smoke)")
+			end
+			local snapshot = { UpdateAvailable = signal() }
+			function snapshot:GetValue(key)
+				return deepCopy(configValues[key])
+			end
+			function snapshot:Refresh() end
+			function snapshot:GetValueChangedSignal()
+				return signal()
+			end
+			SMOKE_CONFIG = snapshot
+			return snapshot
 		end,
 	},
 	DataStoreService = {
@@ -696,7 +724,7 @@ end
 
 local kernelFolder = newInstance("Folder", "TypeTorchKernel")
 kernelFolder.Parent = services.ServerScriptService
-for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
+for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
 	sourceInstance(if name == "Kernel" then "Script" else "ModuleScript", name, `src/server/{file}`).Parent = kernelFolder
 end
 local entryTemplate = sourceInstance("Script", "Entry", "src/server/Entry.server.luau")
@@ -755,13 +783,19 @@ local VIP_MODE = table.find(process.args, "--vip") ~= nil
 -- `--client` (0.3.2, P-K7): runs the CLIENT kernel instead: a generation that fails once is retried on a fresh copy
 -- of its tree and reported to the server; one that keeps failing is reported as failed.
 local CLIENT_MODE = table.find(process.args, "--client") ~= nil
+-- `--fleet` (0.3.2): ConfigService holds TypeTorchFleet, so the kernel sends its fleet data over HTTP (stubbed): a
+-- reserved dev server whose head fails to start (nothing runs: the alerts and heartbeats still go out), then recovers.
+local FLEET_MODE = table.find(process.args, "--fleet") ~= nil
 local HEALTH_MODE = table.find(process.args, "--health") ~= nil
 local HEALTH_PROD_MODE = table.find(process.args, "--health-prod") ~= nil
 local LKG_BOOT_MODE = table.find(process.args, "--lkg-boot") ~= nil
-if DEV_MODE or VIP_MODE or HEALTH_MODE then
+if FLEET_MODE then
+	configValues.TypeTorchFleet = { url = "https://fleet.example.test/api/", token = FLEET_TOKEN }
+end
+if DEV_MODE or VIP_MODE or HEALTH_MODE or FLEET_MODE then
 	GAME_ROOT_PROPS.PrivateServerId = "ps-smoke"
 	GAME_ROOT_PROPS.PrivateServerOwnerId = if VIP_MODE then 777 else 0
-	dataStore.data["private/ps-smoke"] = { branch = "dev", setBy = 1, setAt = "2026-10-04T00:00:00Z", code = if HEALTH_MODE then "smoke-access-code" else nil }
+	dataStore.data["private/ps-smoke"] = { branch = "dev", setBy = 1, setAt = "2026-10-04T00:00:00Z", code = if HEALTH_MODE or FLEET_MODE then "smoke-access-code" else nil }
 end
 if HEALTH_MODE then
 	dataStore.failGets["private/ps-smoke"] = 2 -- P-K8: the boot read is retried
@@ -937,6 +971,9 @@ elseif BOOTSTRAP_ONLY_MODE then
 elseif EMPTY_MODE then
 	-- Only unusable heads: the forged dev-channel one (seq 99, MemoryStore) and one whose payload holds a Script.
 	dataStore.data.heads = { prod = { assetId = 1005, artifactId = "eeeeeee-555555", seq = 70, commit = "eeeeeee", channel = "prod", deployedAt = "2026-10-04T00:00:00Z" } }
+elseif FLEET_MODE then
+	-- The dev head is I, which fails to start, and nothing else is known for "dev": the server runs nothing.
+	memoryStore.data.heads.dev = { assetId = 1009, artifactId = "iiiiiii-999999", seq = 5, commit = "iiiiiii", channel = "dev", t = 1759580000000, deployedAt = "2026-10-04T00:00:00Z" }
 elseif LKG_BOOT_MODE then
 	-- The signed head (I, seq 32) fails to start. The deployment history holds it, an UNSIGNED prod entry (B, seq 20:
 	-- never a target on a prod server) and the signed H1 (A, seq 10): the server must boot A.
@@ -990,7 +1027,17 @@ Constants.STOP_DEADLINE = 0.3
 Constants.SUBSCRIBE_RETRY_DELAYS = { 0.05 }
 Constants.PRIVATE_READ_RETRY_DELAYS = { 0.05, 0.05, 0.05 }
 Constants.CLOSE_DEADLINE = 1
-if HEALTH_MODE or HEALTH_PROD_MODE or LKG_BOOT_MODE then
+if FLEET_MODE then
+	Constants.FLEET_HEARTBEAT_SECONDS = 0.5
+	Constants.FLEET_PLAYERS_GAP = 0.2
+	Constants.FLEET_WATCH_SECONDS = 0.2
+	Constants.FLEET_RETRY_DELAYS = { 0.05, 0.1, 0.2 }
+	Constants.FLEET_SETTINGS_SECONDS = 0.5
+	Constants.FLEET_ALERT_GAP = 0.3
+	Constants.FLEET_SPIKE_GAP = 0.3
+	Constants.FLEET_RATE_PER_MINUTE = 6000
+end
+if HEALTH_MODE or HEALTH_PROD_MODE or LKG_BOOT_MODE or FLEET_MODE then
 	Constants.HEALTH_WINDOW = 1.5
 	Constants.POLL_SECONDS = 0.3
 end
@@ -1065,6 +1112,14 @@ local function finish()
 	check(`no unexpected errors on kernel threads{if #unexpected > 0 then ": " .. unexpected[1] else ""}`, #unexpected == 0)
 	check(`no swap ran on a thread its own stopped generation owned (busy-flag hazard){if #hazards > 0 then ": " .. hazards[1] else ""}`, #hazards == 0)
 	check("the kernel never used a MemoryStore sorted map (0.3.2: fleet status and reports are API only)", #sortedMapRequests == 0)
+	if not FLEET_MODE then
+		check("no HTTP request without TypeTorchFleet", #httpRequests == 0)
+	end
+	local leaked = false
+	for _, line in output do
+		leaked = leaked or string.find(line.text, FLEET_TOKEN, 1, true) ~= nil
+	end
+	check("the fleet token never appears in any output", not leaked)
 	for _, line in output do
 		if line.kind == "warn" and string.find(line.text, "swap failed", 1, true) and not string.find(line.text, "eeeeeee", 1, true) and not string.find(line.text, "1006", 1, true) and not string.find(line.text, "ccccccc", 1, true) and not string.find(line.text, "Sneaky", 1, true) then
 			check(`unexpected: {line.text}`, false)
@@ -1083,7 +1138,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" else "public server"
+	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -1375,6 +1430,149 @@ end
 local function rolledBackFrom(artifactId: string, to: string): boolean
 	local health = status().health
 	return health.lastRollback ~= nil and health.lastRollback.from == artifactId and running() == to
+end
+
+if FLEET_MODE then
+	local PREFIX = "https://fleet.example.test/api/v1/fleet/"
+	local function requests(path: string, from: number?)
+		local list = {}
+		for index = from or 1, #httpRequests do
+			local request = httpRequests[index]
+			if request.url == PREFIX .. path then
+				table.insert(list, request)
+			end
+		end
+		return list
+	end
+	local function alerted(code: string, from: number?)
+		for _, request in requests("alert", from) do
+			if request.body.code == code and request.status == 200 then
+				return request.body
+			end
+		end
+		return nil
+	end
+	local function lastHeartbeat()
+		local list = requests("heartbeat")
+		return list[#list] and list[#list].body
+	end
+
+	-- A broken generation: the head fails to start and nothing else is known. The kernel still alerts and beats.
+	check("fleet: a deploy that fails to start: alert deploy_failed (critical) with its seq and artifact", waitFor("deploy_failed", function()
+		local alert = alerted("deploy_failed")
+		return alert ~= nil and alert.level == "critical" and alert.s == 5 and alert.a == "iiiiiii-999999" and alert.j == JOB and alert.b == "dev" and alert.k == Constants.KERNEL_VERSION and typeof(alert.t) == "number" and #alert.message <= 300
+	end, 6))
+	check("fleet: nothing else could run: lkg_exhausted and health_failed (critical)", waitFor("lkg", function()
+		return alerted("lkg_exhausted") ~= nil and alerted("health_failed") ~= nil and alerted("health_failed").level == "critical"
+	end, 6) and status().generation == nil)
+	check("fleet: heartbeats go on with no generation (h failed, no artifact, j set, no access code)", waitFor("heartbeat", function()
+		local body = lastHeartbeat()
+		return body ~= nil and body.h == "failed" and body.a == nil and body.j == JOB and body.k == nil and body.sv == 2 and body.t == "reserved"
+	end))
+	check("fleet: the failed deploy's report went out", waitFor("report", function()
+		for _, request in requests("report") do
+			if request.body.s == 5 and request.body.r == "failed" and request.body.j == JOB then
+				return true
+			end
+		end
+		return false
+	end))
+	local wellFormed = #httpRequests > 0
+	for _, request in httpRequests do
+		local headers = request.headers or {}
+		wellFormed = wellFormed and request.method == "POST" and string.sub(request.url, 1, #PREFIX) == PREFIX and headers.Authorization == "Bearer " .. FLEET_TOKEN and headers["Content-Type"] == "application/json"
+	end
+	check("fleet: every request is a JSON POST to <url>/v1/fleet/... with the bearer token", wellFormed)
+	check("fleet: status().fleet shows the host, never the token", (function()
+		local info = status().fleet
+		return info.enabled == true and info.host == "fleet.example.test" and info.settings == "ok" and not string.find(serde.encode("json", info), FLEET_TOKEN, 1, true)
+	end)())
+
+	-- It recovers: a good deploy runs, the heartbeat says ok.
+	publish("TypeTorch/deploy", { b = "dev", a = 1004, i = "ddddddd-444444", s = 6, c = "ddddddd", ch = "dev", t = nowMs() })
+	check("fleet: a good deploy: heartbeat ok with the artifact, report booted (the first generation here)", waitFor("recovered", function()
+		local body = lastHeartbeat()
+		local swapped = false
+		for _, request in requests("report") do
+			swapped = swapped or (request.body.s == 6 and request.body.r == "booted") -- the first generation of this server
+		end
+		return running() == "ddddddd-444444" and body ~= nil and body.h == "ok" and body.a == "ddddddd-444444" and body.q == 6 and swapped
+	end, 6))
+
+	-- A deploy that fails its health window: alert health_rollback, report rolled_back, back to D.
+	local mark = #httpRequests
+	publish("TypeTorch/deploy", { b = "dev", a = 1007, i = "ggggggg-777777", s = 7, c = "ggggggg", ch = "dev", t = nowMs() })
+	check("fleet: a health-window rollback: alert health_rollback and report rolled_back", waitFor("health rollback", function()
+		local rolled = false
+		for _, request in requests("report", mark) do
+			rolled = rolled or (request.body.s == 7 and request.body.r == "rolled_back")
+		end
+		local alert = alerted("health_rollback", mark)
+		return alert ~= nil and alert.level == "critical" and alert.s == 7 and alert.a == "ggggggg-777777" and rolled and running() == "ddddddd-444444"
+	end, 6))
+
+	-- An error spike after the window: 20 errors from the generation within 60 s.
+	task.wait(Constants.HEALTH_WINDOW + 0.3)
+	mark = #httpRequests
+	local entry = currentEntry()
+	for index = 1, 20 do
+		fireScriptError(`spike {index}`, "", entry)
+	end
+	check("fleet: an error spike (20 errors in 60 s): alert error_spike (warning), no rollback", waitFor("spike", function()
+		local alert = alerted("error_spike", mark)
+		return alert ~= nil and alert.level == "warning"
+	end) and running() == "ddddddd-444444")
+
+	-- Retries: no answer and 503 are retried; 401 is dropped (the warning names the setting, never the token).
+	mark = #httpRequests
+	httpScript = { "error", 503 }
+	check("fleet: a request that gets no answer, then 503, is retried until it goes through", waitFor("retry", function()
+		local statuses = {}
+		for index = mark + 1, #httpRequests do
+			table.insert(statuses, httpRequests[index].status)
+		end
+		return statuses[1] == 0 and statuses[2] == 503 and statuses[3] == 200 and httpRequests[mark + 1].url == httpRequests[mark + 3].url
+	end, 4))
+	httpScript = { 401 }
+	check("fleet: 401 is dropped with a warning that names the setting", waitFor("401", function()
+		return said("answered 401") and said("TypeTorchFleet.token")
+	end, 4))
+
+	-- A player count change sends a heartbeat at once (at most once per FLEET_PLAYERS_GAP).
+	Constants.FLEET_HEARTBEAT_SECONDS = 100
+	task.wait(0.6)
+	local before = #requests("heartbeat")
+	local visitor = newInstance("Player", "Visitor")
+	visitor.UserId = 77
+	services.Players.PlayerAdded:Fire(visitor)
+	check("fleet: a player count change sends a heartbeat", waitFor("players", function()
+		return #requests("heartbeat") == before + 1
+	end, 2))
+
+	-- Without the setting nothing is sent; it comes back after a publish.
+	configValues.TypeTorchFleet = nil
+	task.wait(0.8)
+	local quiet = #httpRequests
+	publish("TypeTorch/deploy", { b = "dev", a = 1002, i = "bbbbbbb-222222", s = 8, c = "bbbbbbb", ch = "dev", t = nowMs() })
+	task.wait(0.8)
+	check("fleet: without TypeTorchFleet nothing is sent (the swap still happens)", #httpRequests == quiet and running() == "bbbbbbb-222222" and status().fleet.enabled == false)
+	configValues.TypeTorchFleet = { url = "https://fleet.example.test/api", token = FLEET_TOKEN }
+	SMOKE_CONFIG.UpdateAvailable:Fire()
+	check("fleet: the setting is back after a publish: sending resumes", waitFor("resumed", function()
+		return #httpRequests > quiet and status().fleet.enabled == true
+	end, 3))
+
+	-- BindToClose: the closing request (a clean close, not a lost server).
+	local closeDone = false
+	task.spawn(function()
+		closeCallbacks[1]()
+		closeDone = true
+	end)
+	check("fleet: BindToClose sends closing", waitFor("closing", function()
+		local list = requests("closing")
+		return closeDone and #list == 1 and list[1].body.closing == true and list[1].body.j == JOB and list[1].body.k == nil
+	end))
+	finish()
 end
 
 if HEALTH_MODE then

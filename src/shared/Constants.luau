@@ -59,6 +59,28 @@ return {
 	-- api:onDeployReport(fn) one report per deploy outcome (the framework's analytics engine forwards them); the last
 	-- REPORTS_KEPT reports are kept and replayed to each new listener (api:deployReports()).
 	REPORTS_KEPT = 20,
+	-- 0.3.2 (user decision): the kernel also sends its fleet data itself, live and whatever the generation does, to the
+	-- dev's fleet API, when the server-only ConfigService key FLEET_KEY = { url, token } exists (Fleet.luau).
+	FLEET_KEY = "TypeTorchFleet",
+	-- The settings are read at boot and every this many seconds.
+	FLEET_SETTINGS_SECONDS = 300,
+	-- A heartbeat (the fleet status) at least this often, and right after a swap, a health change or (at most once per
+	-- FLEET_PLAYERS_GAP s) a player count change.
+	FLEET_HEARTBEAT_SECONDS = 30,
+	FLEET_PLAYERS_GAP = 5,
+	-- Health and trusted-head changes are looked at this often (they send a heartbeat and maybe an alert).
+	FLEET_WATCH_SECONDS = 5,
+	-- A failed request (no answer, HTTP 429 or 5xx) is retried after these delays, then dropped; other 4xx: dropped.
+	FLEET_RETRY_DELAYS = { 1, 3, 9 },
+	-- Reports, alerts and closing requests waiting at most (the oldest go first when it is full).
+	FLEET_QUEUE_MAX = 100,
+	-- At most this many requests per minute (burst 10), whatever happens: HttpService's 500/min is the game's too.
+	FLEET_RATE_PER_MINUTE = 30,
+	-- One alert per code per this many seconds (an error spike: 5 minutes).
+	FLEET_ALERT_GAP = 60,
+	FLEET_SPIKE_GAP = 300,
+	-- An error spike: this many errors from the running generation's scripts within 60 s.
+	FLEET_ERROR_SPIKE = 20,
 	-- Old client trees stay this long after a swap so clients can stop their old generation first.
 	CLIENT_TREE_GRACE = 30,
 	-- Random delay before a public server fetches a new deploy, so all servers don't hit LoadAsset at once.

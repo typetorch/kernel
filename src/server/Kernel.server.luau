@@ -16,8 +16,9 @@
 --
 -- 0.3.2 (bad deploys are safe): a health window after ready (a failed onStart, or HEALTH_ERRORS errors from the new
 -- generation's own scripts, rolls the server back; P-F1), a last-known-good chain that skips artifacts that failed
--- here (P-K3), the fleet status and per-deploy reports on the API (P-O1: api:fleetStatus, api:onDeployReport; the kernel
--- writes nothing itself), client generation reports (P-K7), onClose per generation, and every swap game code starts
+-- here (P-K3), the fleet status and per-deploy reports on the API (P-O1: api:fleetStatus, api:onDeployReport) and, when
+-- the ConfigService key TypeTorchFleet is set, sent by the kernel itself to the dev's fleet API (Fleet.luau: heartbeats,
+-- reports, alerts, closing), client generation reports (P-K7), onClose per generation, and every swap game code starts
 -- runs on a kernel thread (busy-flag hazard).
 
 local HttpService = game:GetService("HttpService")
@@ -52,6 +53,33 @@ local Api = require(script.Parent.Api)
 local Logs = require(script.Parent.Logs)
 local Registry = require(script.Parent.Registry)
 local Transport = require(script.Parent.Transport)
+
+-- 0.3.2: Fleet.luau is a new file. A place project that lists the kernel's files one by one and doesn't map it yet (an
+-- older template studio.project.json) still boots, without the fleet API, and says so.
+local Fleet
+do
+	local module = script.Parent:FindFirstChild("Fleet")
+	if module then
+		Fleet = require(module)
+	else
+		warn("[TypeTorch] TypeTorchKernel.Fleet is missing (map src/server/Fleet.luau in the place project): no fleet API on this server")
+		local function noop() end
+		Fleet = {
+			configure = noop,
+			start = noop,
+			heartbeat = noop,
+			report = noop,
+			alert = noop,
+			closing = noop,
+			enabled = function()
+				return false
+			end,
+			info = function()
+				return { enabled = false, missing = true }
+			end,
+		}
+	end
+end
 
 Logs.start()
 
@@ -386,6 +414,16 @@ local function rejectedInfo()
 	return { total = rejectedTotal, byKind = table.clone(rejectedByKind), last = if #refusals > 0 then table.clone(refusals[#refusals]) else nil }
 end
 
+-- 0.3.2: an alert to the fleet API (when configured). `head` (optional) names the deploy: seq, artifact id.
+local function fleetAlert(level: string, code: string, message: string, head)
+	Fleet.alert(level, code, message, {
+		s = if typeof(head) == "table" and typeof(head.seq) == "number" then head.seq else appliedSeq,
+		a = if typeof(head) == "table" and typeof(head.artifactId) == "string" then head.artifactId elseif current then current.artifact.id else nil,
+		b = myBranch,
+		g = if current then current.number else 0,
+	})
+end
+
 local function refuse(kind: string, why: string, detail)
 	rejectedTotal += 1
 	rejectedByKind[kind] = (rejectedByKind[kind] or 0) + 1
@@ -406,6 +444,9 @@ local function refuse(kind: string, why: string, detail)
 		warn(`[TypeTorch] refused {kind}: {why}{suppressed} {HttpService:JSONEncode(detail or {})}`)
 	else
 		refusalsSuppressed[kind] = (refusalsSuppressed[kind] or 0) + 1
+	end
+	if kind == "deploy" or kind == "head" or kind == "pin" or kind == "swap" then
+		fleetAlert("warning", `refused_{kind}`, `refused {kind}: {why}`, detail)
 	end
 	if not refusalEventAt[kind] or now - refusalEventAt[kind] >= 60 then
 		refusalEventAt[kind] = now
@@ -919,6 +960,7 @@ local function reportOutcome(head, result: string, extra)
 	while #recentReports > Constants.REPORTS_KEPT do
 		table.remove(recentReports, 1)
 	end
+	Fleet.report(report)
 	for _, listener in table.clone(reportListeners) do
 		if listener.on then
 			callListener(listener, report)
@@ -1017,12 +1059,23 @@ local function checkHealth(generation)
 	end
 end
 
+-- 0.3.2: errors of the running generation in the last 60 s (os.clock), for the fleet API's error_spike alert.
+local recentErrors: { number } = {}
+
 local function noteError(generation, message: string, startFailed: boolean?)
 	local health = generation.health
 	local text = clip(message, 200)
 	health.lastError = text
 	health.lastErrorAt = os.time()
 	noteLastError(text)
+	local now = os.clock()
+	table.insert(recentErrors, now)
+	while #recentErrors > 0 and now - recentErrors[1] > 60 do
+		table.remove(recentErrors, 1)
+	end
+	if #recentErrors >= Constants.FLEET_ERROR_SPIKE then
+		fleetAlert("warning", "error_spike", `{#recentErrors} errors in 60 s from {generation.name}, last: {text}`, generation.head)
+	end
 	if startFailed then
 		health.startFailed = health.startFailed or text
 	else
@@ -1107,6 +1160,24 @@ local function fleetStatus()
 end
 
 
+Fleet.configure({
+	http = HttpService,
+	jobId = game.JobId,
+	active = game.JobId ~= "" and serverType() ~= "studio",
+	readSettings = function()
+		return Registry.readKey(Constants.FLEET_KEY)
+	end,
+	status = fleetStatus,
+	encode = function(value)
+		return HttpService:JSONEncode(value)
+	end,
+	decode = function(text)
+		return HttpService:JSONDecode(text)
+	end,
+	warn = warn,
+	print = print,
+})
+
 -- Swap to a registry head { assetId, artifactId?, seq?, ... }. Returns a report table. `by` is the user id that asked
 -- (dev menu, /tt, game code); `announced` means notifyPending already ran for this swap.
 local restoreLastKnownGood -- (excludeAssetId, why) -> report?, defined below
@@ -1136,6 +1207,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		return { ok = false, reason = reason, artifactId = head.artifactId, error = "local payloads run only in Studio", stage = "gate" }
 	end
 	busy = true
+	Fleet.heartbeat("swap")
 	local report = { reason = reason, assetId = head.assetId, artifactId = head.artifactId, ok = false }
 	local old = current
 	local oldStopped = false
@@ -1252,6 +1324,8 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		-- 0.3.2: a payload refused at mount (channel, scripts, kernel API, wrong id) fails the same way every time.
 		if report.stage == "mount" then
 			markFailed(head.assetId, head.artifactId, head.seq, `mount: {err}`)
+			local apiMismatch = string.find(tostring(err), "needs kernel API", 1, true) ~= nil
+			fleetAlert("critical", if apiMismatch then "kernel_api_mismatch" else "artifact_refused", `{head.artifactId or head.assetId}: {err}`, head)
 		end
 	end
 	if not report.ok then
@@ -1261,6 +1335,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		notifyPending(head, reason, 0, true) -- load or mount failed: the old generation keeps running
 	end
 	print("[TypeTorch] swap " .. HttpService:JSONEncode(report))
+	Fleet.heartbeat("swap")
 	for _, player in Players:GetPlayers() do
 		sendDevStatus(player)
 	end
@@ -1385,6 +1460,7 @@ local function noteFailure(head, reason: string, report)
 		Registry.logEvent({ action = "deploy_failed", seq = head.seq, assetId = head.assetId, artifactId = head.artifactId, stage = report.stage, attempts = failing.attempts, error = clip(report.error, 300), job = game.JobId })
 		-- 0.3.2 (P-O1): the deploy's outcome on this server.
 		reportOutcome(head, "failed", { e = `{report.stage or "swap"}: {report.error or "?"}` })
+		fleetAlert("critical", "deploy_failed", `deploy #{head.seq} ({head.artifactId or head.assetId}) {what}: {report.error or "?"}`, head)
 		return
 	end
 	failing.nextAt = os.clock() + delay
@@ -1980,6 +2056,7 @@ restoreLastKnownGood = function(exclude: number?, why: string)
 	else
 		warn(`[TypeTorch] no last-known-good artifact could run (after: {why}); {if current then `{current.artifact.id} keeps running` else "nothing runs"}`)
 		Registry.logEvent({ action = "auto_rollback_failed", tries = tries, why = clip(why, 300), job = game.JobId })
+		fleetAlert("critical", "lkg_exhausted", `no last-known-good artifact could run after: {why}`, nil)
 	end
 	return result
 end
@@ -2001,6 +2078,7 @@ healthRollback = function(generation, why: string)
 		failing = { seq = head.seq, assetId = head.assetId, attempts = 1, nextAt = math.huge }
 	end
 	Registry.logEvent({ action = "health_rollback", from = artifact.id, assetId = artifact.assetId, seq = head.seq, why = clip(why, 300), job = game.JobId })
+	fleetAlert("critical", "health_rollback", `{artifact.id} failed its health check: {why}`, { seq = head.seq, artifactId = artifact.id })
 	local restored = restoreLastKnownGood(artifact.assetId, `{artifact.id}: {why}`)
 	if not restored and not current and not closing then
 		-- Every candidate failed after the unhealthy generation was stopped: a degraded game beats an empty server. It
@@ -2250,51 +2328,54 @@ end
 -- { g = generation name, ok, e = error?, ms, retried? }. Untrusted input: checked field by field, kept per player, shown
 -- in status().clients and the dev menu. It never triggers a rollback (a player could fake it).
 local clientStatus: { [Player]: any } = {}
-local clientFailures = 0
-local clientWarnAt = -math.huge
-local lastClientFailure = nil
+local clientSummary -- () -> summary (below)
+do -- (scoped: the main chunk is near Luau's 200-local limit)
+	local clientFailures = 0
+	local clientWarnAt = -math.huge
+	local lastClientFailure = nil
 
-local function onClientStatus(player: Player, info)
-	if typeof(info) ~= "table" or typeof(info.g) ~= "string" or #info.g == 0 or #info.g > 120 then
-		return
-	end
-	local ok = info.ok == true
-	local entry = {
-		generation = info.g,
-		ok = ok,
-		error = if not ok and info.e ~= nil then clip(tostring(info.e), 200) else nil,
-		ms = if typeof(info.ms) == "number" and info.ms == info.ms then math.clamp(math.floor(info.ms), 0, 10 ^ 7) else nil,
-		retried = info.retried == true or nil,
-		at = os.time(),
-	}
-	clientStatus[player] = entry
-	if not ok then
-		clientFailures += 1
-		lastClientFailure = { userId = player.UserId, generation = entry.generation, error = entry.error, at = entry.at }
-		if os.clock() - clientWarnAt >= 10 then
-			clientWarnAt = os.clock()
-			warn(`[TypeTorch] {player.Name}'s client failed to start {entry.generation}{if entry.retried then " (after a retry)" else ""}: {entry.error or "?"}`)
+	local function onClientStatus(player: Player, info)
+		if typeof(info) ~= "table" or typeof(info.g) ~= "string" or #info.g == 0 or #info.g > 120 then
+			return
+		end
+		local ok = info.ok == true
+		local entry = {
+			generation = info.g,
+			ok = ok,
+			error = if not ok and info.e ~= nil then clip(tostring(info.e), 200) else nil,
+			ms = if typeof(info.ms) == "number" and info.ms == info.ms then math.clamp(math.floor(info.ms), 0, 10 ^ 7) else nil,
+			retried = info.retried == true or nil,
+			at = os.time(),
+		}
+		clientStatus[player] = entry
+		if not ok then
+			clientFailures += 1
+			lastClientFailure = { userId = player.UserId, generation = entry.generation, error = entry.error, at = entry.at }
+			if os.clock() - clientWarnAt >= 10 then
+				clientWarnAt = os.clock()
+				warn(`[TypeTorch] {player.Name}'s client failed to start {entry.generation}{if entry.retried then " (after a retry)" else ""}: {entry.error or "?"}`)
+			end
 		end
 	end
-end
-Transport.onKernel(Constants.CHANNEL_CLIENT, onClientStatus)
+	Transport.onKernel(Constants.CHANNEL_CLIENT, onClientStatus)
 
--- { players, reported, ok, failed, behind (reported another generation than the running one), failures (since boot),
--- lastFailure? }.
-local function clientSummary()
-	local summary = { players = #Players:GetPlayers(), reported = 0, ok = 0, failed = 0, behind = 0, failures = clientFailures, lastFailure = lastClientFailure }
-	for _, entry in clientStatus do
-		summary.reported += 1
-		if entry.ok then
-			summary.ok += 1
-		else
-			summary.failed += 1
+	-- { players, reported, ok, failed, behind (reported another generation than the running one), failures (since boot),
+	-- lastFailure? }.
+	clientSummary = function()
+		local summary = { players = #Players:GetPlayers(), reported = 0, ok = 0, failed = 0, behind = 0, failures = clientFailures, lastFailure = lastClientFailure }
+		for _, entry in clientStatus do
+			summary.reported += 1
+			if entry.ok then
+				summary.ok += 1
+			else
+				summary.failed += 1
+			end
+			if current and entry.generation ~= current.name then
+				summary.behind += 1
+			end
 		end
-		if current and entry.generation ~= current.name then
-			summary.behind += 1
-		end
+		return summary
 	end
-	return summary
 end
 
 -- Reserves a server on `branch` and teleports the player there. With `assetId` (a known deployment), the new server
@@ -2458,6 +2539,9 @@ local function status()
 		rejected = rejectedInfo(),
 		-- 0.3.1: the running generation is the Studio local payload (ServerStorage.TypeTorchDev.Payload).
 		localPayload = if current and current.localPayload then true else nil,
+		-- 0.3.2: the kernel's own fleet API sender ({ enabled, settings, host, queued, sent, failed, dropped, alerts,
+		-- lastOkAt?, lastError?, lastStatus? }; never the token).
+		fleet = Fleet.info(),
 		-- 0.3.2 (P-F1): { state = "ok" | "failed" | "unverified" | "degraded", errors, lastError?, lastErrorAt?,
 		-- startFailed?, windowLeft? (seconds of the health window left), lastRollback? = { from, to?, why, at } }.
 		health = healthInfo(),
@@ -2654,76 +2738,80 @@ Api.init({
 
 -- /tt chat commands (TextChatCommand), the fallback when a generation is broken --------------------------------------
 
-local HELP = "/tt status | branch <name> | new <branch> [assetId] | pin <assetId> | unpin | reload | rollback | dev"
+do -- (scoped: the main chunk is near Luau's 200-local limit)
+	local HELP = "/tt status | branch <name> | new <branch> [assetId] | pin <assetId> | unpin | reload | rollback | dev"
 
-local function describe(report): string
-	if report.ok then
-		return `now running {report.generation}`
+	local function describe(report): string
+		if report.ok then
+			return `now running {report.generation}`
+		end
+		return `failed: {report.error or "queued"}`
 	end
-	return `failed: {report.error or "queued"}`
+
+	local function runCommand(player: Player, text: string)
+		local words = string.split(string.gsub(text, "^%s*/tt%s*", ""), " ")
+		local command = string.lower(words[1] or "")
+		local argument = words[2]
+		if not Access.isDev(player) then
+			return
+		end
+		if command == "" or command == "help" then
+			notice(player, HELP)
+		elseif command == "status" then
+			local s = status()
+			local pinned = if s.experiment then ", A/B experiment" elseif s.pinned then ", pinned" else ""
+			if s.unverified then
+				pinned ..= ", UNVERIFIED boot (fail-safe)"
+			end
+			if s.localPayload then
+				pinned ..= ", local payload"
+			end
+			local signing = if s.signedOnly then `, signed only ({s.signing.mode}{if s.rejected.total > 0 then `, {s.rejected.total} rejected` else ""})` else ""
+			notice(player, `{s.serverType} server, branch {s.branch} ({s.channel or "?"}), {if s.generation then s.generation.name else "no generation"}{pinned}, up {s.uptime}s, kernel {s.kernelVersion}{if s.kernelBuild then `@{s.kernelBuild}` else ""}{signing}`)
+		elseif command == "branch" and argument then
+			notice(player, describe(switchBranch(player, argument)))
+		elseif command == "new" and argument then
+			local assetId = tonumber(words[3])
+			local report = newServer(player, argument, assetId)
+			if not report.ok then
+				notice(player, `failed: {report.error}`)
+			end
+		elseif command == "pin" and tonumber(argument) then
+			notice(player, describe(pinArtifact(player, tonumber(argument) :: number)))
+		elseif command == "unpin" then
+			notice(player, describe(unpin(player)))
+		elseif command == "reload" then
+			notice(player, describe(reload(player)))
+		elseif command == "rollback" then
+			notice(player, describe(rollback(player)))
+		elseif command == "dev" then
+			Transport.kernelSend(player, Constants.CHANNEL_EVENT, "dev-open")
+		else
+			notice(player, HELP)
+		end
+	end
+
+	local command = Instance.new("TextChatCommand")
+	command.Name = "TypeTorchCommand"
+	command.PrimaryAlias = "/tt"
+	command.Triggered:Connect(function(source: TextSource, text: string)
+		local player = Players:GetPlayerByUserId(source.UserId)
+		if player then
+			task.spawn(runCommand, player, text)
+		end
+	end)
+	command.Parent = TextChatService
 end
-
-local function runCommand(player: Player, text: string)
-	local words = string.split(string.gsub(text, "^%s*/tt%s*", ""), " ")
-	local command = string.lower(words[1] or "")
-	local argument = words[2]
-	if not Access.isDev(player) then
-		return
-	end
-	if command == "" or command == "help" then
-		notice(player, HELP)
-	elseif command == "status" then
-		local s = status()
-		local pinned = if s.experiment then ", A/B experiment" elseif s.pinned then ", pinned" else ""
-		if s.unverified then
-			pinned ..= ", UNVERIFIED boot (fail-safe)"
-		end
-		if s.localPayload then
-			pinned ..= ", local payload"
-		end
-		local signing = if s.signedOnly then `, signed only ({s.signing.mode}{if s.rejected.total > 0 then `, {s.rejected.total} rejected` else ""})` else ""
-		notice(player, `{s.serverType} server, branch {s.branch} ({s.channel or "?"}), {if s.generation then s.generation.name else "no generation"}{pinned}, up {s.uptime}s, kernel {s.kernelVersion}{if s.kernelBuild then `@{s.kernelBuild}` else ""}{signing}`)
-	elseif command == "branch" and argument then
-		notice(player, describe(switchBranch(player, argument)))
-	elseif command == "new" and argument then
-		local assetId = tonumber(words[3])
-		local report = newServer(player, argument, assetId)
-		if not report.ok then
-			notice(player, `failed: {report.error}`)
-		end
-	elseif command == "pin" and tonumber(argument) then
-		notice(player, describe(pinArtifact(player, tonumber(argument) :: number)))
-	elseif command == "unpin" then
-		notice(player, describe(unpin(player)))
-	elseif command == "reload" then
-		notice(player, describe(reload(player)))
-	elseif command == "rollback" then
-		notice(player, describe(rollback(player)))
-	elseif command == "dev" then
-		Transport.kernelSend(player, Constants.CHANNEL_EVENT, "dev-open")
-	else
-		notice(player, HELP)
-	end
-end
-
-local command = Instance.new("TextChatCommand")
-command.Name = "TypeTorchCommand"
-command.PrimaryAlias = "/tt"
-command.Triggered:Connect(function(source: TextSource, text: string)
-	local player = Players:GetPlayerByUserId(source.UserId)
-	if player then
-		task.spawn(runCommand, player, text)
-	end
-end)
-command.Parent = TextChatService
 
 -- Boot ---------------------------------------------------------------------------------------------------------------
 
 Players.PlayerAdded:Connect(function(player)
+	Fleet.heartbeat("players")
 	task.defer(sendDevStatus, player)
 end)
 Players.PlayerRemoving:Connect(function(player)
 	lastDev[player] = nil
+	Fleet.heartbeat("players")
 	clientStatus[player] = nil
 end)
 
@@ -2886,11 +2974,13 @@ local function bootSigned()
 					`[TypeTorch] BOOT FAIL-SAFE: no verified head for {myBranch} loaded, so this server booted the UNVERIFIED stored head {head.artifactId or `asset-{head.assetId}`} (seq {tostring(head.seq)}). Updates still need signatures; the next signed deploy replaces it.`
 				)
 				Registry.logEvent({ action = "booted_unverified", branch = myBranch, assetId = head.assetId, artifactId = head.artifactId, seq = head.seq, job = game.JobId })
+				fleetAlert("critical", "booted_unverified", `no verified head for {myBranch} loaded; booted the unverified stored head {head.artifactId or head.assetId}`, head)
 				return
 			end
 		end
 	end
 	warn(`[TypeTorch] branch {myBranch}: nothing loaded (no verified, bootstrap or usable stored head){if err then ` (registry: {err})` else ""}; waiting for a signed deploy`)
+	fleetAlert("critical", "no_trusted_head", `branch {myBranch}: nothing loaded (no verified, bootstrap or usable stored head)`, nil)
 end
 
 local bootHead = headFor(myBranch)
@@ -2962,10 +3052,39 @@ Registry.startSync(Constants.POLL_SECONDS, function()
 	followHead("poll", true)
 end)
 
+-- 0.3.2: the kernel's own fleet API sender (off without TypeTorchFleet) and its watch: a health change sends a heartbeat,
+-- and failed / unverified / degraded (or no trusted head on a signed-only server) an alert.
+Fleet.start()
+task.spawn(function()
+	local lastHealth = "ok" -- a server that boots unhealthy alerts too
+	local lastNoTrusted = false
+	while not closing do
+		task.wait(Constants.FLEET_WATCH_SECONDS)
+		if Fleet.enabled() then
+			local health = healthState()
+			if health ~= lastHealth then
+				Fleet.heartbeat("health")
+				if health ~= "ok" then
+					local detail = if current and current.health.lastError then `: {current.health.lastError}` else ""
+					fleetAlert(if health == "degraded" then "warning" else "critical", `health_{health}`, `health {lastHealth} -> {health}{detail}`, nil)
+				end
+				lastHealth = health
+			end
+			local noTrusted = requiresSignatures(myBranch) and myBranch ~= nil and headFor(myBranch) == nil
+			if noTrusted and not lastNoTrusted then
+				fleetAlert("critical", "no_trusted_head", `branch {myBranch}: no trusted prod head`, nil)
+			end
+			lastNoTrusted = noTrusted
+		end
+	end
+end)
+
 -- 0.3.2: one BindToClose for the server's lifetime: no more swaps, and the running generation's onClose handler
 -- (api:onClose; the framework runs its modules' onStop and its analytics engine's last flush) gets CLOSE_DEADLINE s.
 local function onClose()
 	closing = true
+	-- The fleet API hears a clean close (not a lost server), in parallel with the generation's handler.
+	task.spawn(Fleet.closing, 3)
 	local generation = current
 	local handler = generation and generation.closeHandler
 	if handler then
