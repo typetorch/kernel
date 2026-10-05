@@ -25,7 +25,8 @@
 --       events                     { list }                   (automatic and server-local rollbacks, pins)
 --
 -- Studio without published configs: ServerStorage.TypeTorchDev may carry a "Registry" JSON attribute (same shape) or a
--- "BootAssetId" number attribute; see Registry.studioOverride.
+-- "BootAssetId" number attribute; see Registry.studioOverride. 0.3.1: a "Payload" Model child is mounted instead of any
+-- registry head (the kernel's "Studio local payload"; this module doesn't read it).
 
 local ConfigService = game:GetService("ConfigService")
 local DataStoreService = game:GetService("DataStoreService")

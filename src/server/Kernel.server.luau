@@ -10,6 +10,9 @@
 -- 0.3: prod servers (public servers, and private/reserved servers on a prod branch) load only what the owner signed:
 -- deploy messages and stored heads need a valid signature (Signing.luau), the "prod" Channel attribute and a seq newer
 -- than the applied one; remote pins need a signature too. Dev servers stay unsigned. See plans/01 "Signed deploys".
+--
+-- 0.3.1: in Studio only, ServerStorage.TypeTorchDev.Payload (a Model shaped like an uploaded payload) is mounted instead
+-- of LoadAsset, a fresh clone per mount; see "Studio local payload" below and plans/01.
 
 local HttpService = game:GetService("HttpService")
 local InsertService = game:GetService("InsertService")
@@ -86,6 +89,65 @@ local function serverType(): string
 	return "public"
 end
 
+-- 0.3.1: Studio local payload ---------------------------------------------------------------------------------------
+-- In Studio only, ServerStorage.TypeTorchDev.Payload (a Model shaped like an uploaded payload: Server, Shared, Client,
+-- include) is mounted instead of LoadAsset, so a dev can run their local build with the real kernel (the template's
+-- studio.project.json: rbxtsc -w + rojo serve + Play). Every mount takes a fresh CLONE, so the source stays for Reload,
+-- and goes through the same mount checks (only Folders and ModuleScripts; dev channel). Such a session never follows
+-- the branch head on its own (deploy messages, the poll); only dev actions move it, and Reload remounts the local copy.
+-- Outside Studio the folder is ignored: every path below checks RunService:IsStudio() itself.
+local localHeads: { [any]: boolean } = setmetatable({}, { __mode = "k" }) :: any -- head tables made by localHead()
+local localMode = false -- set at boot: Studio with a local payload
+local localMounts = 0
+local lastLocalBase = nil
+
+-- The local payload's source Model, or nil (always nil outside Studio).
+local function localPayloadSource(): Instance?
+	if not RunService:IsStudio() then
+		return nil
+	end
+	local dev = ServerStorage:FindFirstChild("TypeTorchDev")
+	local source = dev and dev:FindFirstChild("Payload")
+	if source and source:IsA("Model") then
+		return source
+	end
+	return nil
+end
+
+-- A new head for the local payload (one per mount): artifact id "local-<HHMMSS UTC>" (plus the mount number when two
+-- mounts share a second), dev channel, this server's branch. nil outside Studio or without a source.
+local function localHead()
+	if not RunService:IsStudio() or not localPayloadSource() then
+		return nil
+	end
+	localMounts += 1
+	local now = os.date("!*t")
+	local base = string.format("local-%02d%02d%02d", now.hour, now.min, now.sec)
+	local id = if base == lastLocalBase then `{base}-{localMounts}` else base
+	lastLocalBase = base
+	local head = { artifactId = id, channel = "dev", branch = myBranch }
+	localHeads[head] = true
+	return head
+end
+
+-- A fresh clone of the local payload, stamped with the head's id and the dev channel (the source keeps its own).
+local function loadLocalPayload(head): Instance
+	local source = localPayloadSource()
+	if not source then
+		error("no local payload (ServerStorage.TypeTorchDev.Payload, Studio only)")
+	end
+	if not (source:FindFirstChild("Server") and source:FindFirstChild("Client")) then
+		error("ServerStorage.TypeTorchDev.Payload has no Server/Client (build first: rbxtsc)")
+	end
+	local payload = source:Clone()
+	if not payload then
+		error("ServerStorage.TypeTorchDev.Payload could not be cloned (Archivable is off)")
+	end
+	payload:SetAttribute("ArtifactId", head.artifactId)
+	payload:SetAttribute("Channel", "dev")
+	return payload
+end
+
 -- 0.3: signatures --------------------------------------------------------------------------------------------------
 
 -- A head (or deployment entry) of `branch` that the owner signed for the prod channel.
@@ -158,10 +220,11 @@ local function admit(head, how: string)
 	return head
 end
 
--- A copy of a head that keeps its admission.
+-- A copy of a head that keeps its admission (and, 0.3.1, whether it is the Studio local payload).
 local function cloneHead(head)
 	local copy = table.clone(head)
 	admitted[copy] = admitted[head]
+	localHeads[copy] = localHeads[head]
 	return copy
 end
 
@@ -426,7 +489,8 @@ local function loadPayload(assetId: number): Instance
 end
 
 -- `policy` (0.3) = { requireChannel = "prod"?, modulesOnly = boolean }, decided by swapTo from this server's type and
--- branch (never from head fields, which may come from game-written stores).
+-- branch (never from head fields, which may come from game-written stores). 0.3.1: Studio local payloads are always
+-- modulesOnly.
 local function mount(payload: Instance, head, policy)
 	local artifactId = payload:GetAttribute("ArtifactId")
 	if head.artifactId and artifactId ~= head.artifactId then
@@ -689,6 +753,11 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		refuse("swap", if how == "blind" then "an unverified head after boot" else "not a signed head", { reason = reason, assetId = head.assetId, artifactId = head.artifactId })
 		return { ok = false, reason = reason, assetId = head.assetId, artifactId = head.artifactId, error = "refused: not signed", stage = "gate" }
 	end
+	-- 0.3.1: the Studio local payload (a head made by localHead); never outside Studio.
+	local isLocal = localHeads[head] == true
+	if isLocal and not RunService:IsStudio() then
+		return { ok = false, reason = reason, artifactId = head.artifactId, error = "local payloads run only in Studio", stage = "gate" }
+	end
 	busy = true
 	local report = { reason = reason, assetId = head.assetId, artifactId = head.artifactId, ok = false }
 	local old = current
@@ -699,15 +768,16 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 	local ok, err = pcall(function()
 		local loadStarted = os.clock()
 		report.stage = "load"
-		local payload = loadPayload(head.assetId)
+		local payload = if isLocal then loadLocalPayload(head) else loadPayload(head.assetId)
 		report.loadSeconds = os.clock() - loadStarted
 		report.stage = "mount"
 		-- Signed deploys and heads (and bootstrap heads) on prod servers: Channel exactly "prod"; pins keep their own rule
-		-- (head.requireChannel); experiments (signed remote pins) may be any channel.
+		-- (head.requireChannel); experiments (signed remote pins) may be any channel. Local payloads: modules only.
 		local generation = mount(payload, head, {
 			requireChannel = if signedOnly and (how == "signed" or how == "bootstrap" or how == "blind") then "prod" else nil,
-			modulesOnly = signedOnly,
+			modulesOnly = signedOnly or isLocal,
 		})
+		generation.localPayload = isLocal or nil
 		-- 0.3 boot fail-safe: a generation from an unverified head is flagged until a verified head replaces or vouches
 		-- for it (status().unverified, an Attention error, no verified badge).
 		generation.unverified = signedOnly and how == "blind" or nil
@@ -834,6 +904,9 @@ local function chooseBranch(): string
 		if typeof(branch) == "string" then
 			return branch
 		end
+		if localMode then
+			return "dev" -- 0.3.1: a local payload runs on TypeTorchDev.Branch, else "dev"
+		end
 	end
 	return state.defaultBranch
 end
@@ -939,7 +1012,8 @@ local refusedHeads: { [string]: boolean } = {}
 -- Moves to the branch head when the registry has a newer seq than this server last applied. 0.3: prod servers only
 -- consider signed prod heads; a newer head that isn't one is reported (once) and triggers one rate-limited key re-read.
 local function followHead(reason: string, jitter: boolean?)
-	if not myBranch then
+	-- 0.3.1: a Studio session on the local payload moves only when a dev acts (Reload remounts the local copy).
+	if not myBranch or localMode then
 		return
 	end
 	local head = headFor(myBranch)
@@ -1102,6 +1176,10 @@ local function onDeployMessage(message)
 		sigF = sigF,
 	})
 	if data.b ~= myBranch then
+		return
+	end
+	if localMode then
+		print(`[TypeTorch] deploy {tostring(data.i)} for {data.b} not applied: this Studio session runs the local payload`)
 		return
 	end
 	local signedOnly = requiresSignatures(myBranch)
@@ -1329,8 +1407,12 @@ local function reload(player: Player?)
 	if not allowed then
 		return { ok = false, error = why }
 	end
-	local head = headFor(myBranch)
+	-- 0.3.1: a Studio session on the local payload reloads a fresh clone of it.
+	local head = if localMode then localHead() else headFor(myBranch)
 	if not head then
+		if localMode then
+			return { ok = false, error = "no ServerStorage.TypeTorchDev.Payload to reload" }
+		end
 		return { ok = false, error = `branch {myBranch} has no {if requiresSignatures(myBranch) then "signed " else ""}artifact` }
 	end
 	local kind = serverType()
@@ -1486,8 +1568,8 @@ local function unpin(player: Player?, by: number?, assetId: number?)
 	Registry.logEvent({ action = "unpin", experiment = true, from = current.artifact.id, branch = myBranch, serverType = serverType(), by = by, job = game.JobId })
 	print(`[TypeTorch] experiment {current.artifact.id} ended by {by or "?"}`)
 	Registry.refreshStoredHead(myBranch, 3)
-	local head = headFor(myBranch)
-	if not head or typeof(head.assetId) ~= "number" or sameDeploy(current.artifact, head) then
+	local head = if localMode then localHead() else headFor(myBranch) -- 0.3.1: back to the local payload in Studio
+	if not head or (not localHeads[head] and (typeof(head.assetId) ~= "number" or sameDeploy(current.artifact, head))) then
 		setHold(false, nil) -- nothing else to run: just stop holding
 		return { ok = true, generation = current.name, artifactId = current.artifact.id }
 	end
@@ -1539,7 +1621,7 @@ local function requestReload(player: Player)
 	if not Access.isAdmin(player) then
 		return { ok = false, error = "only the owner or admins can reload" }
 	end
-	if not Registry.branchHead(myBranch) then
+	if not localMode and not Registry.branchHead(myBranch) then
 		return { ok = false, error = `branch {myBranch} has no artifact` }
 	end
 	reloadRequests:Fire(player)
@@ -1673,6 +1755,8 @@ local function status()
 		unverified = if current and current.unverified then true else nil,
 		signing = Signing.summary(),
 		rejected = rejectedInfo(),
+		-- 0.3.1: the running generation is the Studio local payload (ServerStorage.TypeTorchDev.Payload).
+		localPayload = if current and current.localPayload then true else nil,
 	}
 end
 
@@ -1862,6 +1946,9 @@ local function runCommand(player: Player, text: string)
 		if s.unverified then
 			pinned ..= ", UNVERIFIED boot (fail-safe)"
 		end
+		if s.localPayload then
+			pinned ..= ", local payload"
+		end
 		local signing = if s.signedOnly then `, signed only ({s.signing.mode}{if s.rejected.total > 0 then `, {s.rejected.total} rejected` else ""})` else ""
 		notice(player, `{s.serverType} server, branch {s.branch} ({s.channel or "?"}), {if s.generation then s.generation.name else "no generation"}{pinned}, up {s.uptime}s, kernel {s.kernelVersion}{if s.kernelBuild then `@{s.kernelBuild}` else ""}{signing}`)
 	elseif command == "branch" and argument then
@@ -1918,6 +2005,7 @@ end)
 local state, err = Registry.start(Constants.CONFIG_BOOT_WAIT)
 registryError = err
 Access.setConfig(state)
+localMode = localPayloadSource() ~= nil -- 0.3.1: Studio only (localPayloadSource checks IsStudio)
 myBranch = chooseBranch()
 
 task.spawn(function()
@@ -1981,7 +2069,7 @@ if serverType() ~= "studio" then
 end
 local signedBoot = requiresSignatures(myBranch)
 local keys = Signing.summary()
-print(`[TypeTorch] kernel {Constants.KERNEL_VERSION}{if KERNEL_BUILD then `@{KERNEL_BUILD}` else ""} (API {Constants.KERNEL_API}) on a {serverType()} server, branch {myBranch}, {if signedBoot then `signed deploys only (keys: {keys.mode})` else "unsigned deploys allowed"}`)
+print(`[TypeTorch] kernel {Constants.KERNEL_VERSION}{if KERNEL_BUILD then `@{KERNEL_BUILD}` else ""} (API {Constants.KERNEL_API}) on a {serverType()} server, branch {myBranch}, {if localMode then "local payload (ServerStorage.TypeTorchDev.Payload)" elseif signedBoot then `signed deploys only (keys: {keys.mode})` else "unsigned deploys allowed"}`)
 if signedBoot and not Signing.configured() then
 	warn(`[TypeTorch] this kernel has no KeyAssetId or FallbackPublicKey, so as a prod server it refuses every deploy. Run typetorch keys init (and keys init --fallback), then typetorch kernel deploy.`)
 end
@@ -2050,7 +2138,17 @@ local function bootSigned()
 end
 
 local bootHead = headFor(myBranch)
-if bootPin and (not bootHead or (bootHead.seq or 0) <= (bootPin.headSeq or 0)) then
+if localMode then
+	-- 0.3.1: Studio with ServerStorage.TypeTorchDev.Payload: mount a clone of it; deploys and the poll don't move this
+	-- session, Reload remounts the local copy.
+	local head = localHead()
+	if head then
+		swapTo(head, "boot")
+	end
+	if not current then
+		warn(`[TypeTorch] the local payload didn't start (see above); fix it, then Stop + Play`)
+	end
+elseif bootPin and (not bootHead or (bootHead.seq or 0) <= (bootPin.headSeq or 0)) then
 	appliedSeq = math.max(bootPin.headSeq or 0, if bootPin.branch == myBranch then bootPin.seq or 0 else 0)
 	local head = table.clone(bootPin)
 	head.headSeq = nil

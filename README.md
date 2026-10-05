@@ -41,9 +41,16 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   stamped by `typetorch kernel deploy` and read once at boot. `api:keys()` shows the trust state; `api:artifacts()`
   and `status()` carry `verified = {main, fallback}`. Format: `../plans/03-artifact.md` "Signed prod messages";
   rules: `../plans/01-kernel.md`.
+- Studio local payload (0.3.1): in Studio only, when `ServerStorage.TypeTorchDev.Payload` (a Model shaped like an
+  uploaded payload: `Server`, `Shared`, `Client`, `include`) exists, the kernel mounts a fresh clone of it instead of
+  calling LoadAsset, with the same mount checks (only Folders and ModuleScripts; dev channel). The artifact id is
+  `local-<HHMMSS UTC>`, the branch is `TypeTorchDev.Branch` or `dev`, and `status().localPayload` is `true`. Such a
+  session never follows the branch head (deploy messages, the poll); Reload remounts a fresh clone, and pins or branch
+  switches still load uploaded artifacts. Outside Studio the folder is ignored. The template's `studio.project.json`
+  syncs it with Rojo (see the template README, "Testing in Studio").
 - Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
-  `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`).
+  `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.
 

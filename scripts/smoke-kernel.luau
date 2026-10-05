@@ -1,6 +1,8 @@
 -- Smoke test for the whole server kernel (from kernel/): `lune run scripts/smoke-kernel.luau`, then again with
 -- `--fallback` (the key asset never loads), `--dev` (a reserved dev-branch server), `--vip` (a non-dev's private server),
--- `--bootstrap`, `--bootstrap-only` (BootstrapHeads), `--blind` (the boot fail-safe) and `--empty` (nothing usable).
+-- `--bootstrap`, `--bootstrap-only` (BootstrapHeads), `--blind` (the boot fail-safe), `--empty` (nothing usable) and
+-- `--studio-local` (0.3.1: a Studio session mounting ServerStorage.TypeTorchDev.Payload; every other mode has the same
+-- folder in ServerStorage and checks that a non-Studio server ignores it).
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore, ConfigService unavailable), then drives it:
 -- signed / unsigned / dev-channel / replayed deploy messages, a payload holding a Script (S-L4), a payload that fails to
@@ -424,7 +426,7 @@ local services = {
 	LogService = { MessageOut = signal() },
 	RunService = {
 		IsStudio = function()
-			return false
+			return table.find(process.args, "--studio-local") ~= nil
 		end,
 	},
 	Stats = {
@@ -647,6 +649,17 @@ addAsset(1004, payload("ddddddd-444444", "prod"))
 addAsset(1005, payload("eeeeeee-555555", "prod", true))
 addAsset(1006, payload("fffffff-666666", "prod"), 2)
 
+-- 0.3.1: ServerStorage.TypeTorchDev.Payload, as studio.project.json syncs it (no ArtifactId or Channel attribute). Only
+-- `--studio-local` runs in Studio; in every other mode the kernel must ignore it.
+local STUDIO_MODE = table.find(process.args, "--studio-local") ~= nil
+local devFolder = newInstance("Folder", "TypeTorchDev")
+devFolder.Parent = services.ServerStorage
+local localSource = payload("unused", nil)()
+localSource:SetAttribute("ArtifactId", nil)
+localSource:SetAttribute("Commit", nil)
+localSource.Name = "Payload"
+localSource.Parent = devFolder
+
 -- Signed messages ----------------------------------------------------------------------------------------------------
 
 local SIGS = serde.decode("json", fs.readFile("scripts/smoke-signatures.json"))
@@ -725,6 +738,9 @@ Constants.STOP_DEADLINE = 0.3
 if BLIND_MODE then
 	Constants.POLL_SECONDS = 0.3 -- the forged newer head must meet several polls
 end
+if STUDIO_MODE then
+	Constants.POLL_SECONDS = 0.2 -- a newer stored dev head must meet several polls (and be ignored)
+end
 local Signing = requireInstance(kernelFolder.Signing)
 
 local function waitFor(what: string, condition: () -> boolean, timeout: number?): boolean
@@ -763,7 +779,7 @@ end
 local function finish()
 	check("no kernel or script errors", #kernelErrors == 0 and #scriptErrors == 0)
 	for _, line in output do
-		if line.kind == "warn" and string.find(line.text, "swap failed", 1, true) and not string.find(line.text, "eeeeeee", 1, true) and not string.find(line.text, "1006", 1, true) and not string.find(line.text, "ccccccc", 1, true) then
+		if line.kind == "warn" and string.find(line.text, "swap failed", 1, true) and not string.find(line.text, "eeeeeee", 1, true) and not string.find(line.text, "1006", 1, true) and not string.find(line.text, "ccccccc", 1, true) and not string.find(line.text, "Sneaky", 1, true) then
 			check(`unexpected: {line.text}`, false)
 		end
 	end
@@ -780,7 +796,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" else "public server"
+	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -884,6 +900,43 @@ if EMPTY_MODE then
 	finish()
 end
 
+if STUDIO_MODE then
+	-- 0.3.1: Studio with ServerStorage.TypeTorchDev.Payload: a clone of it boots (not the stored dev head), on branch
+	-- "dev", dev channel; deploys and the poll don't move it; Reload remounts a fresh clone; the same mount checks apply.
+	local function isLocalId(id): boolean
+		return typeof(id) == "string" and string.sub(id, 1, 6) == "local-"
+	end
+	check("studio: boots the local payload", waitFor("boot", function()
+		return isLocalId(running())
+	end))
+	local s0 = status()
+	check("studio: localPayload, studio server, branch dev, dev channel, no asset id", s0.localPayload == true and s0.serverType == "studio" and s0.branch == "dev" and s0.channel == "dev" and s0.generation.artifact.channel == "dev" and s0.generation.artifact.assetId == nil and s0.signedOnly == false)
+	check("studio: the source stays put (a clone was mounted)", localSource.Parent == devFolder and localSource:FindFirstChild("Server") ~= nil and localSource:FindFirstChild("Client") ~= nil and localSource:GetAttribute("ArtifactId") == nil and #SMOKE.boots == 1)
+	publish("TypeTorch/deploy", { b = "dev", a = 1002, i = "bbbbbbb-222222", s = 20, c = "bbbbbbb", ch = "dev", t = nowMs() })
+	task.wait(0.8) -- several polls, with a newer stored dev head
+	check("studio: a deploy message and the poll don't move it", isLocalId(running()) and #SMOKE.boots == 1 and said("not applied: this Studio session runs the local payload"))
+	local owner = newInstance("Player", "Owner")
+	owner.UserId = 1
+	local first = status().generation.name
+	local reloaded = SMOKE.kernel:reload(owner)
+	check("studio: Reload remounts a fresh clone", reloaded.ok == true and isLocalId(running()) and status().generation.name ~= first and #SMOKE.boots == 2 and #SMOKE.stops == 1 and localSource.Parent == devFolder)
+	local sneaky = newInstance("Script", "Sneaky")
+	sneaky.Parent = localSource.Shared
+	local before = status().generation.name
+	local refused = SMOKE.kernel:reload(owner)
+	check("studio: a local payload holding a Script is refused at mount", refused.ok == false and string.find(refused.error or "", "Folders and ModuleScripts", 1, true) ~= nil and status().generation.name == before)
+	sneaky:Destroy()
+	local pinned = SMOKE.kernel:pinArtifact(owner, 1002)
+	check("studio: an uploaded artifact can still be pinned", pinned.ok == true and running() == "bbbbbbb-222222" and status().localPayload == nil)
+	local back = SMOKE.kernel:reload(owner)
+	check("studio: Reload goes back to the local payload", back.ok == true and isLocalId(running()) and status().localPayload == true)
+	localSource.Parent = nil
+	local missing = SMOKE.kernel:reload(owner)
+	check("studio: Reload without a source fails cleanly", missing.ok == false and string.find(missing.error or "", "TypeTorchDev.Payload", 1, true) ~= nil and isLocalId(running()))
+	localSource.Parent = devFolder
+	finish()
+end
+
 check("kernel booted the signed head from the durable copy (not the forged MemoryStore head)", waitFor("boot", function()
 	return running() == "aaaaaaa-111111"
 end))
@@ -897,6 +950,7 @@ end
 local s = status()
 check("api.kernelBuild", SMOKE.kernel.kernelBuild == "abc1234")
 check("status: appliedSeq 10", s.appliedSeq == 10)
+check("outside Studio, ServerStorage.TypeTorchDev.Payload is ignored", s.localPayload == nil and s.serverType == "public" and localSource.Parent == devFolder)
 
 if FALLBACK_MODE then
 	-- The key asset never loaded: sigF decides, sig alone is refused, and the badge shows the fallback only.
@@ -914,7 +968,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.0")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.1")
 check("status: running artifact verified main + fallback", s.generation.artifact.verified and s.generation.artifact.verified.main and s.generation.artifact.verified.fallback)
 
 -- Unsigned deploy: refused.
