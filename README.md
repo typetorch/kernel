@@ -60,6 +60,9 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
     `src/server/Reports.luau`.
   - Client generation reports with one retry, `api:onClose(fn)` from the kernel's BindToClose, and every swap game
     code starts runs on a kernel thread. `status()` adds `health`, `failed`, `heartbeat` and `clients`.
+  - Messages across a swap: with a `ProtocolHash` attribute on the payload, client events of the previous artifact
+    of the same hash reach the new generation; the resync names the dropped artifact and reaches only that client
+    generation (`onResync`).
 - Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
