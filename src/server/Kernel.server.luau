@@ -1013,8 +1013,8 @@ local function healthState(): string
 		return "unverified"
 	end
 	local health = current.health
-	if failing ~= nil or health.failed or health.errors >= Constants.HEALTH_ERRORS then
-		return "degraded"
+	if failing ~= nil or health.failed or health.startFailed or health.errors >= Constants.HEALTH_ERRORS then
+		return "degraded" -- (a failed onStart after the window too: that module isn't running)
 	end
 	return "ok"
 end
