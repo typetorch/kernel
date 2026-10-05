@@ -26,7 +26,7 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   `api:experiment()` and `status().experiment` report it. Remote pins arrive on topic `TypeTorch/pin` (`{j?, pct?,
   a, b, by, t, unpin?}`, by JobId list or by `jobBucket(JobId) < pct`), and deploy messages may carry `ro` (1-99):
   only servers whose bucket (djb2 of the JobId, mod 100) is below it swap; the others keep their artifact, and new
-  servers boot the head. In 0.2.x both topics are unsigned (see `../plans/12-audit.md`, S-C2).
+  servers boot the head. On dev servers both topics are unsigned; prod servers need them signed (below).
 - Signed prod deploys (0.3.0): prod servers (every public server, and private/reserved servers on a prod branch)
   take a deploy message, a stored head or a remote pin only with a valid Ed25519 signature (`sig` from a key in the
   group-owned key asset's `PublicKeys` minus `RevokedKeys`; `sigF` from the baked `FallbackPublicKey` until the key
@@ -39,8 +39,7 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   unsigned.
   `KeyAssetId`, `FallbackPublicKey` and `BootstrapHeads` are attributes on `ServerScriptService.TypeTorchKernel`,
   stamped by `typetorch kernel deploy` and read once at boot. `api:keys()` shows the trust state; `api:artifacts()`
-  and `status()` carry `verified = {main, fallback}`. Format: `../plans/03-artifact.md` "Signed prod messages";
-  rules: `../plans/01-kernel.md`.
+  and `status()` carry `verified = {main, fallback}`. Setup and rules: [Prod signing](https://github.com/typetorch/docs/blob/main/guides/prod-signing.md).
 - Studio local payload (0.3.1): in Studio only, when `ServerStorage.TypeTorchDev.Payload` (a Model shaped like an
   uploaded payload: `Server`, `Shared`, `Client`, `include`) exists, the kernel mounts a fresh clone of it instead of
   calling LoadAsset, with the same mount checks (only Folders and ModuleScripts; dev channel). The artifact id is
@@ -56,4 +55,4 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
 
 Contract with payloads: `Server.boot.boot(kernel)` / `Client.boot.boot(kernel)` return a stop function (0.2.2 passes
 it what replaces the generation). The typed view
-of `kernel` is `ServerKernel` / `ClientKernel` in `@typetorch/framework`. Design: `../plans/01-kernel.md`.
+of `kernel` is `ServerKernel` / `ClientKernel` in `@typetorch/framework`. Guides: [typetorch/docs](https://github.com/typetorch/docs).
