@@ -1398,8 +1398,8 @@ if HEALTH_MODE then
 	end))
 	local booted, bootedTtl = reportOf(5)
 	check(
-		"P-O1: report fields {s,b,a,j,r,d,t,g,k,p}, TTL 7 days",
-		booted ~= nil and booted.s == 5 and booted.b == "dev" and booted.a == "ddddddd-444444" and booted.j == JOB and typeof(booted.t) == "number" and booted.g == 1 and booted.k == Constants.KERNEL_VERSION and booted.p == 0 and typeof(booted.d) == "number" and booted.e == nil and bootedTtl == 7 * 24 * 3600
+		"P-O1: report fields {s,b,a,j,r,d,t,g,k,p}, TTL = Constants.REPORTS_TTL (1 day)",
+		booted ~= nil and booted.s == 5 and booted.b == "dev" and booted.a == "ddddddd-444444" and booted.j == JOB and typeof(booted.t) == "number" and booted.g == 1 and booted.k == Constants.KERNEL_VERSION and booted.p == 0 and typeof(booted.d) == "number" and booted.e == nil and bootedTtl == Constants.REPORTS_TTL and Constants.REPORTS_TTL == 24 * 3600
 	)
 	check("P-O1: the kernel writes the heartbeat", waitFor("heartbeat", function()
 		return heartbeatOf() ~= nil

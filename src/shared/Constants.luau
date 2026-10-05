@@ -65,7 +65,7 @@ return {
 	HEARTBEAT_MIN_GAP = 10,
 	-- Reports: MemoryStore SortedMap REPORTS_MAP, key = "<seq, 10 digits>/<JobId>", one per deploy outcome per server.
 	REPORTS_MAP = "TypeTorchReports",
-	REPORTS_TTL = 7 * 24 * 3600,
+	REPORTS_TTL = 24 * 3600, -- 1 day: reports are read minutes after a deploy; 7 days could fill the experience's MemoryStore quota (shared with the game) at low CCU
 	-- A failed heartbeat or report write is retried after these delays (seconds), then dropped.
 	WRITE_RETRY_DELAYS = { 1, 3, 9 },
 	-- Old client trees stay this long after a swap so clients can stop their old generation first.
