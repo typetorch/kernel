@@ -5,7 +5,8 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
 
 - `src/server/` → `ServerScriptService.TypeTorchKernel`: boot, branch choice, LoadAsset + side-by-side mounting,
   swaps with soft + hard stop, automatic rollback, registry (ConfigService + in-game DataStore), dev access,
-  stable transport, logs, `/tt` chat commands.
+  stable transport, logs, heartbeat and deploy reports (`Reports`), `/tt` chat commands. A place project that maps
+  these files one by one must map `Reports` too (0.3.2; without it the kernel boots without reports).
 - `src/shared/` → `ReplicatedStorage.TypeTorchKernelShared`: constants, client API, ClientEntry template.
 - `src/client/` → `ReplicatedFirst.TypeTorchKernelClient`: follows `ActiveGeneration`, swaps client generations.
 - `place.project.json`: the whole place (kernel + baseplate + spawn, HTTP on). `rojo build place.project.json -o
@@ -47,9 +48,22 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   session never follows the branch head (deploy messages, the poll); Reload remounts a fresh clone, and pins or branch
   switches still load uploaded artifacts. Outside Studio the folder is ignored. The template's `studio.project.json`
   syncs it with Rojo (see the template README, "Testing in Studio").
+- Bad deploys are safe (0.3.2):
+  - **Health window:** a failed `onStart` (the framework reports it with `api:reportError`) or 3 errors from the new
+    generation's own scripts within 30 s of ready roll the server back. Errors from outside the generation never
+    count.
+  - **Last known good:** this server's history, then the branch's deployments (prod: only verified ones, or heads
+    this server already ran), skipping artifacts that failed here. Also at boot when the head fails to start.
+  - **Heartbeat and reports:** the kernel writes the server list (MemoryStore SortedMap `TypeTorchServers`, every
+    60 s, also when the game is broken) and one report per deploy outcome (`TypeTorchReports`, key
+    `<seq, 10 digits>/<JobId>`), so `typetorch servers` and `deploy --wait` work. The contract is in
+    `src/server/Reports.luau`.
+  - Client generation reports with one retry, `api:onClose(fn)` from the kernel's BindToClose, and every swap game
+    code starts runs on a kernel thread. `status()` adds `health`, `failed`, `heartbeat` and `clients`.
 - Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
-  `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`).
+  `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
+  `--health-prod`, `--lkg-boot`, `--client`).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.
 
