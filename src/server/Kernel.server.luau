@@ -2832,6 +2832,8 @@ local function status()
 		-- 0.3.8 (plans/20): the signed settings record: { state, seq?, at?, age?, verifiedBy?, fields, reads, error?,
 		-- errorAt?, refused? } (never a value: it holds tokens).
 		settings = Registry.settings.status(),
+		-- 0.3.8: detached jobs (api:runDetached): { running, started, finished, failed, slow, max, oldest?, lastError? }.
+		detached = Api.detachedStatus(),
 		memoryMb = Stats:GetTotalMemoryUsageMb(),
 		luaHeapKb = collectgarbage("count"),
 		appliedSeq = appliedSeq,
@@ -3062,6 +3064,10 @@ Api.init({
 	settingsStatus = function()
 		return Registry.settings.status()
 	end,
+	-- 0.3.8: detached jobs run on kernel threads; their errors never count toward a generation's health.
+	onKernel = spawnOnKernel,
+	logError = logError,
+	Constants = Constants,
 	Access = Access,
 	Transport = Transport,
 	Logs = Logs,

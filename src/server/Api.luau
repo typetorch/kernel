@@ -8,6 +8,8 @@ local Api = {}
 
 local persistStore: { [string]: any } = {}
 local entries: { [Script]: any } = {}
+-- 0.3.8: detached jobs (api:runDetached): counters and the running ones ({ generation name, started }), server-wide.
+local detached = { running = 0, started = 0, finished = 0, failed = 0, slow = 0, nextId = 0, jobs = {}, lastError = nil }
 local services = nil -- set by the kernel: { Access, Transport, Logs, status, branchList, artifacts, reload, rollback,
 -- switchBranch, pinArtifact, newServer, requestReload, unpin, experiment, KERNEL_BUILD, keys, reportError, fleetStatus,
 -- addReportListener, deployReports, accessCode }. 0.3.2: reload, rollback, switchBranch, pinArtifact and unpin run
@@ -23,6 +25,73 @@ end
 
 function Api.unregister(entry: Script)
 	entries[entry] = nil
+end
+
+-- 0.3.8: runs fn() on a KERNEL thread (services.onKernel), so stopping or hard-stopping `generation` never kills it:
+-- the fix for a library call (a ProfileStore load, save or release) that a swap's hard stop would cut off halfway.
+-- The job keeps the old generation's closures alive until it ends. done(ok, result) runs on the kernel thread, only
+-- while `generation` is still registered (a result for a stopped generation is dropped: the job writes what must
+-- survive into persist itself). Errors go to the log ring (never to the generation's health). Returns the job's id.
+function Api.runDetached(generation, fn, done)
+	if typeof(fn) ~= "function" then
+		error("runDetached: pass a function", 3)
+	end
+	if detached.running >= services.Constants.DETACHED_MAX then
+		error(`runDetached: {detached.running} detached jobs already run on this server (the cap is {services.Constants.DETACHED_MAX}); wait for some to finish`, 3)
+	end
+	detached.running += 1
+	detached.started += 1
+	detached.nextId += 1
+	local id = detached.nextId
+	local job = { generation = generation.name, started = os.clock() }
+	detached.jobs[id] = job
+	services.onKernel(function()
+		task.delay(services.Constants.DETACHED_SLOW, function()
+			if detached.jobs[id] == job then
+				detached.slow += 1
+				warn(`[TypeTorch] detached job #{id} of {job.generation} still runs after {services.Constants.DETACHED_SLOW} s`)
+			end
+		end)
+		local result = table.pack(pcall(fn))
+		detached.jobs[id] = nil
+		detached.running -= 1
+		detached.finished += 1
+		if not result[1] then
+			detached.failed += 1
+			local text = string.sub(tostring(result[2]), 1, 500)
+			detached.lastError = { generation = job.generation, error = text, at = os.time() }
+			services.logError(`[TypeTorch] detached job #{id} of {job.generation} failed: {text}`)
+		end
+		if typeof(done) == "function" and generation.entry and entries[generation.entry] == generation then
+			local ok, err = pcall(done, result[1], result[2])
+			if not ok then
+				warn(`[TypeTorch] detached job #{id}: its callback threw: {err}`)
+			end
+		end
+	end)
+	return id
+end
+
+-- 0.3.8: { running, started, finished, failed, slow, max, oldest? (seconds the longest running job has run),
+-- lastError? { generation, error, at } } (status().detached).
+function Api.detachedStatus()
+	local oldest = nil
+	for _, job in detached.jobs do
+		local age = os.clock() - job.started
+		if oldest == nil or age > oldest then
+			oldest = age
+		end
+	end
+	return {
+		running = detached.running,
+		started = detached.started,
+		finished = detached.finished,
+		failed = detached.failed,
+		slow = detached.slow,
+		max = services.Constants.DETACHED_MAX,
+		oldest = if oldest then math.floor(oldest) else nil,
+		lastError = if detached.lastError then table.clone(detached.lastError) else nil,
+	}
 end
 
 function Api.forEntry(entry: Script)
@@ -240,6 +309,12 @@ function Api.forEntry(entry: Script)
 		function api:onRollCall(fn)
 			Messaging.onRollCall(generation, fn)
 		end
+	end
+
+	-- Kernel 0.3.8 (additive): fn() on a kernel thread that this generation's stop can't kill (see Api.runDetached).
+	-- done(ok, result) runs while this generation still runs. Errors at once past DETACHED_MAX running jobs.
+	function api:runDetached(fn, done)
+		return Api.runDetached(generation, fn, done)
 	end
 
 	-- Entry-only (not on the TS interface).

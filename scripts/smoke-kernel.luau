@@ -18,7 +18,8 @@
 -- roll call topic), `--messaging-studio` (loopback only), `--messaging-missing`, `--client-boot` and `--client-own` (the
 -- game's loading screen and the ClientReady signal; `--client` and `--hold` check the new attributes too), and
 -- `--settings` / `--settings-missing` (plans/20: the signed settings record replacing ConfigService; `--fleet`,
--- `--switch`, `--access` and `--fallback` read their settings from it too).
+-- `--switch`, `--access` and `--fallback` read their settings from it too), and `--detached` (api:runDetached: a job
+-- outlives its generation's hard stop; errors, the cap and the slow-job warning).
 -- Every mode also checks that no swap ran on a thread its own stopped generation owned.
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore; 0.3.8: no ConfigService at all), then drives it:
@@ -1053,6 +1054,9 @@ local MODES38 = {
 	-- `--settings-missing` (a place project without Settings.luau boots with the defaults).
 	settings = table.find(process.args, "--settings") ~= nil,
 	settingsMissing = table.find(process.args, "--settings-missing") ~= nil,
+	-- `--detached` (api:runDetached): a job outlives its generation's hard stop and finishes; its callback is dropped
+	-- for a stopped generation; errors are logged with the generation and counted; the cap and the slow-job warning.
+	detached = table.find(process.args, "--detached") ~= nil,
 }
 -- 0.3.8 loading screens (plans/19 item 13), client side: `--client-boot` (the game's BootScreen replaces the kernel's
 -- "Starting..." until the first client generation runs and the server's hold ends), `--client-own` (KernelScreen =
@@ -1867,7 +1871,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if MODES38.detached then "--detached" elseif MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -3631,6 +3635,93 @@ if MODES38.settingsMissing then
 		return SMOKE.kernel ~= nil and running() ~= nil
 	end) and said("TypeTorchKernel.Settings is missing"))
 	check("settings-missing: the defaults; status says why; api:settings() is nil", status().settings.state == "missing" and string.find(status().settings.error or "", "Settings module", 1, true) ~= nil and SMOKE.kernel:settings() == nil and status().branch == "prod")
+	finish()
+end
+
+if MODES38.detached then
+	Constants.DETACHED_SLOW = 0.4
+	check("detached: boots", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() == "aaaaaaa-111111"
+	end))
+	check("detached: the API has runDetached; status().detached starts at zero", type(SMOKE.kernel.runDetached) == "function" and status().detached.running == 0 and status().detached.max == 256)
+	-- Generation B starts a thread of its own and a detached job, both 1.5 s long, then B is swapped out (hard stop).
+	local seen = {}
+	SMOKE.behave["bbbbbbb-222222"] = function(kernel)
+		SMOKE.task.spawn(function()
+			SMOKE.task.wait(1.5)
+			seen.owned = true
+		end)
+		seen.id = kernel:runDetached(function()
+			SMOKE.task.wait(1.5)
+			kernel:persist("detached-save", function()
+				return {}
+			end).saved = true
+			seen.ran = true
+			return "saved"
+		end, function(ok, result)
+			seen.callback = { ok, result }
+		end)
+	end
+	publish("TypeTorch/deploy", deployMessage("M2", FIELDS.M2, { "sig" }))
+	check("detached: B runs and started its job (returns an id)", waitFor("B", function()
+		return running() == "bbbbbbb-222222" and seen.id ~= nil
+	end) and seen.id == 1 and status().detached.running == 1)
+	publish("TypeTorch/deploy", deployMessage("M6", FIELDS.M6, { "sig" }))
+	check("detached: swapped to F; B's job still runs after B's hard stop", waitFor("F", function()
+		return running() == "fffffff-666666"
+	end) and status().detached.running == 1 and seen.ran == nil)
+	check("detached: the job finished (its persist write is there); B's own thread died with B", waitFor("job", function()
+		return seen.ran == true
+	end, 3) and SMOKE.kernel:persist("detached-save", function()
+		return {}
+	end).saved == true and seen.owned == nil)
+	check("detached: B's callback was dropped (B stopped); counted as finished", seen.callback == nil and status().detached.running == 0 and status().detached.finished == 1 and status().detached.failed == 0)
+	-- The running generation: results and errors reach done(ok, result); errors are logged with the generation.
+	local api = SMOKE.kernel
+	api:runDetached(function()
+		return 42
+	end, function(ok, value)
+		seen.answer = { ok, value }
+	end)
+	check("detached: done(true, result) while the generation runs", waitFor("answer", function()
+		return seen.answer ~= nil
+	end) and seen.answer[1] == true and seen.answer[2] == 42)
+	api:runDetached(function()
+		error("profile store down", 0)
+	end, function(ok, err)
+		seen.failure = { ok, err }
+	end)
+	local lastError = nil
+	check("detached: an error goes to done(false, err), the log (with the generation) and status().detached", waitFor("failure", function()
+		return seen.failure ~= nil
+	end) and seen.failure[1] == false and seen.failure[2] == "profile store down" and said("detached job #3 of fffffff-666666#") and said("failed: profile store down") and status().detached.failed == 1 and (function()
+		lastError = status().detached.lastError
+		return lastError ~= nil and string.sub(lastError.generation, 1, 14) == "fffffff-666666" and lastError.error == "profile store down"
+	end)())
+	check("detached: a job's error never counts toward the generation's health", status().health == nil or (status().health.errors or 0) == 0)
+	-- Slow jobs are logged once; past the cap runDetached errors at once.
+	Constants.DETACHED_MAX = 2
+	api:runDetached(function()
+		SMOKE.task.wait(0.8)
+	end)
+	api:runDetached(function()
+		SMOKE.task.wait(0.8)
+	end)
+	local okCap, capError = pcall(function()
+		api:runDetached(function() end)
+	end)
+	check("detached: past the cap it errors at once, naming the cap", okCap == false and string.find(tostring(capError), "the cap is 2", 1, true) ~= nil and status().detached.running == 2)
+	local okArg, argError = pcall(function()
+		api:runDetached("not a function")
+	end)
+	check("detached: a non-function is refused", okArg == false and string.find(tostring(argError), "pass a function", 1, true) ~= nil)
+	check("detached: a job past DETACHED_SLOW is logged once (status: slow, oldest; B's job was slow too)", waitFor("slow", function()
+		return status().detached.slow == 3
+	end, 2) and said("still runs after 0.4 s") and (status().detached.oldest or -1) >= 0)
+	check("detached: both finish; running back to 0", waitFor("drained", function()
+		return status().detached.running == 0
+	end, 3) and status().detached.started == 5 and status().detached.finished == 5)
+	Constants.DETACHED_MAX = 256
 	finish()
 end
 

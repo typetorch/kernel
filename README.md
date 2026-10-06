@@ -153,14 +153,21 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   first client generation runs and the hold ends, at most 60 s) and `TypeTorchKernelScreen = false` (the game draws its
   own) are copied onto that script by the server before anyone joins; until then the kernel's "Starting..." stays off.
   Moves ("Reconnecting...") and later holds always show the kernel's screen.
+- Detached jobs (0.3.8): `api:runDetached(fn, done?)` runs `fn()` on a kernel thread, so a generation's stop (and its
+  hard stop) never cuts it off: for library calls that must not stop halfway (a ProfileStore load, save or release).
+  `done(ok, result)` runs only while the calling generation still runs (a stopped generation's result is dropped: the
+  job writes what must survive into `persist`). At most `DETACHED_MAX` (256) run at once (then it errors); one running
+  past `DETACHED_SLOW` (60 s) is logged once; errors go to the log with the generation's name and never count toward
+  its health window; `status().detached` = `{ running, started, finished, failed, slow, max, oldest?, lastError? }`. A
+  job keeps the old generation's closures (and what they reference) alive until it ends.
 - Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
   `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, `--durable`, 0.3.6's `--hold`, `--hold-optout`,
   `--peers`, `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
   `--kernel-crash`, `--heads-cap`, `--access`, 0.3.7's `--health-config` and `--health-missing`, 0.3.8's
-  `--messaging`, `--messaging-studio`, `--messaging-missing`, `--client-boot`, `--client-own`, `--settings` and
-  `--settings-missing`, and `--boot-budget`, which runs 25 boot scenarios with simulated slow or failing dependencies and
+  `--messaging`, `--messaging-studio`, `--messaging-missing`, `--client-boot`, `--client-own`, `--settings`,
+  `--settings-missing` and `--detached`, and `--boot-budget`, which runs 25 boot scenarios with simulated slow or failing dependencies and
   checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.

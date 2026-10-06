@@ -21,6 +21,11 @@ return {
 	SETTINGS_PING_GAP = 5,
 	SETTINGS_BODY_MAX = 32768,
 	SETTINGS_GAME_MAX = 16384,
+	-- 0.3.8: DETACHED JOBS (api:runDetached, Api.luau): game code run on a kernel thread, so a generation's hard stop
+	-- can't cut it off (a ProfileStore load, save or release). At most DETACHED_MAX run at once per server; one that
+	-- runs longer than DETACHED_SLOW seconds is logged once.
+	DETACHED_MAX = 256,
+	DETACHED_SLOW = 60,
 	-- Fast path for deploys; the poll below is the backup (MessagingService delivery is best-effort).
 	DEPLOY_TOPIC = "TypeTorch/deploy",
 	-- 0.2.3: remote experiment pins (A/B) from Manage > Servers: { j?, pct?, a?, b, by, t, unpin? }.
