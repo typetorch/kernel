@@ -7,7 +7,7 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.3.4",
+	KERNEL_VERSION = "0.3.5",
 
 	-- Interim registry (until the backend exists): a DataStore written by the CLI through Open Cloud.
 	DATASTORE = "TypeTorch",
@@ -46,6 +46,9 @@ return {
 	-- 0.3 (P-K2): a deploy whose payload failed to LOAD is retried after these delays (seconds), then reported.
 	LOAD_RETRY_DELAYS = { 5, 15, 60, 60, 60 },
 	POLL_SECONDS = 60,
+	-- 0.3.5 (durable heads): the DataStore copy of the heads is read at most this often by the sync loop (the CLI writes
+	-- that copy after every deploy, so a deploy no running server heard is found). One GetAsync per server per minute.
+	HEADS_DURABLE_SECONDS = 55,
 	-- Deployment history entries kept in the in-game DataStore key "deployments" (dev menu artifact picker).
 	DEPLOYMENTS_KEPT = 100,
 

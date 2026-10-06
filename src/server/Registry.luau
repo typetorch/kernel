@@ -310,12 +310,22 @@ end
 -- All heads live in ONE key, { [branch] = head }, so a read is one request and listing branches needs no ListKeysAsync
 -- (its budget is a few calls per minute per server; the dev menu used to hit it on every Branch tab load):
 --   * MemoryStore HashMap "TypeTorch", key "heads": the fast copy every server polls (universe-wide quota, cheap);
---   * DataStore "TypeTorch", key "heads": the durable copy (MemoryStore entries expire), read when MemoryStore has
---     nothing or fails. Kernel 0.2.0's per-branch "head/<branch>" keys are read once at boot as a migration fallback.
+--   * DataStore "TypeTorch", key "heads": the durable copy (MemoryStore entries expire), read at boot, when MemoryStore
+--     fails or holds an untrusted prod head, and (0.3.5) about every HEADS_DURABLE_SECONDS anyway. Kernel 0.2.0's
+--     per-branch "head/<branch>" keys are read once at boot as a migration fallback.
 -- Writes: the server whose MemoryStore update wins (seq newer than what's stored) also writes the DataStore copy, so a
 -- deploy costs one durable write however many servers hear the message.
+-- 0.3.5 (durable heads): the CLI writes the DataStore copy itself after every deploy message (it can't write
+-- MemoryStore, and the registry needs a scope API keys can't get), so a deploy made while NO server of that branch ran
+-- is no longer lost: new servers boot it (the boot reads both copies) and running ones find it on the periodic durable
+-- read and follow it like a polled head (prod: the same signature checks). When the durable copy holds a head that
+-- replaces MemoryStore's, the server writes MemoryStore back (one UpdateAsync with the same `replaces` rule, so only the
+-- first server's write changes anything) and the fast copy catches up. Budget: one DataStore GetAsync per server per
+-- HEADS_DURABLE_SECONDS (55 s, so one per 60 s sync tick) for the periodic read, out of a server's 60 + 10 x players
+-- reads a minute; the MemoryStore write-back only while the fast copy is behind.
 local storedHeads: { [string]: any } = {}
 local headsReadAt = -math.huge
+local durableReadAt = -math.huge -- 0.3.5: the last DataStore read of `heads` (the periodic one is rate-limited)
 local HEADS_KEY = "heads"
 local HEADS_TTL = 45 * 24 * 3600 -- MemoryStore maximum
 
@@ -411,7 +421,47 @@ local function needsDurable(heads: any): boolean
 	return false
 end
 
--- Re-reads all heads (yields): MemoryStore, else DataStore. At most once per `maxAge` seconds (default 15).
+-- 0.3.5: the heads in `durable` that replace MemoryStore's (`memory` as read; nil = no key there), or nil.
+local function newerThanMemory(durable: any, memory: any): { [string]: any }?
+	if typeof(durable) ~= "table" then
+		return nil
+	end
+	local found = nil
+	for branch, head in durable do
+		if typeof(branch) == "string" and isHead(head) then
+			local fast = if typeof(memory) == "table" then memory[branch] else nil
+			if replaces(fast, head, branch) then
+				found = found or {}
+				found[branch] = head
+			end
+		end
+	end
+	return found
+end
+
+-- 0.3.5: writes durable heads the MemoryStore copy lacks back into it (non-blocking). The transform re-checks `replaces`
+-- against what MemoryStore holds then, so when several servers notice at once only the first write changes anything.
+local function writeMemoryBack(newer: { [string]: any })
+	task.spawn(function()
+		pcall(function()
+			getMemory():UpdateAsync(HEADS_KEY, function(existing)
+				local heads = if typeof(existing) == "table" then existing else {}
+				local changed = false
+				for branch, head in newer do
+					if replaces(heads[branch], head, branch) then
+						heads[branch] = head
+						changed = true
+					end
+				end
+				return if changed then heads else nil
+			end, HEADS_TTL)
+		end)
+	end)
+end
+
+-- Re-reads all heads (yields): MemoryStore, then the DataStore copy when MemoryStore failed or holds an untrusted prod
+-- head, and (0.3.5) at most every HEADS_DURABLE_SECONDS anyway (the CLI writes only that copy). At most once per
+-- `maxAge` seconds (default 15).
 function Registry.refreshHeads(maxAge: number?)
 	if os.clock() - headsReadAt < (maxAge or 15) then
 		return
@@ -420,18 +470,26 @@ function Registry.refreshHeads(maxAge: number?)
 	local ok, value = pcall(function()
 		return getMemory():GetAsync(HEADS_KEY)
 	end)
-	if ok and typeof(value) == "table" then
-		local durableToo = needsDurable(value)
-		mergeHeads(storedHeads, value)
-		if not durableToo then
-			return
-		end
+	local memory = if ok and typeof(value) == "table" then value else nil
+	if memory then
+		mergeHeads(storedHeads, memory)
 	end
+	local due = os.clock() - durableReadAt >= Constants.HEADS_DURABLE_SECONDS
+	if ok and not due and not needsDurable(memory) then
+		return
+	end
+	durableReadAt = os.clock()
 	local durableOk, durable = pcall(function()
 		return getStore():GetAsync(HEADS_KEY)
 	end)
 	if durableOk then
 		mergeHeads(storedHeads, durable)
+		-- The fast copy is behind (a deploy nobody heard, or MemoryStore expired): catch it up. Not when MemoryStore just
+		-- failed (its state is unknown).
+		local newer = if ok then newerThanMemory(durable, memory) else nil
+		if newer then
+			writeMemoryBack(newer)
+		end
 	end
 end
 
@@ -439,18 +497,30 @@ end
 -- looks at each copy's own head of the branch). Boot waits until `headsSettled()` (MemoryStore answered with nothing
 -- that needs the durable copy, or the DataStore copy answered), at most BOOT_READS_WAIT; slow reads keep going and merge
 -- when they land. Later refreshes (the sync loop) skip while these are recent.
-local bootMemory = { done = false, ok = false, value = nil }
+local bootMemory = { done = false, ok = false, answered = false, value = nil }
 local bootDurable = { done = false, ok = false, value = nil }
+-- 0.3.5: once both boot reads answered, durable heads MemoryStore lacks are written back (the deploys nobody heard).
+local function catchUpAfterBoot()
+	if not (bootMemory.done and bootDurable.done and bootMemory.answered and bootDurable.ok) then
+		return
+	end
+	local newer = newerThanMemory(bootDurable.value, if bootMemory.ok then bootMemory.value else nil)
+	if newer then
+		writeMemoryBack(newer)
+	end
+end
 function Registry.startBootReads()
 	headsReadAt = os.clock()
+	durableReadAt = os.clock()
 	task.spawn(function()
 		local ok, value = pcall(function()
 			return getMemory():GetAsync(HEADS_KEY)
 		end)
-		bootMemory.ok, bootMemory.value, bootMemory.done = ok and typeof(value) == "table", value, true
+		bootMemory.ok, bootMemory.answered, bootMemory.value, bootMemory.done = ok and typeof(value) == "table", ok, value, true
 		if bootMemory.ok then
 			mergeHeads(storedHeads, value)
 		end
+		catchUpAfterBoot()
 	end)
 	task.spawn(function()
 		local ok, value = pcall(function()
@@ -460,14 +530,15 @@ function Registry.startBootReads()
 		if bootDurable.ok then
 			mergeHeads(storedHeads, value)
 		end
+		catchUpAfterBoot()
 	end)
 end
 
+-- 0.3.5: the durable copy is waited for too (still within BOOT_READS_WAIT): the CLI writes only that copy, so it can
+-- hold a newer head than MemoryStore (a deploy no running server heard), and a new server should boot that head rather
+-- than the older one and swap a moment later. A DataStore read that fails or hangs doesn't hold the boot past the gate.
 function Registry.headsSettled(): boolean
-	if bootDurable.done then
-		return true
-	end
-	return bootMemory.done and bootMemory.ok and not needsDurable(bootMemory.value)
+	return bootDurable.done
 end
 
 -- Both boot reads are over (whatever they found).

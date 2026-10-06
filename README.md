@@ -78,6 +78,18 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   `/tt pin`; the server API has no owner path. Private and reserved servers keep the stored switch for devs. Reload and
   Rollback always work. `status().switched = {by, name, at, branch, artifact?}`, the fleet heartbeat's `b` is the
   branch, and each switch or load posts an info alert (`branch_switch`, `build_load`) and is printed and logged.
+- Durable heads (0.3.5): the CLI writes the DataStore `TypeTorch` key `heads` (and `deployments`) after every deploy
+  message, so a deploy made while no server of that branch ran is no longer lost. The boot waits for the DataStore copy
+  as well as MemoryStore (inside the 3 s boot gate) and boots the newer head; running servers read that copy about once
+  a minute (`HEADS_DURABLE_SECONDS` = 55, one GetAsync per server per 60 s sync tick, out of a server's 60 + 10 x
+  players DataStore reads a minute) and follow a newer head like a polled one (prod: the same signature rules). When
+  the DataStore copy is ahead of MemoryStore, the server writes MemoryStore back (one UpdateAsync with the same
+  `replaces` rule, so only the first server's write changes anything). Smoke: `--durable`.
+- Log noise (0.3.5): the engine's orange `ConfigService: Config value not found for key "TypeTorch".` (the registry is
+  optional and never written with an API key) is one info line in the kernel's log ring, `[TypeTorch] no ConfigService
+  registry (optional)` (the dev menu shows it dim); repeats are dropped, and `TypeTorchFleet` / `TypeTorchAnalytics`
+  get the same treatment. The game's own missing keys stay warnings. Roblox's own console still shows the engine's
+  line.
 - Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,

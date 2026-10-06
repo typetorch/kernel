@@ -6,7 +6,9 @@
 -- server: the health window, the last-known-good chain, fleet status and deploy reports, the busy-flag hazard, client
 -- reports, onClose, subscribe and private-read retries, revocations unknown), `--health-prod` (the same failures on a
 -- signed public server) and `--lkg-boot` (a prod head that fails to start at boot: the signed deployment history,
--- never an unsigned entry). Every mode also checks that no swap ran on a thread its own stopped generation owned.
+-- never an unsigned entry), and 0.3.5's `--durable` (deploys no running server heard: the CLI wrote only the DataStore
+-- copy; a new server boots it, a running one follows it within one durable read, MemoryStore is written back, and the
+-- DataStore read budget holds). Every mode also checks that no swap ran on a thread its own stopped generation owned.
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore, ConfigService unavailable), then drives it:
 -- signed / unsigned / dev-channel / replayed deploy messages, a payload holding a Script (S-L4), a payload that fails to
@@ -553,8 +555,9 @@ end
 
 local function keyValueStore()
 	local data = {}
-	local store = { data = data, failGets = {} } -- failGets[key] = n: the next n reads of key throw
+	local store = { data = data, failGets = {}, reads = {} } -- failGets[key] = n: the next n reads of key throw
 	function store:GetAsync(key)
+		self.reads[key] = (self.reads[key] or 0) + 1 -- 0.3.5 `--durable`: the read budget
 		simWait(if self.latencyName == "memory" then "memoryGet" elseif string.sub(tostring(key), 1, 8) == "private/" then "privateGet" else "datastoreGet")
 		if (self.failGets[key] or 0) > 0 then
 			self.failGets[key] -= 1
@@ -851,12 +854,14 @@ if SWITCH_MODE then
 	configValues.TypeTorch = { defaultBranch = "prod", members = { ["2"] = "admin", ["4"] = "owner" } }
 end
 local HEALTH_MODE = table.find(process.args, "--health") ~= nil
+-- `--durable` (0.3.5): a reserved dev server and deploys that only the DataStore copy holds (the CLI wrote it).
+local DURABLE_MODE = table.find(process.args, "--durable") ~= nil
 local HEALTH_PROD_MODE = table.find(process.args, "--health-prod") ~= nil
 local LKG_BOOT_MODE = table.find(process.args, "--lkg-boot") ~= nil
 if FLEET_MODE then
 	configValues.TypeTorchFleet = { url = "https://fleet.example.test/api/", token = FLEET_TOKEN }
 end
-if DEV_MODE or VIP_MODE or HEALTH_MODE or FLEET_MODE then
+if DEV_MODE or VIP_MODE or HEALTH_MODE or FLEET_MODE or DURABLE_MODE then
 	GAME_ROOT_PROPS.PrivateServerId = "ps-smoke"
 	GAME_ROOT_PROPS.PrivateServerOwnerId = if VIP_MODE then 777 else 0
 	dataStore.data["private/ps-smoke"] = { branch = "dev", setBy = 1, setAt = "2026-10-04T00:00:00Z", code = if HEALTH_MODE or FLEET_MODE then "smoke-access-code" else nil }
@@ -1019,6 +1024,16 @@ local function publish(topic: string, data)
 	task.spawn(handler, { Data = serde.encode("json", data), Sent = os.time() })
 end
 
+-- 0.3.5 `--durable`: a dev head and history entry exactly as the CLI writes them (cli/src/durablehead.ts).
+local function cliHead(seq: number, assetId: number, artifactId: string)
+	return { assetId = assetId, artifactId = artifactId, seq = seq, commit = string.sub(artifactId, 1, 7), channel = "dev", deployedAt = "2026-10-06T12:00:00Z", t = 1759580000000 + seq }
+end
+local function cliEntry(seq: number, assetId: number, artifactId: string)
+	local entry = cliHead(seq, assetId, artifactId)
+	entry.branch, entry.at, entry.deployedAt = "dev", entry.deployedAt, nil
+	return entry
+end
+
 -- The stores: a signed H1 in the durable copy, and a FORGED higher-seq unsigned head in MemoryStore.
 local h1 = FIELDS.H1
 dataStore.data.heads = {
@@ -1038,6 +1053,20 @@ elseif BOOTSTRAP_ONLY_MODE then
 elseif EMPTY_MODE then
 	-- Only unusable heads: the forged dev-channel one (seq 99, MemoryStore) and one whose payload holds a Script.
 	dataStore.data.heads = { prod = { assetId = 1005, artifactId = "eeeeeee-555555", seq = 70, commit = "eeeeeee", channel = "prod", deployedAt = "2026-10-04T00:00:00Z" } }
+elseif DURABLE_MODE then
+	-- Deploys #45 (and later #46) went out while no dev server ran: nobody heard the messages, so MemoryStore still says
+	-- #44; the CLI wrote the DataStore copy (heads + deployments, durablehead.ts shapes).
+	addAsset(1010, payload("jjjjjjj-101010", "dev"))
+	addAsset(1011, payload("kkkkkkk-111111", "dev"))
+	addAsset(1012, payload("lllllll-121212", "dev"))
+	addAsset(1013, payload("mmmmmmm-131313", "dev"))
+	-- Real store latencies: MemoryStore answers first, so a boot that didn't wait for the DataStore copy would run #44.
+	LATENCY.memoryGet, LATENCY.datastoreGet = 0.05, 1.5
+	memoryStore.data.heads.dev = cliHead(44, 1010, "jjjjjjj-101010")
+	dataStore.data.heads.dev = cliHead(45, 1011, "kkkkkkk-111111")
+	-- No forged prod head in MemoryStore here (that alone would make the boot read the durable copy too).
+	memoryStore.data.heads.prod = deepCopy(dataStore.data.heads.prod)
+	dataStore.data.deployments = { list = { cliEntry(45, 1011, "kkkkkkk-111111"), cliEntry(44, 1010, "jjjjjjj-101010") } }
 elseif FLEET_MODE then
 	-- The dev head is I, which fails to start, and nothing else is known for "dev": the server runs nothing.
 	memoryStore.data.heads.dev = { assetId = 1009, artifactId = "iiiiiii-999999", seq = 5, commit = "iiiiiii", channel = "dev", t = 1759580000000, deployedAt = "2026-10-04T00:00:00Z" }
@@ -1231,6 +1260,11 @@ end
 if BLIND_MODE then
 	Constants.POLL_SECONDS = 0.3 -- the forged newer head must meet several polls
 end
+if DURABLE_MODE then
+	-- The real ratio, 100 times faster: a sync tick every 0.6 s (60 s), the durable read at most every 0.55 s (55 s).
+	Constants.POLL_SECONDS = 0.6
+	Constants.HEADS_DURABLE_SECONDS = 0.55
+end
 if STUDIO_MODE then
 	Constants.POLL_SECONDS = 0.2 -- a newer stored dev head must meet several polls (and be ignored)
 end
@@ -1352,7 +1386,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -1523,6 +1557,52 @@ if DEV_MODE then
 		end
 		return true
 	end)())
+	finish()
+end
+if DURABLE_MODE then
+	local function devHead(store)
+		return store.data.heads and store.data.heads.dev
+	end
+	check("durable: a new server boots the head only the DataStore copy holds (#45, no server heard it)", waitFor("boot #45", function()
+		return running() == "kkkkkkk-111111" and status().appliedSeq == 45
+	end))
+	check("durable: it boots #45 directly (the boot waits for the DataStore copy; #44 never ran)", SMOKE.boots[1] == "kkkkkkk-111111" and #SMOKE.boots == 1)
+	LATENCY.datastoreGet = 0.05 -- the periodic reads below
+	check("durable: it writes MemoryStore back (#44 -> #45)", waitFor("memory #45", function()
+		return devHead(memoryStore).seq == 45 and devHead(memoryStore).assetId == 1011
+	end))
+	local listed = nil
+	for _, branch in SMOKE.kernel:branches() do
+		if branch.name == "dev" then
+			listed = branch
+		end
+	end
+	check("durable: the dev menu lists #45 as the dev head", listed ~= nil and listed.seq == 45 and listed.artifactId == "kkkkkkk-111111")
+	-- The CLI deploys #46 while this server runs, and the message is lost (no MessagingService delivery here at all):
+	-- only the DataStore copy changes.
+	local readsBefore, memoryBefore, startedAt = dataStore.reads.heads or 0, memoryStore.reads.heads or 0, os.clock()
+	dataStore.data.heads.dev = cliHead(46, 1012, "lllllll-121212")
+	table.insert(dataStore.data.deployments.list, 1, cliEntry(46, 1012, "lllllll-121212"))
+	local followed = waitFor("follow #46", function()
+		return running() == "lllllll-121212" and status().appliedSeq == 46
+	end, 4)
+	local tookTicks = (os.clock() - startedAt) / Constants.POLL_SECONDS
+	check(string.format("durable: the running server follows the CLI-only head within about one sync tick (%.1f ticks = %.0f s at full scale)", tookTicks, tookTicks * 60), followed and tookTicks <= 2.5)
+	check("durable: MemoryStore catches up (#46)", waitFor("memory #46", function()
+		return devHead(memoryStore).seq == 46
+	end))
+	-- Budget over about 5 ticks: one durable read per tick at most (MemoryStore is read every tick too).
+	task.wait(Constants.POLL_SECONDS * 5)
+	local window = os.clock() - startedAt
+	local durableReads = (dataStore.reads.heads or 0) - readsBefore
+	local memoryReads = (memoryStore.reads.heads or 0) - memoryBefore
+	local allowed = math.floor(window / Constants.HEADS_DURABLE_SECONDS) + 1
+	check(`durable: DataStore heads reads within budget ({durableReads} in {string.format("%.1f", window / Constants.POLL_SECONDS)} ticks, at most {allowed}; MemoryStore {memoryReads})`, durableReads >= 1 and durableReads <= allowed)
+	-- A lower seq in the durable copy (an older CLI run, or forged) is never followed nor written back.
+	dataStore.data.heads.dev = cliHead(43, 1013, "mmmmmmm-131313")
+	task.wait(Constants.POLL_SECONDS * 3)
+	check("durable: a lower seq in the DataStore copy is ignored", running() == "lllllll-121212" and devHead(memoryStore).seq == 46)
+	check("durable: no deploy message was involved", status().lastMessage == nil)
 	finish()
 end
 if VIP_MODE then
@@ -2218,7 +2298,43 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.4")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.5")
+
+-- 0.3.5: the engine's warning for a ConfigService key nobody published becomes ONE info line per TypeTorch key in the
+-- kernel's log ring (the registry is optional and, with API keys, never written); the game's own keys stay warnings.
+do
+	local LogService = services.LogService
+	local before = #SMOKE.kernel:logs(nil, 500)
+	for _, text in {
+		'ConfigService: Config value not found for key "TypeTorch".',
+		'ConfigService: Config value not found for key "TypeTorch".',
+		'ConfigService: Config value not found for key "TypeTorchFleet".',
+		'ConfigService: Config value not found for key "ShopPrices".',
+	} do
+		LogService.MessageOut:Fire(text, Enum.MessageType.MessageWarning)
+	end
+	waitFor("log lines", function()
+		return #SMOKE.kernel:logs(nil, 500) >= before + 3
+	end)
+	task.wait(0.1)
+	local lines = SMOKE.kernel:logs(nil, 500)
+	local registry, fleetKey, game, orange = 0, 0, 0, 0
+	for index = before + 1, #lines do
+		local line = lines[index]
+		if line.text == "[TypeTorch] no ConfigService registry (optional)" and line.kind == "info" then
+			registry += 1
+		elseif string.find(line.text, "TypeTorchFleet (optional", 1, true) and line.kind == "info" then
+			fleetKey += 1
+		elseif string.find(line.text, "ShopPrices", 1, true) and line.kind == "warning" then
+			game += 1
+		end
+		if line.kind == "warning" and string.find(line.text, 'key "TypeTorch', 1, true) then
+			orange += 1
+		end
+	end
+	check("logs: a missing TypeTorch ConfigService key is one dim info line, repeats dropped", registry == 1 and fleetKey == 1 and orange == 0)
+	check("logs: the game's own missing keys stay warnings", game == 1)
+end
 check("status: running artifact verified main + fallback", s.generation.artifact.verified and s.generation.artifact.verified.main and s.generation.artifact.verified.fallback)
 
 -- Unsigned deploy: refused.
