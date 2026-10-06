@@ -18,6 +18,7 @@
 -- Signatures are base64 of the 64-byte Ed25519 signature of a canonical string (UTF-8, fields joined by "\n"):
 --   deploy messages and branch heads: tt1 \n b \n a \n i \n s \n c \n ch \n t \n r
 --   pin messages (TypeTorch/pin):     tt1pin \n b \n a \n jobs \n pct \n by \n t \n unpin
+--   the settings record (0.3.8):      tt1settings \n seq \n at \n body   (body = the exact JSON text stored; plans/20)
 -- Integers in base 10 (string.format("%d"): no sign, exponent, leading zeros or fraction); `r` is "1" (rollback),
 -- "resign" (the CLI re-signed the head after `keys rotate`: same asset, new seq) or ""; `unpin` is "1" or ""; absent
 -- optional fields are ""; `jobs` is the job ids joined by "," in message order.
@@ -32,6 +33,7 @@ local Signing = {}
 
 local DEPLOY_TAG = "tt1"
 local PIN_TAG = "tt1pin"
+local SETTINGS_TAG = "tt1settings"
 
 -- Minimum seconds between two key asset reads, by reason. Rekey hints are unsigned (anyone in the universe can send
 -- one) and failed signatures can be provoked, so both are rate-limited; a hint inside the window is not lost (the
@@ -126,6 +128,16 @@ function Signing.headFields(branch: string, head)
 		t = head.t,
 		r = if head.r == "resign" then "resign" elseif head.r == 1 or head.rollback == true then 1 else nil,
 	}
+end
+
+-- 0.3.8 (plans/20): the signed string of the settings record. `at` may not hold a newline (the body follows it; the
+-- body may). nil when a field is bad.
+function Signing.settingsCanonical(seq: any, at: any, body: any): string?
+	local s = decimal(seq)
+	if not s or typeof(at) ~= "string" or string.find(at, "\n", 1, true) or typeof(body) ~= "string" then
+		return nil
+	end
+	return `{SETTINGS_TAG}\n{s}\n{at}\n{body}`
 end
 
 -- The signed string of a pin message ({j?, pct?, a?, b, by, t, unpin?}).

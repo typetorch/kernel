@@ -16,10 +16,12 @@
 -- and 0.3.8's `--messaging` (game messaging: one lazy kernel-held TypeTorch/game subscription kept across swaps, dispatch
 -- per generation, the mid-swap replay, tags and `to`, publish limits, retries, the universe's rate, the queue, the held
 -- roll call topic), `--messaging-studio` (loopback only), `--messaging-missing`, `--client-boot` and `--client-own` (the
--- game's loading screen and the ClientReady signal; `--client` and `--hold` check the new attributes too).
+-- game's loading screen and the ClientReady signal; `--client` and `--hold` check the new attributes too), and
+-- `--settings` / `--settings-missing` (plans/20: the signed settings record replacing ConfigService; `--fleet`,
+-- `--switch`, `--access` and `--fallback` read their settings from it too).
 -- Every mode also checks that no swap ran on a thread its own stopped generation owned.
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
--- services (InsertService, MessagingService, DataStore, MemoryStore, ConfigService unavailable), then drives it:
+-- services (InsertService, MessagingService, DataStore, MemoryStore; 0.3.8: no ConfigService at all), then drives it:
 -- signed / unsigned / dev-channel / replayed deploy messages, a payload holding a Script (S-L4), a payload that fails to
 -- load twice (P-K2 retries), a rollback, unsigned and signed pins, a key rotation after a rekey hint, and a message
 -- signed with a revoked key. Messages are signed with the throwaway plans/03 test keys (scripts/smoke-signatures.json,
@@ -433,6 +435,9 @@ end
 -- Scripts and require ----------------------------------------------------------------------------------------------
 
 local SMOKE = { boots = {}, stops = {}, closed = {}, behave = {}, messages = {}, heard = {}, disconnects = {}, task = ownedTask }
+-- 0.3.8 (plans/20): signed settings records, made by the CLI with the public plans/03 test keys
+-- (cli/test/fixtures/settings-fixtures.ts; the CLI's tests check it still signs them byte for byte).
+SMOKE.settings = serde.decode("json", fs.readFile("scripts/smoke-settings.json"))
 local moduleCache = {}
 local game
 
@@ -648,7 +653,7 @@ local function keyValueStore()
 	local store = { data = data, failGets = {}, reads = {} } -- failGets[key] = n: the next n reads of key throw
 	function store:GetAsync(key)
 		self.reads[key] = (self.reads[key] or 0) + 1 -- 0.3.5 `--durable`: the read budget
-		simWait(if self.latencyName == "memory" then "memoryGet" elseif string.sub(tostring(key), 1, 8) == "private/" then "privateGet" else "datastoreGet")
+		simWait(if self.latencyName == "memory" then "memoryGet" elseif string.sub(tostring(key), 1, 8) == "private/" then "privateGet" elseif key == "settings" then "settingsGet" else "datastoreGet")
 		if (self.failGets[key] or 0) > 0 then
 			self.failGets[key] -= 1
 			error("DataStore request failed (smoke)")
@@ -687,14 +692,11 @@ local assets = {}
 local assetVersions = {} -- version -> asset id
 local closeCallbacks = {} -- game:BindToClose
 local fakePlayers = {} -- 0.3.4 `--switch`: the players in this server
-local SMOKE_CONFIG = nil -- the ConfigService snapshot in `--fleet`
 -- 0.3.2 fleet API: every RequestAsync ({ url, method, headers, body (decoded), status }); `httpScript` = status codes
 -- (or "error") for the next requests, then 200.
 local httpRequests = {}
 local httpScript = {}
 local FLEET_TOKEN = "smoke-fleet-token-0123456789abcdef"
-local configValues = {} -- ConfigService keys in `--fleet` (the "TypeTorch" registry key stays missing)
-local configThrows = {} -- 0.3.6 `--access`: keys whose GetValue throws
 -- 0.3.6: MessagingService publishes ({ topic, data (decoded) }); `peerReplies` answers the kernel's roll call ask with
 -- these rows (each { delay?, row }), as other kernels would; teleports ({ placeId, players (names), options props });
 -- `teleportFails` = errors for the next TeleportAsync calls; Players attributes; reserved servers made.
@@ -836,27 +838,6 @@ local services = {
 			}
 		end,
 	},
-	ConfigService = {
-		GetConfigAsync = function()
-			simWait("config")
-			if not (table.find(process.args, "--fleet") or table.find(process.args, "--switch") or table.find(process.args, "--backup") or table.find(process.args, "--teleport") or table.find(process.args, "--bounce") or table.find(process.args, "--access")) then
-				error("ConfigService unavailable (smoke)")
-			end
-			local snapshot = { UpdateAvailable = signal() }
-			function snapshot:GetValue(key)
-				if configThrows[key] then
-					error(`ConfigService GetValue({key}) failed (smoke)`)
-				end
-				return deepCopy(configValues[key])
-			end
-			function snapshot:Refresh() end
-			function snapshot:GetValueChangedSignal()
-				return signal()
-			end
-			SMOKE_CONFIG = snapshot
-			return snapshot
-		end,
-	},
 	DataStoreService = {
 		GetDataStore = function()
 			return dataStore
@@ -970,7 +951,7 @@ end
 
 local kernelFolder = newInstance("Folder", "TypeTorchKernel")
 kernelFolder.Parent = services.ServerScriptService
-for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Messaging = "Messaging.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
+for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Messaging = "Messaging.luau", Settings = "Settings.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
 	sourceInstance(if name == "Kernel" then "Script" else "ModuleScript", name, `src/server/{file}`).Parent = kernelFolder
 end
 local entryTemplate = sourceInstance("Script", "Entry", "src/server/Entry.server.luau")
@@ -1035,15 +1016,15 @@ if not CLIENT_MODE then
 	clientStandIn = newInstance("LocalScript", "TypeTorchKernelClient")
 	clientStandIn.Parent = services.ReplicatedFirst
 end
--- `--fleet` (0.3.2): ConfigService holds TypeTorchFleet, so the kernel sends its fleet data over HTTP (stubbed): a
+-- `--fleet` (0.3.2): the settings hold `fleet` (0.3.8; ConfigService TypeTorchFleet before), so the kernel sends its fleet data over HTTP (stubbed): a
 -- reserved dev server whose head fails to start (nothing runs: the alerts and heartbeats still go out), then recovers.
 local FLEET_MODE = table.find(process.args, "--fleet") ~= nil
 -- `--switch` (0.3.4): the owner switches a public prod server to dev and back, loads builds here; Reload and Rollback
 -- keep working; no admins (a member with the old role "admin" is a dev); members with role "owner" are owners.
 local SWITCH_MODE = table.find(process.args, "--switch") ~= nil
 if SWITCH_MODE then
-	configValues.TypeTorchFleet = { url = "https://fleet.example.test/api", token = FLEET_TOKEN }
-	configValues.TypeTorch = { defaultBranch = "prod", members = { ["2"] = "admin", ["4"] = "owner" } }
+	-- 0.3.8: the signed settings record (was ConfigService TypeTorchFleet + the TypeTorch registry key).
+	dataStore.data.settings = deepCopy(SMOKE.settings.switch)
 end
 local HEALTH_MODE = table.find(process.args, "--health") ~= nil
 -- `--durable` (0.3.5): a reserved dev server and deploys that only the DataStore copy holds (the CLI wrote it).
@@ -1067,6 +1048,11 @@ local MODES38 = {
 	messagingMissing = table.find(process.args, "--messaging-missing") ~= nil,
 	clientBoot = table.find(process.args, "--client-boot") ~= nil,
 	clientOwn = table.find(process.args, "--client-own") ~= nil,
+	-- plans/20: `--settings` (the signed record: read at boot, a ping re-reads, a bad signature, an older seq, unsigned
+	-- and missing records keep the last good copy, the periodic read, server only, onSettingsChanged) and
+	-- `--settings-missing` (a place project without Settings.luau boots with the defaults).
+	settings = table.find(process.args, "--settings") ~= nil,
+	settingsMissing = table.find(process.args, "--settings-missing") ~= nil,
 }
 -- 0.3.8 loading screens (plans/19 item 13), client side: `--client-boot` (the game's BootScreen replaces the kernel's
 -- "Starting..." until the first client generation runs and the server's hold ends), `--client-own` (KernelScreen =
@@ -1074,7 +1060,7 @@ local MODES38 = {
 -- ClientGeneration and Holding too.
 
 if FLEET_MODE then
-	configValues.TypeTorchFleet = { url = "https://fleet.example.test/api/", token = FLEET_TOKEN }
+	dataStore.data.settings = deepCopy(SMOKE.settings.fleetSlash) -- 0.3.8: was ConfigService TypeTorchFleet
 end
 if DEV_MODE or VIP_MODE or HEALTH_MODE or FLEET_MODE or DURABLE_MODE or HEALTH_CONFIG_MODE then
 	GAME_ROOT_PROPS.PrivateServerId = "ps-smoke"
@@ -1082,6 +1068,7 @@ if DEV_MODE or VIP_MODE or HEALTH_MODE or FLEET_MODE or DURABLE_MODE or HEALTH_C
 	dataStore.data["private/ps-smoke"] = { branch = "dev", setBy = 1, setAt = "2026-10-04T00:00:00Z", code = if HEALTH_MODE or FLEET_MODE then "smoke-access-code" else nil }
 end
 if HEALTH_MODE then
+	dataStore.failGets.settings = math.huge -- S-M2: the settings never read, so revocations stay unknown
 	dataStore.failGets["private/ps-smoke"] = 2 -- P-K8: the boot read is retried
 	subscribeFailures["TypeTorch/deploy"] = 2 -- P-K8: the subscription is retried
 end
@@ -1337,8 +1324,8 @@ local BOUNCE_MODE = table.find(process.args, "--bounce") ~= nil
 local MIDSWAP_MODE = table.find(process.args, "--mid-swap") ~= nil
 local CLIENT_FAIL_MODE = table.find(process.args, "--client-fail") ~= nil
 -- 0.3.6 (plans/18): `--heads-cap` (a public prod server: deploy messages of unknown branches are recorded only when
--- signed; the stored heads hold at most HEADS_MAX_BRANCHES branches) and `--access` (the dev lists from TypeTorchAccess
--- apply at once on a ConfigService update, even when the registry key can't be read).
+-- signed; the stored heads hold at most HEADS_MAX_BRANCHES branches) and `--access` (0.3.8: the dev lists from the
+-- signed settings apply at once after a write and a ping; a forged record is refused).
 local HEADS_CAP_MODE = table.find(process.args, "--heads-cap") ~= nil
 local ACCESS_MODE = table.find(process.args, "--access") ~= nil
 if HEADS_CAP_MODE then
@@ -1353,7 +1340,7 @@ if HEADS_CAP_MODE then
 	memoryStore.data.heads.dev = nil
 end
 if ACCESS_MODE then
-	configValues.TypeTorch = { defaultBranch = "prod" }
+	dataStore.data.settings = deepCopy(SMOKE.settings.access1) -- 0.3.8: was the ConfigService TypeTorch registry key
 end
 -- `--kernel-crash`: the kernel errors right after the hold (a kernel bug): the held players are still moved.
 local KERNEL_CRASH_MODE = table.find(process.args, "--kernel-crash") ~= nil
@@ -1403,7 +1390,7 @@ local function joinPlayer(userId: number, name: string, bounce: number?, fire: b
 end
 
 if FALLBACK_FLEET then
-	configValues.TypeTorchFleet = { url = "https://fleet.example.test/api", token = FLEET_TOKEN }
+	dataStore.data.settings = deepCopy(SMOKE.settings.fleet) -- 0.3.8: was ConfigService TypeTorchFleet
 end
 if HOLD_OPTOUT_MODE then
 	playersAttributes.TypeTorchHoldCharacters = false
@@ -1517,8 +1504,8 @@ end
 -- Each: `setup` (fixtures and latencies), `first` = the artifact expected first, `final` = the artifact expected once
 -- background retries and late reads settle (optional), `within` = a tighter bound than the 15 s budget (optional).
 -- A public prod server unless the setup says otherwise. Normal latencies (simulated seconds): key asset 0.3 + 0.5,
--- ConfigService 0.5, MemoryStore 0.15, DataStore 0.4 (private record too), LoadAsset 0.6, generation start 0.3.
-local NORMAL = { keyVersion = 0.3, keyLoad = 0.5, config = 0.5, memoryGet = 0.15, datastoreGet = 0.4, privateGet = 0.4, payloadLoad = 0.6, groups = 0.3, badge = 0.3 }
+-- settings 0.4 (0.3.8; ConfigService 0.5 before), MemoryStore 0.15, DataStore 0.4 (private record too), LoadAsset 0.6, generation start 0.3.
+local NORMAL = { keyVersion = 0.3, keyLoad = 0.5, settingsGet = 0.4, memoryGet = 0.15, datastoreGet = 0.4, privateGet = 0.4, payloadLoad = 0.6, groups = 0.3, badge = 0.3 }
 local HANG = { hang = true }
 local function signedStoredHead(name: string)
 	local fields = FIELDS[name]
@@ -1540,8 +1527,9 @@ local BOOT_SCENARIOS = {
 	{ name = "normal", first = "bbbbbbb-222222", within = 3 },
 	{ name = "keys-slow", first = "bbbbbbb-222222", setup = function() LATENCY.keyVersion = HANG end },
 	{ name = "keys-fail", first = "bbbbbbb-222222", within = 3, setup = function() LATENCY.keyVersion = { fail = true, after = 0.2 }; assets[500].failLoads = math.huge end },
-	{ name = "config-slow", first = "bbbbbbb-222222", setup = function() LATENCY.config = HANG end },
-	{ name = "config-fail", first = "bbbbbbb-222222", within = 3, setup = function() LATENCY.config = { fail = true, after = 0.3 } end },
+	-- 0.3.8: the signed settings (one DataStore read) replace ConfigService on the boot path.
+	{ name = "settings-slow", first = "bbbbbbb-222222", setup = function() LATENCY.settingsGet = HANG end },
+	{ name = "settings-fail", first = "bbbbbbb-222222", within = 3, setup = function() LATENCY.settingsGet = { fail = true, after = 0.3 } end },
 	{ name = "memory-slow", first = "aaaaaaa-111111", setup = function() LATENCY.memoryGet = HANG end },
 	{ name = "stores-slow", first = "aaaaaaa-111111", final = "bbbbbbb-222222", setup = function()
 		LATENCY.memoryGet, LATENCY.datastoreGet = 8, 8
@@ -1658,6 +1646,7 @@ Constants.STOP_DEADLINE = 0.3
 Constants.SUBSCRIBE_RETRY_DELAYS = { 0.05 }
 Constants.PRIVATE_READ_RETRY_DELAYS = { 0.05, 0.05, 0.05 }
 Constants.CLOSE_DEADLINE = 1
+Constants.SETTINGS_PING_GAP = 0.05 -- 0.3.8: a settings ping re-reads at once
 if BOOT_SCENARIO then
 	-- Real kernel timing, SCALE times faster (and the same constants an older kernel had, for before/after runs).
 	for _, name in { "BOOT_BUDGET", "BOOT_READS_WAIT", "KEYS_BOOT_WAIT", "CONFIG_BOOT_WAIT", "BOOT_OWNER_CHECK", "BOOT_DEADLINE", "BOOT_LOAD_TIMEOUT", "BOOT_READY_TIMEOUT", "BOOT_LATE_LOAD", "BOOT_LATE_READY", "READY_TIMEOUT", "POLL_SECONDS", "STOP_DEADLINE", "PUBLIC_JITTER_SECONDS", "FALLBACK_AT", "PEER_COLLECT", "PEER_CACHE", "PEER_REPLY_JITTER", "TELEPORT_GRACE", "TELEPORT_RETRY" } do
@@ -1722,6 +1711,17 @@ if HEALTH_MISSING_MODE then
 end
 if MODES38.messagingMissing then
 	kernelFolder.Messaging.Parent = nil -- an older place project that lists the kernel's files one by one
+end
+if MODES38.settings then
+	dataStore.data.settings = deepCopy(SMOKE.settings.s1)
+	Constants.POLL_SECONDS = 0.3 -- the sync tick runs often; the settings re-read only on pings until the last check
+	Constants.SETTINGS_REFRESH_SECONDS = 1000
+end
+if MODES38.settingsMissing then
+	kernelFolder.Settings.Parent = nil
+end
+if FALLBACK_MODE then
+	dataStore.data.settings = deepCopy(SMOKE.settings.s1) -- the key asset never loads: the record verifies by sigF
 end
 if MODES38.messaging or MODES38.messagingStudio then
 	Constants.MESSAGING_RETRY_DELAYS = { 0.05, 0.05, 0.05 }
@@ -1842,7 +1842,7 @@ local function finish()
 	check(`no swap ran on a thread its own stopped generation owned (busy-flag hazard){if #hazards > 0 then ": " .. hazards[1] else ""}`, #hazards == 0)
 	check("the kernel never used a MemoryStore sorted map (0.3.2: fleet status and reports are API only)", #sortedMapRequests == 0)
 	if not FLEET_MODE and not SWITCH_MODE and not FALLBACK_FLEET and not ACCESS_MODE then
-		check("no HTTP request without TypeTorchFleet", #httpRequests == 0)
+		check("no HTTP request without settings.fleet", #httpRequests == 0)
 	end
 	local leaked = false
 	for _, line in output do
@@ -1867,7 +1867,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -2647,7 +2647,7 @@ if FLEET_MODE then
 	end, 4))
 	httpScript = { 401 }
 	check("fleet: 401 is dropped with a warning that names the setting", waitFor("401", function()
-		return said("answered 401") and said("TypeTorchFleet.token")
+		return said("answered 401") and said("settings.fleet.token")
 	end, 4))
 
 	-- A player count change sends a heartbeat at once (at most once per FLEET_PLAYERS_GAP).
@@ -2661,16 +2661,17 @@ if FLEET_MODE then
 		return #requests("heartbeat") == before + 1
 	end, 2))
 
-	-- Without the setting nothing is sent; it comes back after a publish.
-	configValues.TypeTorchFleet = nil
+	-- Without the setting nothing is sent; it comes back after a write. 0.3.8: a new signed record without `fleet`, a ping.
+	dataStore.data.settings = deepCopy(SMOKE.settings.fleetOff)
+	publish("TypeTorch/deploy", { k = "settings", s = 2 })
 	task.wait(0.8)
 	local quiet = #httpRequests
 	publish("TypeTorch/deploy", { b = "dev", a = 1002, i = "bbbbbbb-222222", s = 8, c = "bbbbbbb", ch = "dev", t = nowMs() })
 	task.wait(0.8)
-	check("fleet: without TypeTorchFleet nothing is sent (the swap still happens)", #httpRequests == quiet and running() == "bbbbbbb-222222" and status().fleet.enabled == false)
-	configValues.TypeTorchFleet = { url = "https://fleet.example.test/api", token = FLEET_TOKEN }
-	SMOKE_CONFIG.UpdateAvailable:Fire()
-	check("fleet: the setting is back after a publish: sending resumes", waitFor("resumed", function()
+	check("fleet: without settings.fleet nothing is sent (the swap still happens)", #httpRequests == quiet and running() == "bbbbbbb-222222" and status().fleet.enabled == false)
+	dataStore.data.settings = deepCopy(SMOKE.settings.fleetOn)
+	publish("TypeTorch/deploy", { k = "settings", s = 3 })
+	check("fleet: the setting is back after a write and a ping: sending resumes", waitFor("resumed", function()
 		return #httpRequests > quiet and status().fleet.enabled == true
 	end, 3))
 
@@ -2719,7 +2720,7 @@ if HEALTH_MODE then
 	)
 	check("api: accessCode() (from the private record)", SMOKE.kernel:accessCode() == "smoke-access-code")
 
-	-- S-M2: the registry never loaded (ConfigService is down here), so revocations are unknown.
+	-- S-M2: the settings never loaded (every read fails here), so revocations are unknown.
 	local stranger = newInstance("Player", "Stranger")
 	stranger.UserId = 99
 	local info = SMOKE.kernel:devInfo(stranger)
@@ -3534,38 +3535,132 @@ if MODES38.messagingMissing then
 end
 end
 
+-- 0.3.8 THE SIGNED SETTINGS RECORD (plans/20) ---------------------------------------------------------------------------
+if MODES38.settings then
+	check("settings: boots", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() ~= nil
+	end))
+	local function settingsStatus()
+		return status().settings
+	end
+	local first = settingsStatus()
+	check("settings: the signed record is read at boot (seq 1, verified, its fields)", first.state == "ok" and first.seq == 1 and (first.verifiedBy == "sig" or first.verifiedBy == "sigF") and table.find(first.fields, "game") ~= nil and table.find(first.fields, "analytics") ~= nil and table.find(first.fields, "access") ~= nil and table.find(first.fields, "channels") ~= nil)
+	local api = SMOKE.kernel
+	local copy = api:settings()
+	check("settings: api:settings() is a copy with seq, at and every field (server only)", copy ~= nil and copy.seq == 1 and copy.at == "2026-10-06T12:00:00.000Z" and copy.game["shop.price"] == 50 and copy.channels.dev == "dev" and copy.analytics.token == "analytics-ingest-token-0123456789")
+	copy.game["shop.price"] = 1
+	check("settings: changing the copy changes nothing in the kernel", api:settings().game["shop.price"] == 50)
+	local owner = joinPlayer(5, "SettingsOwner")
+	check("settings: access from the record (member 5 is an owner)", api:devInfo(owner).role == "owner" and api:devInfo(owner).reason == "member")
+	-- Server only: nothing of it reaches clients (no attribute, no remote carries the analytics token).
+	local leaked = false
+	for _, instance in { services.ReplicatedStorage.TypeTorch, clientStandIn } do
+		for _, value in internals[instance].attributes do
+			if typeof(value) == "string" and string.find(value, "analytics-ingest-token", 1, true) then
+				leaked = true
+			end
+		end
+	end
+	for _, call in firedToClient do
+		for index = 2, #call do
+			if typeof(call[index]) == "string" and string.find(call[index], "analytics-ingest-token", 1, true) then
+				leaked = true
+			end
+		end
+	end
+	check("settings: no token in any replicated attribute or remote", not leaked)
+	-- A write and a ping: re-read within the ping gap; the running generation hears it.
+	local heard = {}
+	api:onSettingsChanged(function(settings)
+		table.insert(heard, settings)
+	end)
+	dataStore.data.settings = deepCopy(SMOKE.settings.s2)
+	local readsBefore = dataStore.reads.settings or 0
+	publish("TypeTorch/deploy", { k = "settings", s = 2 })
+	check("settings: a ping re-reads at once; the generation hears the new copy (onSettingsChanged)", waitFor("seq 2", function()
+		return settingsStatus().seq == 2 and #heard == 1 and heard[1].seq == 2 and heard[1].game["shop.price"] == 75
+	end, 2) and (dataStore.reads.settings or 0) == readsBefore + 1)
+	publish("TypeTorch/deploy", { k = "settings", s = 2 })
+	publish("TypeTorch/deploy", { k = "settings", s = 1 })
+	task.wait(0.2)
+	check("settings: a ping for a seq it already holds reads nothing", (dataStore.reads.settings or 0) == readsBefore + 1)
+	-- A bad signature (game code rewrote the body of a signed record): refused, #2 kept.
+	local forged = deepCopy(SMOKE.settings.s5)
+	forged.body = string.gsub(forged.body, "999", "1")
+	dataStore.data.settings = forged
+	publish("TypeTorch/deploy", { k = "settings", s = 5 })
+	check("settings: a bad signature is refused; the last good copy (#2) stays", waitFor("refused", function()
+		local now = settingsStatus()
+		return now.refused ~= nil and now.refused.seq == 5 and string.find(now.refused.why, "signature", 1, true) ~= nil
+	end, 2) and settingsStatus().seq == 2 and settingsStatus().state == "ok" and api:settings().game["shop.price"] == 75 and #heard == 1 and said("settings: signature"))
+	-- An older signed record put back (a replay): refused.
+	dataStore.data.settings = deepCopy(SMOKE.settings.s1)
+	publish("TypeTorch/deploy", { k = "settings", s = 9 }) -- (a ping only asks for a read; the record decides)
+	check("settings: an older seq (a replay of #1) is ignored", waitFor("older", function()
+		local now = settingsStatus()
+		return now.refused ~= nil and now.refused.seq == 1 and string.find(now.refused.why, "not newer", 1, true) ~= nil
+	end, 2) and settingsStatus().seq == 2)
+	-- Unsigned: refused.
+	local unsigned = deepCopy(SMOKE.settings.s5)
+	unsigned.sig, unsigned.sigF = nil, nil
+	dataStore.data.settings = unsigned
+	publish("TypeTorch/deploy", { k = "settings", s = 10 })
+	check("settings: an unsigned record is refused", waitFor("unsigned", function()
+		local now = settingsStatus()
+		return now.refused ~= nil and string.find(now.refused.why, "unsigned", 1, true) ~= nil
+	end, 2) and settingsStatus().seq == 2)
+	-- The record deleted: the last good copy stays.
+	dataStore.data.settings = nil
+	publish("TypeTorch/deploy", { k = "settings", s = 11 })
+	check("settings: a missing record keeps the last good copy", waitFor("gone", function()
+		local now = settingsStatus()
+		return now.refused ~= nil and string.find(now.refused.why, "gone", 1, true) ~= nil
+	end, 2) and settingsStatus().seq == 2 and api:settings() ~= nil)
+	-- No ping: the sync tick reads it (at most every SETTINGS_REFRESH_SECONDS).
+	Constants.SETTINGS_REFRESH_SECONDS = 0.1
+	Constants.POLL_SECONDS = 0.2
+	dataStore.data.settings = deepCopy(SMOKE.settings.s5)
+	check("settings: without a ping the periodic read takes a newer signed copy (#5)", waitFor("seq 5", function()
+		return settingsStatus().seq == 5 and settingsStatus().refused == nil
+	end, 3) and #heard == 2)
+	finish()
+end
+
+if MODES38.settingsMissing then
+	check("settings-missing: boots without Settings.luau and says so", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() ~= nil
+	end) and said("TypeTorchKernel.Settings is missing"))
+	check("settings-missing: the defaults; status says why; api:settings() is nil", status().settings.state == "missing" and string.find(status().settings.error or "", "Settings module", 1, true) ~= nil and SMOKE.kernel:settings() == nil and status().branch == "prod")
+	finish()
+end
+
 if ACCESS_MODE then
 	check("access: boots", waitFor("boot", function()
 		return SMOKE.kernel ~= nil and running() ~= nil
 	end))
 	local member = joinPlayer(9, "Member")
 	local api = SMOKE.kernel
-	check("access: no TypeTorchAccess key: a would-be member isn't a dev", api:devInfo(member).dev == false)
-	-- `typetorch access push`, while the registry key itself can't be read: the update applies at once (no 60 s wait).
-	configThrows.TypeTorch = true
-	configValues.TypeTorchAccess = { v = 1, members = { ["9"] = "dev" }, revoked = {} }
-	SMOKE_CONFIG.UpdateAvailable:Fire()
-	check("access: a ConfigService update re-reads TypeTorchAccess at once (Registry.onUpdate -> Access.refresh)", waitFor("dev", function()
+	check("access: the settings (seq 1) list no members: a would-be member isn't a dev", api:devInfo(member).dev == false and status().settings.seq == 1)
+	-- 0.3.8: `typetorch access push` writes a new signed record (seq 2) and pings: it applies within seconds.
+	dataStore.data.settings = deepCopy(SMOKE.settings.access2)
+	publish("TypeTorch/deploy", { k = "settings", s = 2 })
+	check("access: a settings write + ping makes the member a dev at once", waitFor("dev", function()
 		return api:devInfo(member).dev == true
-	end, 1) and said("dev access from ConfigService TypeTorchAccess"))
-	configValues.TypeTorchAccess = { v = 1, members = {}, revoked = { ["9"] = true } }
-	SMOKE_CONFIG.UpdateAvailable:Fire()
+	end, 1) and said("dev access from the settings: 1 member(s)"))
+	dataStore.data.settings = deepCopy(SMOKE.settings.access3)
+	publish("TypeTorch/deploy", { k = "settings", s = 3 })
 	check("access: a revocation pushed the same way applies at once", waitFor("revoked", function()
-		return api:devInfo(member).dev == false
+		return api:devInfo(member).dev == false and api:devInfo(member).reason == "revoked"
 	end, 1))
-	-- The engine's warning for a missing TypeTorchAccess key is one dim info line, like the other optional keys.
-	local before = #api:logs(nil, 500)
-	services.LogService.MessageOut:Fire('ConfigService: Config value not found for key "TypeTorchAccess".', Enum.MessageType.MessageWarning)
-	services.LogService.MessageOut:Fire('ConfigService: Config value not found for key "TypeTorchAccess".', Enum.MessageType.MessageWarning)
-	task.wait(0.1)
-	local lines = api:logs(nil, 500)
-	local infos = 0
-	for index = before + 1, #lines do
-		if lines[index].kind == "info" and string.find(lines[index].text, "no ConfigService key TypeTorchAccess (optional: run typetorch access push)", 1, true) then
-			infos += 1
-		end
-	end
-	check("access: a missing TypeTorchAccess key is one info line in the log ring", infos == 1 and #lines == before + 1)
+	-- In-universe code can write the DataStore: a forged record (seq 4, member 66 as owner, the old signatures) is refused.
+	local forged = deepCopy(SMOKE.settings.access2)
+	forged.seq = 4
+	forged.body = '{"access":{"members":{"66":"owner"},"revoked":{}},"defaultBranch":"prod"}'
+	dataStore.data.settings = forged
+	publish("TypeTorch/deploy", { k = "settings", s = 4 })
+	local intruder = joinPlayer(66, "Intruder")
+	task.wait(0.3)
+	check("access: a forged record (game code wrote it, bad signature) is refused; the last good lists stay", api:devInfo(intruder).dev == false and api:devInfo(member).reason == "revoked" and status().settings.seq == 3 and status().settings.refused ~= nil and string.find(status().settings.refused.why, "signature", 1, true) ~= nil)
 	finish()
 end
 
@@ -3650,6 +3745,7 @@ if FALLBACK_MODE then
 	local keys = SMOKE.kernel:keys()
 	check("fallback: mode is fallback only, the read error is kept", s.signing.mode == "fallback only" and keys.mode == "fallback only" and keys.loaded == false and keys.lastError ~= nil)
 	check("fallback: running artifact verified by the fallback key only", s.generation.artifact.verified and not s.generation.artifact.verified.main and s.generation.artifact.verified.fallback)
+	check("fallback: the signed settings verify by sigF (0.3.8)", s.settings.state == "ok" and s.settings.verifiedBy == "sigF" and s.settings.seq == 1)
 	publish("TypeTorch/deploy", deployMessage("M2", FIELDS.M2, { "sig" }))
 	check("fallback: sig alone refused", waitFor("refusal", function()
 		return rejected("deploy") == 1
@@ -3663,40 +3759,10 @@ end
 
 check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.8")
 
--- 0.3.5: the engine's warning for a ConfigService key nobody published becomes ONE info line per TypeTorch key in the
--- kernel's log ring (the registry is optional and, with API keys, never written); the game's own keys stay warnings.
+-- 0.3.8: no settings record here (a game that never ran `typetorch settings push`): the defaults, reported as missing.
 do
-	local LogService = services.LogService
-	local before = #SMOKE.kernel:logs(nil, 500)
-	for _, text in {
-		'ConfigService: Config value not found for key "TypeTorch".',
-		'ConfigService: Config value not found for key "TypeTorch".',
-		'ConfigService: Config value not found for key "TypeTorchFleet".',
-		'ConfigService: Config value not found for key "ShopPrices".',
-	} do
-		LogService.MessageOut:Fire(text, Enum.MessageType.MessageWarning)
-	end
-	waitFor("log lines", function()
-		return #SMOKE.kernel:logs(nil, 500) >= before + 3
-	end)
-	task.wait(0.1)
-	local lines = SMOKE.kernel:logs(nil, 500)
-	local registry, fleetKey, game, orange = 0, 0, 0, 0
-	for index = before + 1, #lines do
-		local line = lines[index]
-		if line.text == "[TypeTorch] no ConfigService registry (optional)" and line.kind == "info" then
-			registry += 1
-		elseif string.find(line.text, "TypeTorchFleet (optional", 1, true) and line.kind == "info" then
-			fleetKey += 1
-		elseif string.find(line.text, "ShopPrices", 1, true) and line.kind == "warning" then
-			game += 1
-		end
-		if line.kind == "warning" and string.find(line.text, 'key "TypeTorch', 1, true) then
-			orange += 1
-		end
-	end
-	check("logs: a missing TypeTorch ConfigService key is one dim info line, repeats dropped", registry == 1 and fleetKey == 1 and orange == 0)
-	check("logs: the game's own missing keys stay warnings", game == 1)
+	local settings = status().settings
+	check("settings: no record: state missing, the defaults (branch prod), nothing refused", settings ~= nil and settings.state == "missing" and settings.seq == nil and #settings.fields == 0 and status().branch == "prod" and settings.refused == nil)
 end
 check("status: running artifact verified main + fallback", s.generation.artifact.verified and s.generation.artifact.verified.main and s.generation.artifact.verified.fallback)
 

@@ -4,7 +4,7 @@ The small loader baked into the place. It is plain Luau (no compile step, no rob
 shares a RuntimeLib with the payloads it loads. Changing it needs a server restart (`typetorch kernel deploy`).
 
 - `src/server/` → `ServerScriptService.TypeTorchKernel`: boot, branch choice, LoadAsset + side-by-side mounting,
-  swaps with soft + hard stop, automatic rollback, registry (ConfigService + in-game DataStore), dev access,
+  swaps with soft + hard stop, automatic rollback, registry (in-game DataStore heads + the signed settings), dev access,
   stable transport, logs, the fleet API sender (`Fleet`), the fallbacks (`Fallback`), `/tt` chat commands. A place
   project that maps these files one by one must map `Fleet` (0.3.2), `Fallback` (0.3.6), `Health` (0.3.7) and
   `Messaging` (0.3.8) too; without them the kernel boots without that part and says so.
@@ -61,7 +61,8 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
     this server already ran), skipping artifacts that failed here. Also at boot when the head fails to start.
   - **Fleet status and deploy reports:** `api:fleetStatus()` (this server's heartbeat), `api:onDeployReport(fn)` (one
     report per deploy outcome, the last 20 replayed) and `api:deployReports()`; the kernel writes nothing to
-    MemoryStore for them. With the server-only ConfigService key `TypeTorchFleet` = `{url, token}` the kernel also
+    MemoryStore for them. With the signed settings' `fleet` = `{url, token}` (0.3.8; the ConfigService key
+    `TypeTorchFleet` before) the kernel also
     posts heartbeats (every 30 s and on changes), reports, alerts and a closing notice to that fleet API itself, live
     and also while the generation is broken (`src/server/Fleet.luau`; the token is never logged).
   - **Boot budget:** a new server runs a playable generation within 15 s of start in every path (about 2 s
@@ -90,11 +91,6 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   players DataStore reads a minute) and follow a newer head like a polled one (prod: the same signature rules). When
   the DataStore copy is ahead of MemoryStore, the server writes MemoryStore back (one UpdateAsync with the same
   `replaces` rule, so only the first server's write changes anything). Smoke: `--durable`.
-- Log noise (0.3.5): the engine's orange `ConfigService: Config value not found for key "TypeTorch".` (the registry is
-  optional and never written with an API key) is one info line in the kernel's log ring, `[TypeTorch] no ConfigService
-  registry (optional)` (the dev menu shows it dim); repeats are dropped, and `TypeTorchFleet` / `TypeTorchAnalytics`
-  get the same treatment. The game's own missing keys stay warnings. Roblox's own console still shows the engine's
-  line.
 - Never an empty server (0.3.6; the user: "IN NO POSSIBLE WAY players should load into an empty baseplate";
   `src/server/Fallback.luau`):
   - **Hold:** from the kernel's first line until a generation is ready, characters don't spawn
@@ -125,11 +121,21 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
     (`PlayerGui.TypeTorchResend`, `__tt/resend`); if that fails too, the player moves to a healthy server of the branch
     (or rejoins). `status().clients` and the fleet status `clients` count `resent` and `moved`.
   - `status().fallback` = `{hold, backup, peers, chain, recovery, moving, clients}`.
-- Security audit follow-ups (0.3.6, plans/18): the dev lists come from the server-only ConfigService key
-  `TypeTorchAccess` (`typetorch access push`) when it exists, re-read on every ConfigService update; the stored `heads`
+- Security audit follow-ups (0.3.6, plans/18): the dev lists come from `typetorch access push` (0.3.8: the signed
+  settings' `access`; 0.3.6-0.3.7: the ConfigService key `TypeTorchAccess`); the stored `heads`
   key holds at most 32 branches, and prod servers record another branch's deploy only when they know the branch or the
   message is signed; `place.project.json` sets `LoadStringEnabled` false (`kernel deploy --loadstring` turns it on for
   a test place).
+- The signed settings record (0.3.8, `src/server/Settings.luau`; plans/20): ONE DataStore entry, `TypeTorch` /
+  `settings` = `{ v = 1, seq, at, body, sig, sigF }`, replaces every ConfigService key. `body` is JSON text
+  (`defaultBranch`, `channels`, `access`, `fleet`, `analytics`, `game`); `sig` / `sigF` are both prod keys' Ed25519
+  signatures of `tt1settings \n seq \n at \n body` (Signing.settingsCanonical; the strict rule of signed deploys).
+  Read at boot (inside the 3 s gate), every 55 s from the sync tick and right after a ping (`{"k":"settings","s":seq}` on
+  `TypeTorch/deploy`); taken only when it verifies and its seq is newer; a missing, unsigned, invalid or older copy keeps
+  the last good one. `api:settings()` (a copy, server only: it holds tokens), `api:onSettingsChanged(fn)`,
+  `status().settings` (state, seq, age, verifiedBy, fields, refused). Written only by the CLI (`typetorch settings`,
+  `fleet setup`, `access push`). The Studio `Registry` / `BootAssetId` overrides and the ConfigService log quieting are
+  gone.
 - Game messaging (0.3.8, `src/server/Messaging.luau`; plans/19 item 4): game topics ride ONE MessagingService topic,
   `TypeTorch/game`, subscribed on the first listener and held for the server's life (a swap never subscribes again).
   `api:messagingSubscribe(topic, fn)` (fn(data, meta), dropped with the generation), `api:messagingPublish(topic, data,
@@ -153,7 +159,8 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, `--durable`, 0.3.6's `--hold`, `--hold-optout`,
   `--peers`, `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
   `--kernel-crash`, `--heads-cap`, `--access`, 0.3.7's `--health-config` and `--health-missing`, 0.3.8's
-  `--messaging`, `--messaging-studio`, `--messaging-missing`, `--client-boot` and `--client-own`, and `--boot-budget`, which runs 25 boot scenarios with simulated slow or failing dependencies and
+  `--messaging`, `--messaging-studio`, `--messaging-missing`, `--client-boot`, `--client-own`, `--settings` and
+  `--settings-missing`, and `--boot-budget`, which runs 25 boot scenarios with simulated slow or failing dependencies and
   checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.

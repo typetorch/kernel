@@ -9,8 +9,18 @@ return {
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
 	KERNEL_VERSION = "0.3.8",
 
-	-- Interim registry (until the backend exists): a DataStore written by the CLI through Open Cloud.
+	-- The kernel's DataStore: durable heads, deployments, private records, events, and (0.3.8) the signed settings.
 	DATASTORE = "TypeTorch",
+	-- 0.3.8 (plans/20): THE SIGNED SETTINGS RECORD, key SETTINGS_KEY in DATASTORE, written only by the CLI and signed
+	-- with both prod keys (Settings.luau). It replaces every ConfigService key (TypeTorch, TypeTorchFleet,
+	-- TypeTorchAccess, TypeTorchAnalytics). Read at boot, at most every SETTINGS_REFRESH_SECONDS from the sync tick, and
+	-- after a ping ({ k = "settings", s = seq } on DEPLOY_TOPIC) at most every SETTINGS_PING_GAP seconds. The body is
+	-- at most SETTINGS_BODY_MAX bytes, its `game` field at most SETTINGS_GAME_MAX.
+	SETTINGS_KEY = "settings",
+	SETTINGS_REFRESH_SECONDS = 55,
+	SETTINGS_PING_GAP = 5,
+	SETTINGS_BODY_MAX = 32768,
+	SETTINGS_GAME_MAX = 16384,
 	-- Fast path for deploys; the poll below is the backup (MessagingService delivery is best-effort).
 	DEPLOY_TOPIC = "TypeTorch/deploy",
 	-- 0.2.3: remote experiment pins (A/B) from Manage > Servers: { j?, pct?, a?, b, by, t, unpin? }.
@@ -22,7 +32,7 @@ return {
 	-- 0.3: the key asset is re-read about this often anyway.
 	KEYS_REFRESH_SECONDS = 600,
 	-- 0.3.2 BOOT BUDGET (user requirement): a new server runs a playable generation within BOOT_BUDGET seconds of the
-	-- kernel starting, in every path (plans/01 "Boot budget"). The boot reads (key asset, ConfigService, both copies of
+	-- kernel starting, in every path (plans/01 "Boot budget"). The boot reads (key asset, the settings, both copies of
 	-- the heads, the private record, the deployment list) all start at once; boot waits for them at most BOOT_READS_WAIT
 	-- seconds from the kernel start (a read that already failed isn't waited for; slow ones land later).
 	BOOT_BUDGET = 15,
@@ -85,8 +95,8 @@ return {
 	-- REPORTS_KEPT reports are kept and replayed to each new listener (api:deployReports()).
 	REPORTS_KEPT = 20,
 	-- 0.3.2 (user decision): the kernel also sends its fleet data itself, live and whatever the generation does, to the
-	-- dev's fleet API, when the server-only ConfigService key FLEET_KEY = { url, token } exists (Fleet.luau).
-	FLEET_KEY = "TypeTorchFleet",
+	-- dev's fleet API, when the signed settings hold `fleet` = { url, token } (Fleet.luau; 0.3.2-0.3.7: the ConfigService
+	-- key TypeTorchFleet).
 	-- The settings are read at boot and every this many seconds.
 	FLEET_SETTINGS_SECONDS = 300,
 	-- A heartbeat (the fleet status) at least this often, and right after a swap, a health change or (at most once per
@@ -169,14 +179,10 @@ return {
 	BOUNCE_MAX = 3,
 	KICK_MESSAGE = "Servers are restarting. Please rejoin in a minute.",
 	CLIENT_KICK_MESSAGE = "The game didn't load. Please rejoin.",
-	-- 0.3.6 (security audit, plans/18): the server-only ConfigService key with the dev lists (`typetorch access push`):
-	-- { v = 1, members, revoked, devBadgeId }; when it exists its lists replace the registry's. Re-read on every registry
-	-- change, on every ConfigService update (Registry.onUpdate), and at most every ACCESS_REFRESH_SECONDS from a check.
-	ACCESS_KEY = "TypeTorchAccess",
-	ACCESS_REFRESH_SECONDS = 60,
+	-- (0.3.6-0.3.7 read the dev lists from the ConfigService key TypeTorchAccess; 0.3.8: the signed settings' `access`.)
 	-- 0.3.6 (plans/18): the stored `heads` key holds at most this many branches; a deploy message for a NEW branch
 	-- beyond it isn't recorded (the CLI's durable copy still has it). Prod servers also ignore messages for branches they
-	-- don't know (not in ConfigService `channels`, not in the stored heads) unless the message is signed.
+	-- don't know (not in the settings' `channels`, not in the stored heads) unless the message is signed.
 	HEADS_MAX_BRANCHES = 32,
 	-- server -> client, tagged "*": { g } the client tree of generation g was re-sent to PlayerGui.TypeTorchResend (once,
 	-- after the client's own retry failed); the client waits at most CLIENT_RESEND_WAIT s for it.

@@ -1,7 +1,8 @@
 --!nonstrict
 -- 0.3.2 (user decision): the kernel sends this server's fleet data itself to the dev's fleet API, so it is live and
--- survives a broken (or missing) generation. Off unless the server-only ConfigService key "TypeTorchFleet" holds
--- { url = "https://...", token = "..." } (read at boot and every FLEET_SETTINGS_SECONDS; the token authorizes fleet
+-- survives a broken (or missing) generation. Off unless the signed settings (0.3.8, Settings.luau; before: the
+-- ConfigService key "TypeTorchFleet") hold `fleet` = { url = "https://...", token = "..." } (`typetorch fleet setup`;
+-- taken on every new settings copy and every FLEET_SETTINGS_SECONDS; the token authorizes fleet
 -- writes only and is never logged, printed or sent anywhere but the Authorization header). Studio sends nothing.
 --
 -- Requests (HttpService:RequestAsync, POST, JSON, `Authorization: Bearer <token>`); contract in plans/01 "Fleet API":
@@ -34,7 +35,7 @@ local deps = {
 	print = print,
 }
 
--- "unknown" (not read yet, or ConfigService unavailable: keep the last good), "absent", "ok", "invalid".
+-- "unknown" (the settings not read yet: keep the last good), "absent", "ok", "invalid".
 local settingsState = "unknown"
 local settings = nil -- { url, token, host }
 local settingsError = nil
@@ -60,7 +61,7 @@ function Fleet.enabled(): boolean
 	return deps.active and settingsState == "ok"
 end
 
--- Things worth keeping while the settings aren't known yet (a boot report before ConfigService answers).
+-- Things worth keeping while the settings aren't known yet (a boot report before the settings read lands).
 local function accepting(): boolean
 	return deps.active and not closed and (settingsState == "ok" or settingsState == "unknown")
 end
@@ -113,7 +114,7 @@ local function parseSettings(value): (any?, string?)
 	return { url = url, token = token, host = string.match(url, "^https://([^/]+)") }, nil
 end
 
--- Re-reads the settings (ConfigService snapshot, no web call). Unavailable: keep the last good ones.
+-- Takes the settings' `fleet` (the kernel's copy in memory, no web call). Not read yet: keep the last good ones.
 function Fleet.refreshSettings()
 	if not deps.active then
 		return
@@ -134,7 +135,7 @@ function Fleet.refreshSettings()
 	local parsed, why = parseSettings(value)
 	if not parsed then
 		if settingsState ~= "invalid" then
-			warnOnce("settings", `[TypeTorch] fleet settings ({Constants.FLEET_KEY}) ignored: {why}`)
+			warnOnce("settings", `[TypeTorch] fleet settings (settings.fleet) ignored: {why}`)
 		end
 		settingsState, settings, settingsError = "invalid", nil, why
 		table.clear(queue)
@@ -199,7 +200,7 @@ local function post(path: string, body): (boolean, boolean)
 	stats.lastError = `HTTP {tostring(code)}`
 	local retry = code == 429 or (typeof(code) == "number" and code >= 500)
 	if not retry then
-		warnOnce(`http{tostring(code)}`, `[TypeTorch] fleet API answered {tostring(code)} to {path}{if code == 401 or code == 403 then ` (check {Constants.FLEET_KEY}.token)` else ""}; dropped`)
+		warnOnce(`http{tostring(code)}`, `[TypeTorch] fleet API answered {tostring(code)} to {path}{if code == 401 or code == 403 then ` (check settings.fleet.token: typetorch fleet setup)` else ""}; dropped`)
 	end
 	return false, retry
 end

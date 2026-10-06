@@ -5,22 +5,17 @@
 -- once per server.
 -- Decided on the server only. Roblox has no in-game "edit access" API, so this is TypeTorch's own rule.
 --
--- 0.3.2 (audit S-M2): revocation fails closed. The revocation list comes with the registry; until a registry read has
--- succeeded on this server (Registry.known()), badge holders are NOT devs (a badge can't be revoked by the game, so the
--- list is the off switch). Studio and the owner are unaffected (the owner can't be revoked). A later failed read keeps
--- the last good registry (Registry), so revocations never vanish on an error.
+-- 0.3.2 (audit S-M2): revocation fails closed. Until a settings read has succeeded on this server (Registry.known()),
+-- badge holders and members are NOT devs (a badge can't be revoked by the game, so the list is the off switch). Studio
+-- and the owner are unaffected (the owner can't be revoked). A later failed or refused read keeps the last good copy
+-- (Settings.luau), so revocations never vanish on an error.
 -- 0.3.2 (audit P-K9): a failed badge, rank or group web call counts as "no" for ACCESS_FAILURE_CACHE seconds instead of
 -- being retried on every check (an outage must not turn every dev check into a web call); successes stay cached.
 --
--- 0.3.6 (security audit 2026-10-06, plans/18): the lists can also come from the server-only ConfigService key
--- ACCESS_KEY ("TypeTorchAccess", written by `typetorch access push`): { v = 1, members, revoked, devBadgeId }. The
--- registry key "TypeTorch" can't be written with an API key (its read scope is OAuth-only), so typetorch.json's members
--- never reached servers and only the creator was a dev. ConfigService can't be written by game code, so this key is as
--- trustworthy as the registry (a DataStore would not be: any code in the universe can write one and make itself an
--- owner on every server). When the key exists, its three lists REPLACE the registry's; without it nothing changes. It
--- is read through the sibling Registry module (the same ConfigService snapshot) on every setConfig and at most every
--- ACCESS_REFRESH seconds from a check, so a push reaches a server within about a minute of ConfigService delivering
--- it. A failed read keeps the last lists (S-M2 holds: revocations never vanish on an error).
+-- 0.3.8 (plans/20): the lists come from the signed settings record's `access` = { members, revoked, devBadgeId }
+-- (`typetorch access push`), which the kernel hands over with setConfig on every new good copy. The record is signed
+-- with both prod keys, so in-universe code can't add itself as an owner even though it can write the DataStore.
+-- (0.3.6-0.3.7 read them from the ConfigService key TypeTorchAccess, before that from the never-written registry.)
 
 local BadgeService = game:GetService("BadgeService")
 local RunService = game:GetService("RunService")
@@ -28,11 +23,8 @@ local Constants = require(game:GetService("ReplicatedStorage"):WaitForChild("Typ
 
 local Access = {}
 
-local ACCESS_KEY = Constants.ACCESS_KEY or "TypeTorchAccess"
-local ACCESS_REFRESH = Constants.ACCESS_REFRESH_SECONDS or 60
-
 local config = { members = {}, revoked = {} }
-local known = false -- the registry (and so `revoked`) has been read at least once on this server
+local known = false -- a settings read (and so `revoked`) has succeeded at least once on this server
 -- userId -> true/false badge ownership for this server's lifetime (cleared when the badge id changes).
 local badgeCache: { [number]: boolean } = {}
 -- userId -> owns the experience (user-owned: the creator; group-owned: rank 255 in the group).
@@ -92,26 +84,6 @@ local function normalizedMembers(members)
 	return result
 end
 
--- The ConfigService access key (0.3.6) --------------------------------------------------------------------------------
-
-local registryConfig = { members = {}, revoked = {} } -- what setConfig last received: the registry's lists
-local overlay = nil -- the parsed ACCESS_KEY value ({ members, revoked, devBadgeId }), or nil when the key is absent or bad
-local overlayReadAt = -math.huge
-local overlayNote = nil -- the last line printed about the key, so a change prints once
-local Registry = nil -- the sibling module, looked up on first use; false when there is none (a test harness)
-
-local function registry()
-	if Registry == nil then
-		local ok, module = pcall(function()
-			local parent = script.Parent
-			local sibling = if parent then parent:FindFirstChild("Registry") else nil
-			return if sibling then require(sibling) else nil
-		end)
-		Registry = if ok and typeof(module) == "table" and typeof(module.readKey) == "function" then module else false
-	end
-	return if Registry then Registry else nil
-end
-
 -- `revoked` as the CLI writes it ({ ["123"] = true }), or as a list of ids.
 local function normalizedRevoked(revoked)
 	local result = {}
@@ -128,23 +100,7 @@ local function normalizedRevoked(revoked)
 	return result
 end
 
--- A table (the configs API stores JSON objects) or a JSON string; nil unless it is a v1 access value.
-local function parseOverlay(value)
-	if typeof(value) == "string" then
-		local ok, decoded = pcall(function()
-			return game:GetService("HttpService"):JSONDecode(value)
-		end)
-		value = if ok then decoded else nil
-	end
-	if typeof(value) ~= "table" or value.v ~= 1 then
-		return nil
-	end
-	return {
-		members = normalizedMembers(value.members),
-		revoked = normalizedRevoked(value.revoked),
-		devBadgeId = tonumber(value.devBadgeId),
-	}
-end
+local listsNote = nil -- the last line printed about the lists, so a change prints once
 
 local function count(map): number
 	local n = 0
@@ -154,85 +110,28 @@ local function count(map): number
 	return n
 end
 
--- Rebuilds `config` from the registry's lists, replaced by the key's when it exists.
-local function apply()
+-- `lists` = { members, revoked, devBadgeId } (the settings' `access`, or empty); `isKnown` (0.3.2): a settings read
+-- has succeeded on this server (a missing record counts); see S-M2 above.
+function Access.setConfig(lists, isKnown: boolean?)
+	lists = if typeof(lists) == "table" then lists else {}
 	local before = config.devBadgeId
-	local next = table.clone(registryConfig)
-	next.members = normalizedMembers(registryConfig.members)
-	next.revoked = if typeof(registryConfig.revoked) == "table" then registryConfig.revoked else {}
-	if overlay then
-		next.members = overlay.members
-		next.revoked = overlay.revoked
-		next.devBadgeId = overlay.devBadgeId
-	end
-	if next.devBadgeId ~= before then
+	config = {
+		members = normalizedMembers(lists.members),
+		revoked = normalizedRevoked(lists.revoked),
+		devBadgeId = tonumber(lists.devBadgeId),
+	}
+	if config.devBadgeId ~= before then
 		table.clear(badgeCache)
 	end
-	config = next
-end
-
--- Re-reads the key: always with `force`, else at most every ACCESS_REFRESH seconds. ConfigService unavailable (or no
--- Registry module): the last lists stay.
-local function readOverlay(force: boolean?)
-	local now = os.clock()
-	if not force and now - overlayReadAt < ACCESS_REFRESH then
-		return
-	end
-	local reg = registry()
-	if not reg then
-		return
-	end
-	overlayReadAt = now
-	local ok, found, value = pcall(reg.readKey, ACCESS_KEY)
-	if not ok or not found then
-		return
-	end
-	local parsed = parseOverlay(value)
-	local note = if parsed
-		then `{count(parsed.members)} member(s), {count(parsed.revoked)} revoked{if parsed.devBadgeId then `, dev badge {parsed.devBadgeId}` else ""}`
-		elseif value ~= nil then "ignored: not a { v = 1, members, revoked, devBadgeId } value"
-		else nil
-	if note ~= overlayNote then
-		overlayNote = note
-		if parsed then
-			print(`[TypeTorch] dev access from ConfigService {ACCESS_KEY}: {note}`)
-		elseif value ~= nil then
-			warn(`[TypeTorch] ConfigService key {ACCESS_KEY} {note}`)
-		elseif overlay then
-			print(`[TypeTorch] ConfigService key {ACCESS_KEY} is gone: dev access from the registry again`)
-		end
-	end
-	overlay = parsed
-end
-
-local function maybeRefresh()
-	local before = overlay
-	readOverlay(false)
-	if overlay ~= before then
-		apply()
-	end
-end
-
--- Where the lists in force come from: "config-key" (ACCESS_KEY) or "registry".
-function Access.source(): string
-	return if overlay then "config-key" else "registry"
-end
-
--- Re-reads ACCESS_KEY now (the kernel may call it when ConfigService announces an update).
-function Access.refresh()
-	readOverlay(true)
-	apply()
-end
-
--- `isKnown` (0.3.2): the registry has been read on this server (Registry.known()); see S-M2 above.
-function Access.setConfig(newConfig, isKnown: boolean?)
-	registryConfig = table.clone(newConfig)
 	known = isKnown == true
-	readOverlay(true)
-	apply()
+	local note = `{count(config.members)} member(s), {count(config.revoked)} revoked{if config.devBadgeId then `, dev badge {config.devBadgeId}` else ""}`
+	if known and note ~= listsNote then
+		listsNote = note
+		print(`[TypeTorch] dev access from the settings: {note}`)
+	end
 end
 
--- Whether the revocation list is known (a registry read succeeded).
+-- Whether the revocation list is known (a settings read succeeded).
 function Access.revocationsKnown(): boolean
 	return known
 end
@@ -264,7 +163,6 @@ end
 -- "badge", "revoked", "none", and (0.3.2) "registry-unknown" (a badge or member check while the revocation list is
 -- unknown).
 function Access.check(player: Player): (boolean, string, string?)
-	maybeRefresh()
 	local key = tostring(player.UserId)
 	if config.revoked[key] then
 		return false, "revoked", nil
@@ -309,7 +207,6 @@ function Access.isOwnerUserId(userId: number): boolean
 	if typeof(userId) ~= "number" or userId <= 0 or userId % 1 ~= 0 then
 		return false
 	end
-	maybeRefresh()
 	local key = tostring(userId)
 	if config.revoked[key] then
 		return false
@@ -358,7 +255,6 @@ function Access.isDevUserId(userId: number): boolean
 	if typeof(userId) ~= "number" or userId <= 0 or userId % 1 ~= 0 then
 		return false
 	end
-	maybeRefresh()
 	if config.revoked[tostring(userId)] then
 		return false
 	end

@@ -17,8 +17,8 @@
 -- 0.3.2 (bad deploys are safe): a health window after ready (a failed onStart, or HEALTH_ERRORS errors from the new
 -- generation's own scripts, rolls the server back; P-F1), a last-known-good chain that skips artifacts that failed
 -- here (P-K3), the fleet status and per-deploy reports on the API (P-O1: api:fleetStatus, api:onDeployReport) and, when
--- the ConfigService key TypeTorchFleet is set, sent by the kernel itself to the dev's fleet API (Fleet.luau: heartbeats,
--- reports, alerts, closing), client generation reports (P-K7), onClose per generation, and every swap game code starts
+-- the settings hold `fleet` (before 0.3.8: the ConfigService key TypeTorchFleet), sent by the kernel itself to the dev's
+-- fleet API (Fleet.luau: heartbeats, reports, alerts, closing), client generation reports (P-K7), onClose per generation, and every swap game code starts
 -- runs on a kernel thread (busy-flag hazard).
 --
 -- 0.3.4 (owner switch): the dev menu's Switch and Load here are ordinary branch switches and pins on every server. On
@@ -108,6 +108,7 @@ do
 			report = noop,
 			alert = noop,
 			closing = noop,
+			refreshSettings = noop,
 			enabled = function()
 				return false
 			end,
@@ -402,7 +403,8 @@ local function trustedProd(branch: string, head): boolean
 	return signedProd(branch, head) or Signing.matchesBootstrap(branch, head)
 end
 
--- A branch's channel from sources game code can't write: ConfigService's `channels`, the default branch (prod), a
+-- A branch's channel from sources game code can't forge: the signed settings' `channels` (0.3.8; ConfigService before),
+-- the default branch (prod), a
 -- BootstrapHeads entry, or a signed prod head of that branch. Unsigned stored heads don't count (game code can write
 -- them).
 local function trustedChannelOf(branch: string?): string
@@ -489,7 +491,7 @@ local function bootstrapFor(branch: string)
 end
 
 -- What a prod server follows on `branch` (user decision 2026-10-04): the newest trusted head (signed, or matching
--- BootstrapHeads exactly) from ConfigService or the stores; else the bootstrap head itself; else nil. Admitted.
+-- BootstrapHeads exactly) from the stores; else the bootstrap head itself; else nil. Admitted.
 local function signedHead(branch: string)
 	local head = Registry.branchHead(branch, function(candidate)
 		return trustedProd(branch, candidate)
@@ -1232,7 +1234,7 @@ Fleet.configure({
 	jobId = game.JobId,
 	active = game.JobId ~= "" and serverType() ~= "studio",
 	readSettings = function()
-		return Registry.readKey(Constants.FLEET_KEY)
+		return Registry.settingsField("fleet") -- 0.3.8: the signed settings (was the ConfigService key TypeTorchFleet)
 	end,
 	status = fleetStatus,
 	encode = function(value)
@@ -1763,19 +1765,22 @@ local function followHead(reason: string, jitter: boolean?)
 	want(head, reason, jitter == true)
 end
 
--- 0.3.6 (plans/18): every ConfigService update re-reads the dev lists (TypeTorchAccess), even when the registry key
--- itself can't be read: a `typetorch access push` applies at once.
-Registry.onUpdate(function()
-	Access.refresh()
-end)
+-- 0.3.8: every new good copy of the signed settings (Settings.luau) brings the dev lists, channels and the default
+-- branch; a `typetorch access push` applies within seconds (the CLI pings servers).
 Registry.onChange(function(state)
 	Access.setConfig(state, Registry.known())
-	-- Public servers run the default branch. ConfigService may arrive after boot (P-K5) or change it. 0.3.4: a public
+	Fleet.refreshSettings() -- 0.3.8: the fleet API settings ride the same record
+	-- 0.3.8: the running generation hears it (api:onSettingsChanged; the framework's analytics and liveConfig).
+	local handler = current and current.settingsHandler
+	if handler then
+		task.spawn(handler, Registry.settings.copy())
+	end
+	-- Public servers run the default branch. The settings may arrive after boot (P-K5) or change it. 0.3.4: a public
 	-- server the owner switched keeps the owner's branch.
 	if myBranch and serverType() == "public" and not lastSwitch and typeof(state.defaultBranch) == "string" and state.defaultBranch ~= myBranch then
 		print(`[TypeTorch] default branch is now {state.defaultBranch} (was {myBranch})`)
 		myBranch = state.defaultBranch
-		appliedSeq = -1 -- a new branch (from ConfigService, which game code can't write); its newest head wins
+		appliedSeq = -1 -- a new branch (from the signed settings, which game code can't forge); its newest head wins
 	end
 	for _, player in Players:GetPlayers() do
 		sendDevStatus(player)
@@ -1798,7 +1803,7 @@ end
 
 -- Deploy messages: {b = branch, a = assetId, i = artifactId, s = seq, c = commit, ch = channel, t = sent ms,
 -- r = rollback?, ro = rollout % (0.2.3, 1-99)?, sig?, sigF? (0.3)}. Every server records the head (any branch) so
--- servers started later boot it even without a ConfigService registry. With `ro`, only servers whose jobBucket is below
+-- servers started later boot it (0.3.5: the CLI writes the durable copy too). With `ro`, only servers whose jobBucket is below
 -- it swap; the others keep their current artifact (plans/12 P-R1). 0.3: on prod servers a message counts only with a
 -- valid signature, `ch` = "prod" and a seq newer than the applied one (plans/03 "Signed prod messages").
 local function onDeployMessage(message)
@@ -1809,6 +1814,12 @@ local function onDeployMessage(message)
 	-- 0.3.6: a kernel roll call ask ({ rc = 1, q, j, b, t }) rides this topic (no extra subscription); not a deploy.
 	if data.rc == 1 then
 		Fallback.onAsk(data)
+		return
+	end
+	-- 0.3.8 (plans/20): the CLI wrote the signed settings ({ k = "settings", s = seq }): re-read them soon (debounced;
+	-- the content is only a hint, the record is verified). Older kernels ignore it (no branch).
+	if data.k == "settings" then
+		Registry.settings.ping(data.s)
 		return
 	end
 	lastMessage = {
@@ -1840,8 +1851,8 @@ local function onDeployMessage(message)
 	local sigF = if typeof(data.sigF) == "string" and #data.sigF <= 100 then data.sigF else nil
 	-- `r`: 1 = rollback; "resign" (0.3) = the CLI re-signed the running head after `keys rotate` (same asset, new seq).
 	local r = if data.r == 1 or data.r == "resign" then data.r else nil
-	-- 0.3.6 (plans/18): a prod server records another branch's deploy only when it knows the branch (ConfigService, the
-	-- stored heads) or the message is signed, so forged messages can't grow the stored heads and the deployment list.
+	-- 0.3.6 (plans/18): a prod server records another branch's deploy only when it knows the branch (the settings'
+	-- channels, the stored heads) or the message is signed, so forged messages can't grow the stored heads and the deployment list.
 	if data.b ~= myBranch and requiresSignatures(myBranch) and not Registry.knowsBranch(data.b) and not ((sig ~= nil or sigF ~= nil) and Signing.verifyDeploy(data, sig, sigF)) then
 		Registry.noteIgnoredBranch(data.b)
 		return
@@ -2816,7 +2827,11 @@ local function status()
 		maxPlayers = Players.MaxPlayers,
 		kernelVersion = Constants.KERNEL_VERSION,
 		kernelApi = Constants.KERNEL_API,
-		registryError = registryError,
+		-- 0.3.8: the last failed settings read (nil once a read works again).
+		registryError = if Registry.configSettled() and not Registry.connected() then Registry.readError() else nil,
+		-- 0.3.8 (plans/20): the signed settings record: { state, seq?, at?, age?, verifiedBy?, fields, reads, error?,
+		-- errorAt?, refused? } (never a value: it holds tokens).
+		settings = Registry.settings.status(),
 		memoryMb = Stats:GetTotalMemoryUsageMb(),
 		luaHeapKb = collectgarbage("count"),
 		appliedSeq = appliedSeq,
@@ -3040,6 +3055,13 @@ Api.init({
 	KERNEL_VERSION = Constants.KERNEL_VERSION,
 	-- 0.3.8: nil when the place doesn't map Messaging.luau (the API then has no messaging methods).
 	Messaging = if Messaging.missing then nil else Messaging,
+	-- 0.3.8 (plans/20): the signed settings, server only.
+	settings = function()
+		return Registry.settings.copy()
+	end,
+	settingsStatus = function()
+		return Registry.settings.status()
+	end,
 	Access = Access,
 	Transport = Transport,
 	Logs = Logs,
@@ -3166,7 +3188,8 @@ end)
 
 -- 0.3.2 BOOT BUDGET (user requirement; plans/01 "Boot budget"): a new server runs a playable generation within
 -- BOOT_BUDGET (15) seconds of the kernel start in every path, about 1-3 s normally. Every boot read starts now, in
--- parallel: the key asset, ConfigService, both copies of the heads, the private record and the deployment list. Boot
+-- parallel: the key asset, the signed settings (0.3.8; ConfigService before), both copies of the heads, the private
+-- record and the deployment list. Boot
 -- waits for them at most BOOT_READS_WAIT seconds from the kernel start (a read that already failed isn't waited for);
 -- slow ones land later: a late private record moves the server with a swap, late heads boot a server that runs nothing
 -- (or move it to a newer head). Before 0.3.2 these waits were serial (config 3 s, the private record with 1+2+4 s of
@@ -3176,7 +3199,7 @@ task.spawn(function()
 	Signing.refresh("boot")
 	keysRead = true
 end)
-Registry.start(0) -- ConfigService: connects and retries in the background
+Registry.start() -- 0.3.8: the signed settings (one DataStore read; the sync loop retries a failure)
 Registry.startBootReads() -- the MemoryStore and DataStore copies of the heads, in parallel
 task.spawn(Registry.refreshDeployments, 0) -- the deployment list (last-known-good candidates)
 startPrivateRead()
@@ -3189,7 +3212,7 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 	local state = Registry.state()
 	Access.setConfig(state, Registry.known())
 end
-local err = if Registry.connected() then nil else Registry.readError() or "ConfigService slow or unavailable (still retrying)"
+local err = if not Registry.configSettled() then "the settings read is slow (still waiting)" elseif Registry.connected() then nil else Registry.readError()
 registryError = err
 localMode = localPayloadSource() ~= nil -- 0.3.1: Studio only (localPayloadSource checks IsStudio)
 myBranch = chooseBranch()
@@ -3725,8 +3748,8 @@ local function retryPrivateRead()
 	end
 end
 
--- The one sync loop (0.3.2, Registry.startSync): every POLL_SECONDS the registry refreshes ConfigService (or retries
--- it), then this re-reads the stored head (the backup for missed messages) and follows it.
+-- The one sync loop (0.3.2, Registry.startSync): every POLL_SECONDS the registry re-reads the signed settings (at most
+-- every SETTINGS_REFRESH_SECONDS), then this re-reads the stored head (the backup for missed messages) and follows it.
 Registry.startSync(Constants.POLL_SECONDS, function()
 	if privateReadPending then
 		retryPrivateRead()

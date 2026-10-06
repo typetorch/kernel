@@ -1,0 +1,90 @@
+{
+	"fleet": {
+		"v": 1,
+		"seq": 1,
+		"at": "2026-10-06T12:00:00.000Z",
+		"body": "{\"fleet\":{\"token\":\"smoke-fleet-token-0123456789abcdef\",\"url\":\"https://fleet.example.test/api\"}}",
+		"sig": "9r7jji9VjBgkqj4vrFMUttjmvxez9v1EDz1+a0D0+Zs9jupR0V58XsulH4zF2L+rxm7WdCgkYuSd/M1u86oSDA==",
+		"sigF": "lnTSE5Fe5F1uyJNZZymVvOIH1ezoK6P1qJ/RsIVyhCccQzXEtqgV/4F7bUqOybWJqKXsOM+Jz1VIEljFcfM1CA=="
+	},
+	"fleetSlash": {
+		"v": 1,
+		"seq": 1,
+		"at": "2026-10-06T12:00:00.000Z",
+		"body": "{\"fleet\":{\"token\":\"smoke-fleet-token-0123456789abcdef\",\"url\":\"https://fleet.example.test/api/\"}}",
+		"sig": "Q8yokTU6sxVPVpDwTCsttxG4Qv0GebJ3Akk+67/W3+WHQ3WIBxvL9tqKYIB/CHcEAFLxjvKdeKavU5QJkjapAQ==",
+		"sigF": "z5ckdnLSTz94VyKblxWnNg5Kj41qllsQ8edgGL0EJmmBQYYwC6SRAiiwTFESRyLNf6K7+FeZSKTSSOxJtsncAA=="
+	},
+	"fleetOff": {
+		"v": 1,
+		"seq": 2,
+		"at": "2026-10-06T12:00:00.000Z",
+		"body": "{}",
+		"sig": "v7PCsdDydiVeoez0XpqcG4hz4bnUaeI3ppE6rYkwKpwE1j+AOwtof4OHks3RiMcc9sV9JBfO0HSGRbJSSnjZDQ==",
+		"sigF": "5q376Z40Mo/m6Np9YRLgxyui4geiaPhxJ/IOfyAA4axgiS+227k/fXi2BdhpIlIpovIY/HH+Q400fM6YV891Aw=="
+	},
+	"fleetOn": {
+		"v": 1,
+		"seq": 3,
+		"at": "2026-10-06T12:00:00.000Z",
+		"body": "{\"fleet\":{\"token\":\"smoke-fleet-token-0123456789abcdef\",\"url\":\"https://fleet.example.test/api\"}}",
+		"sig": "wpRwYcWbIwTP1+uy5dB4E6973qoTzcENcUQk02L3c2KxR/u2VRAP9t5FO/0+MfqHNomThSurDYLoec3VNnZMCA==",
+		"sigF": "gTL+a+LMbYtQLgp/e4vIUADDwgBCJgsMzxslGlMxtN+4/hvcS6tmzgXjKjSWtekxRhvpABC4O7l9ATghyRYoAQ=="
+	},
+	"switch": {
+		"v": 1,
+		"seq": 1,
+		"at": "2026-10-06T12:00:00.000Z",
+		"body": "{\"access\":{\"devBadgeId\":null,\"members\":{\"2\":\"admin\",\"4\":\"owner\"},\"revoked\":{}},\"defaultBranch\":\"prod\",\"fleet\":{\"token\":\"smoke-fleet-token-0123456789abcdef\",\"url\":\"https://fleet.example.test/api\"}}",
+		"sig": "DNmcJdVkkopAL8hbasp6FpJYlNmPLLd+8ChwhpXixzemboMTOnwc0oQfcY5P82rMPxwHFh/2/h57e46ZhEtXCA==",
+		"sigF": "eAI1Jj2crQ0HWlg2F8QzsyJojsHtPn0ZCiVTUwInJjUV2zzGA1nmexFNP5cDJd2xhVfkTVVEvkzkF1segFP0AA=="
+	},
+	"access1": {
+		"v": 1,
+		"seq": 1,
+		"at": "2026-10-06T12:00:00.000Z",
+		"body": "{\"defaultBranch\":\"prod\"}",
+		"sig": "dlyrGSN5Tus8g0mUfQ2zah1o/kY2ZCZUak2mmoxQs2RRN4Jm20elObYKs+rmDHcYizVCtTWe7hZVnehpN5b6Bw==",
+		"sigF": "FmRu5GPULXWc58WPZ1r7/yAdJ8ShnsLYY/DOrr23Ejc4PaKNzRmY3i9VxzitdDjfNpq+Bw+jFa3fByAx6EqmDg=="
+	},
+	"access2": {
+		"v": 1,
+		"seq": 2,
+		"at": "2026-10-06T12:00:00.000Z",
+		"body": "{\"access\":{\"devBadgeId\":null,\"members\":{\"9\":\"dev\"},\"revoked\":{}},\"defaultBranch\":\"prod\"}",
+		"sig": "k+ts5j1E9ZcjbHV2UwQaBnueb8ZjyYH7eDjV/HMR72WlnHsJsRKeWC2JAgPUt/4l9Su0FFKaohIWLakImf37Cg==",
+		"sigF": "ga9MLEpfJH7FtIEBnHHMXvpA4lMu0WS2u3QaKRS5K8ZpfKG5AKI2yrRU9B5jkqpMEH8iU9n9XCQXUjrWKmtBDg=="
+	},
+	"access3": {
+		"v": 1,
+		"seq": 3,
+		"at": "2026-10-06T12:00:00.000Z",
+		"body": "{\"access\":{\"devBadgeId\":null,\"members\":{},\"revoked\":{\"9\":true}},\"defaultBranch\":\"prod\"}",
+		"sig": "hWs5Iwjry+NAOCrkqZiIAXU0yKOCd2ophpiWStxYUp6R1M+xl5V5tw0XoGy4BNQ2PZxNnwse4hWN3Y32VpZSBA==",
+		"sigF": "C5u9xCBsRI7Uag3X3teFOy9sElPwUEcHBzc+dA15Oy20lpjGvJS8vF4kgfA7stdnVtZ4w6cC9eyza+X/XdoNCg=="
+	},
+	"s1": {
+		"v": 1,
+		"seq": 1,
+		"at": "2026-10-06T12:00:00.000Z",
+		"body": "{\"access\":{\"devBadgeId\":null,\"members\":{\"5\":\"owner\"},\"revoked\":{}},\"analytics\":{\"backend\":\"duckdb\",\"events\":\"https://analytics.example.test/v1/ingest\",\"token\":\"analytics-ingest-token-0123456789\"},\"channels\":{\"dev\":\"dev\",\"prod\":\"prod\"},\"defaultBranch\":\"prod\",\"game\":{\"flags\":{\"pvp\":true},\"shop.price\":50}}",
+		"sig": "dVv+zbxW7NN/bgoJdODRwwKtkhVlgU/v/IVW9z3hWTQkq9GnlTfTHX55pcD/DlIKrMC4ZPTM4obutdd+iWtABw==",
+		"sigF": "xvsy8gN+aNasr/agXNFyGqiP03i/J3PTnK+Ca3JSb875sQOQHBxrUfNEhaqf4s8EQG55Fe99505Z79XHYnLUCg=="
+	},
+	"s2": {
+		"v": 1,
+		"seq": 2,
+		"at": "2026-10-06T12:00:00.000Z",
+		"body": "{\"access\":{\"devBadgeId\":null,\"members\":{\"5\":\"owner\"},\"revoked\":{}},\"analytics\":{\"backend\":\"duckdb\",\"events\":\"https://analytics.example.test/v1/ingest\",\"token\":\"analytics-ingest-token-0123456789\"},\"channels\":{\"dev\":\"dev\",\"prod\":\"prod\"},\"defaultBranch\":\"prod\",\"game\":{\"flags\":{\"pvp\":false},\"shop.price\":75}}",
+		"sig": "KeBCxStk7pEMXTSwiuBU+WmA0mjRTCz6gPkrqUoefTN+ZGx1mZqbqpbm300Iyffb8asa6YmZt0MTUYsZAHpxDg==",
+		"sigF": "A22C8OQeptaD2g700lztVD8CQOHsUExeJTBUry47vBz6+Y6c9hBNRGdsyn6tYXHjcv0GotiQn7GQgNumq2shAA=="
+	},
+	"s5": {
+		"v": 1,
+		"seq": 5,
+		"at": "2026-10-06T12:00:00.000Z",
+		"body": "{\"access\":{\"devBadgeId\":null,\"members\":{\"5\":\"owner\"},\"revoked\":{}},\"analytics\":{\"backend\":\"duckdb\",\"events\":\"https://analytics.example.test/v1/ingest\",\"token\":\"analytics-ingest-token-0123456789\"},\"channels\":{\"dev\":\"dev\",\"prod\":\"prod\"},\"defaultBranch\":\"prod\",\"game\":{\"shop.price\":999}}",
+		"sig": "ZlvEq2jKRgOug6IjRTbWu1980/NBrmwU8CneEBau77YBigWA03l+Gds11JwAspDG0CmLCTCrZEZS4oJAc8imDg==",
+		"sigF": "0s6WEHZqO9zy91MBi7Jiv6OuoiusvTDyiE+c00jJ0Bamo+y0KlhHOLT/Rjo2zyvhX1OoFopSHUmLiADpcuiABQ=="
+	}
+}

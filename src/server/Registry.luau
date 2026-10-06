@@ -1,21 +1,19 @@
 --!nonstrict
--- Where the kernel learns which artifact a branch runs.
+-- Where the kernel learns which artifact a branch runs, and the project settings it follows.
 --
--- Interim registry (plans/05: the backend replaces it):
---   * ConfigService key "TypeTorch" (repository InExperienceConfig), written by the CLI through the Open Cloud configs
---     API (draft -> publish). Server-only (clients can't read configs) and pushed to live servers
---     (ConfigSnapshot.UpdateAvailable). One key, because a repository holds at most 100 keys and the game shares it:
+--   * The signed settings record (0.3.8, Settings.luau, plans/20; it replaced the ConfigService registry key
+--     "TypeTorch", which the CLI could never write with an API key): `defaultBranch`, `channels` and the dev lists
+--     (`access`). Registry.state() is built from it:
 --       { v, defaultBranch, channels = { [branch] = "prod"|"dev" }, members = { [userId] = role },
---         revoked = { [userId] = true }, devBadgeId?,
---         branches = { [name] = { artifactId, assetId, channel, commit, commitHash, seq, deployedAt, by } },
---         deployments = { newest last, at most 25 } }
+--         revoked = { [userId] = true }, devBadgeId?, branches = {}, deployments = {} }
+--     (`branches` and `deployments` stay empty since 0.3.8: heads and history come from the stores below).
 --   * In-game DataStore "TypeTorch" for what game servers write themselves (no Open Cloud scope needed):
 --       heads                      { [branch] = { assetId, artifactId, seq, commit, channel, deployedAt, rollout?, t?,
---                                  rollback?, sig?, sigF? } } (from deploy messages; the fallback registry when
---                                  ConfigService isn't written; higher seq wins, but a signed prod head (0.3) is never
---                                  replaced by an unsigned one; mirrored in MemoryStore HashMap "TypeTorch" for
---                                  polling; see "Branch heads" below). Game code can write these stores, so prod
---                                  servers (0.3) only follow heads whose signatures check out (Signing.luau).
+--                                  rollback?, sig?, sigF? } } (from deploy messages, and since 0.3.5 the CLI's durable
+--                                  copy; higher seq wins, but a signed prod head (0.3) is never replaced by an unsigned
+--                                  one; mirrored in MemoryStore HashMap "TypeTorch" for polling; see "Branch heads"
+--                                  below). Game code can write these stores, so prod servers (0.3) only follow heads
+--                                  whose signatures check out (Signing.luau).
 --       private/<PrivateServerId>  { branch, setBy, setAt, pin?, code? } (private and reserved servers' branch; `pin` =
 --                                  { assetId, artifactId, seq, commit, channel, branch, headSeq } boots that artifact
 --                                  until the branch gets a deploy newer than headSeq; `code` (0.3.2) = a reserved
@@ -24,258 +22,145 @@
 --                                  artifactId, assetId, commit, at, rollback?, rollout?, t?, sig?, sigF? } from deploy
 --                                  messages and known heads; rollout = the deploy's `ro` %, 0.2.3; t/sig/sigF 0.3;
 --                                  0.3.2: written by the server that won the head's MemoryStore update only)
+--       settings                   the signed settings record (0.3.8; written by the CLI only; Settings.luau)
 --       events/<date>/<job>/<n>    { action, at, ... }        (0.3.2: one key per event, SetAsync: automatic and
 --                                  server-local rollbacks, health rollbacks, pins, refusals; the 0.3.1 `events` list
 --                                  key is no longer written)
 --
--- Studio without published configs: ServerStorage.TypeTorchDev may carry a "Registry" JSON attribute (same shape) or a
--- "BootAssetId" number attribute; see Registry.studioOverride. 0.3.1: a "Payload" Model child is mounted instead of any
--- registry head (the kernel's "Studio local payload"; this module doesn't read it).
+-- Studio: ServerStorage.TypeTorchDev's `Branch` attribute picks the branch (the kernel's chooseBranch), and a
+-- "Payload" Model child is mounted instead of any head (the kernel's "Studio local payload"). 0.3.8: the `Registry`
+-- JSON and `BootAssetId` attributes (stand-ins for a ConfigService registry Studio couldn't read) are gone.
 
-local ConfigService = game:GetService("ConfigService")
 local DataStoreService = game:GetService("DataStoreService")
-local HttpService = game:GetService("HttpService")
-local RunService = game:GetService("RunService")
-local ServerStorage = game:GetService("ServerStorage")
 local Constants = require(game:GetService("ReplicatedStorage"):WaitForChild("TypeTorchKernelShared"):WaitForChild("Constants"))
 
-local CONFIG_KEY = "TypeTorch"
+-- 0.3.8: the signed settings. A place project that lists the kernel's files one by one and doesn't map Settings.luau yet
+-- still boots, with the defaults (defaultBranch "prod", no channels, only the creator as a dev, no fleet API), and says
+-- so.
+local Settings
+do
+	local module = script.Parent:FindFirstChild("Settings")
+	if module then
+		Settings = require(module)
+	else
+		warn("[TypeTorch] TypeTorchKernel.Settings is missing (map src/server/Settings.luau in the place project): no signed settings on this server (defaults)")
+		Settings = {
+			missing = true,
+			start = function() end,
+			refresh = function() end,
+			ping = function() end,
+			settled = function()
+				return true
+			end,
+			known = function()
+				return true
+			end,
+			readOk = function()
+				return true
+			end,
+			readError = function()
+				return nil
+			end,
+			current = function()
+				return nil
+			end,
+			copy = function()
+				return nil
+			end,
+			onChange = function()
+				return function() end
+			end,
+			field = function()
+				return true, nil
+			end,
+			status = function()
+				return { state = "missing", fields = {}, reads = 0, error = "the place doesn't map the kernel's Settings module" }
+			end,
+		}
+	end
+end
 
 local Registry = {}
 
-local snapshot = nil
-local state = nil
+-- The settings module (status, copies for the API, pings); Registry.state() is the part this module derives.
+Registry.settings = Settings
+
 local listeners = {}
 local store: DataStore? = nil
 
-local function normalize(value)
-	value = if typeof(value) == "table" then value else {}
-	value.v = value.v or 1
-	value.defaultBranch = value.defaultBranch or "prod"
-	value.channels = value.channels or {}
-	value.members = value.members or {}
-	value.revoked = value.revoked or {}
-	value.branches = value.branches or {}
-	value.deployments = value.deployments or {}
-	return value
-end
-
--- Studio fallback for places whose configs aren't readable in Studio.
-function Registry.studioOverride()
-	if not RunService:IsStudio() then
-		return nil
-	end
-	local dev = ServerStorage:FindFirstChild("TypeTorchDev")
-	if not dev then
-		return nil
-	end
-	local json = dev:GetAttribute("Registry")
-	if typeof(json) == "string" and json ~= "" then
-		local ok, decoded = pcall(HttpService.JSONDecode, HttpService, json)
-		if ok then
-			return normalize(decoded)
-		end
-	end
-	local assetId = dev:GetAttribute("BootAssetId")
-	if typeof(assetId) == "number" then
-		local branch = dev:GetAttribute("Branch") or "dev"
-		return normalize({
-			defaultBranch = branch,
-			channels = { [branch] = dev:GetAttribute("Channel") or "dev" },
-			branches = { [branch] = { assetId = assetId, artifactId = dev:GetAttribute("ArtifactId"), seq = 0 } },
-		})
-	end
-	return nil
-end
-
--- The engine warns 'Config value not found for key "TypeTorch"' on every GetValue of a missing key, which floods the
--- dev Logs tab. So once the key is missing, it is only read again after a publish (UpdateAvailable, or the key's own
--- changed signal), never from the periodic refresh.
-local keyMissing = false
--- 0.3.2 (audit S-M2): whether a registry read has ever succeeded (a missing key counts: no registry, nothing revoked).
--- Until then `revoked` is unknown and Access denies badge devs. A failed read later keeps the last good registry.
-local known = false
-local lastReadError: string? = nil
-local configFirstFailed = false -- 0.3.2 (boot budget): the first GetConfigAsync failed (boot doesn't wait for retries)
-
--- (ok, value): ok = false when the read itself failed (keep what we have); value = nil when the key is missing.
-local function read(): (boolean, any)
-	if not snapshot then
-		return false, nil
-	end
-	if keyMissing then
-		return true, nil
-	end
-	local ok, value = pcall(function()
-		return snapshot:GetValue(CONFIG_KEY)
-	end)
-	if not ok then
-		lastReadError = tostring(value)
-		return false, nil
-	end
-	keyMissing = value == nil
-	return true, value
-end
-
--- Re-reads the registry; a failed read keeps the last good state (S-M2: a read error never empties `revoked`).
-local function changed()
-	local ok, value = read()
-	if not ok then
-		return
-	end
-	known = true
-	lastReadError = nil
-	local newState = normalize(value)
-	local before = state
-	state = newState
-	for _, listener in listeners do
-		task.spawn(listener, newState, before)
-	end
-end
-
--- 0.3.6 (plans/18): fn() after every ConfigService update (UpdateAvailable), whatever the registry key did; the
--- kernel re-reads the dev lists (Access.refresh) there, so a `typetorch access push` applies at once.
-local updateListeners: { () -> () } = {}
--- Other server-only keys of the same snapshot that were missing (Registry.readKey); a publish may have added them.
-local otherMissing: { [string]: boolean } = {}
-function Registry.onUpdate(fn: () -> ())
-	table.insert(updateListeners, fn)
-end
-
-local function watch()
-	snapshot.UpdateAvailable:Connect(function()
-		pcall(function()
-			snapshot:Refresh()
-		end)
-		keyMissing = false -- a publish may have added the key
-		table.clear(otherMissing) -- and the other keys (before the listeners read them)
-		changed()
-		for _, listener in updateListeners do
-			task.spawn(listener)
-		end
-	end)
-	-- Also covers a key added by a Refresh from the sync loop (if the engine has the per-key signal).
-	pcall(function()
-		snapshot:GetValueChangedSignal(CONFIG_KEY):Connect(function()
-			keyMissing = false
-			changed()
-		end)
-	end)
-end
-
--- One GetConfigAsync attempt; on success the snapshot is watched and its value read (listeners fire).
-local function connect(): (boolean, string?)
-	local ok, result = pcall(ConfigService.GetConfigAsync, ConfigService)
-	if not ok then
-		lastReadError = tostring(result)
-		return false, tostring(result)
-	end
-	snapshot = result
-	watch()
-	changed()
-	return true, nil
-end
-
--- Loads the config and keeps it fresh: UpdateAvailable, plus the sync loop's Refresh (Registry.startSync). Returns
--- (state, error). In Studio, a TypeTorchDev override wins.
--- 0.3 (audit P-K5): ConfigService is off the boot path. The first retries (with backoff, about 60 s) run on their own
--- thread; boot waits at most `bootWait` seconds for the first snapshot and continues with an empty registry (the
--- stored heads still work). A snapshot that arrives later fires the onChange listeners like any update. 0.3.2: after
--- those retries the sync loop keeps trying once per tick (S-M2: "retry the boot read").
-function Registry.start(bootWait: number?): (any, string?)
-	local override = Registry.studioOverride()
-	if override then
-		state = override
-		known = true
-		return state, nil
-	end
-	state = normalize(nil)
-	local finished = false
-	task.spawn(function()
-		local delay = 1
-		for attempt = 1, 6 do
-			local ok, connectError = connect()
-			if ok then
-				break
+-- Registry.state() from a settings body (nil: the defaults).
+local function stateFrom(body)
+	body = if typeof(body) == "table" then body else {}
+	local access = if typeof(body.access) == "table" then body.access else {}
+	local channels = {}
+	if typeof(body.channels) == "table" then
+		for branch, channel in body.channels do
+			if typeof(branch) == "string" and (channel == "prod" or channel == "dev") then
+				channels[branch] = channel
 			end
-			configFirstFailed = true
-			warn(`[TypeTorch] ConfigService unavailable (attempt {attempt}): {connectError}`)
-			task.wait(delay)
-			delay = math.min(delay * 2, 30)
 		end
-		finished = true
-	end)
-	local deadline = os.clock() + (bootWait or 3)
-	while not finished and not snapshot and os.clock() < deadline do
-		task.wait(0.05)
 	end
-	if not snapshot then
-		return state, if finished then "ConfigService unavailable" else "ConfigService slow (still retrying)"
-	end
-	return state, nil
+	return {
+		v = 1,
+		defaultBranch = if typeof(body.defaultBranch) == "string" and body.defaultBranch ~= "" then body.defaultBranch else "prod",
+		channels = channels,
+		members = if typeof(access.members) == "table" then access.members else {},
+		revoked = if typeof(access.revoked) == "table" then access.revoked else {},
+		devBadgeId = tonumber(access.devBadgeId),
+		branches = {},
+		deployments = {},
+	}
 end
 
--- 0.3.2 (boot budget): whether boot may stop waiting for ConfigService: a snapshot came, the first attempt already
--- failed (a place without configs answers at once; the retries go on in the background), or a Studio override.
+local state = stateFrom(nil)
+
+-- Every new good copy of the settings (and the first successful read, even of a missing record) rebuilds the state and
+-- tells the listeners (fn(newState, oldState)).
+Settings.onChange(function(body)
+	local before = state
+	state = stateFrom(body)
+	for _, listener in listeners do
+		task.spawn(listener, state, before)
+	end
+end)
+
+-- Starts the boot read of the settings (doesn't yield; boot waits for Registry.configSettled within its gate). Returns
+-- the state (the defaults until the read lands).
+function Registry.start(): any
+	Settings.start()
+	return state
+end
+
+-- 0.3.2 (boot budget): whether boot may stop waiting for the settings: the first read finished (found, missing or
+-- failed; a failure is retried by the sync loop).
 function Registry.configSettled(): boolean
-	return snapshot ~= nil or configFirstFailed or Registry.studioOverride() ~= nil
+	return Settings.settled()
 end
 
--- A ConfigService snapshot (or the Studio override) is there.
+-- The last settings read succeeded.
 function Registry.connected(): boolean
-	return snapshot ~= nil or Registry.studioOverride() ~= nil
+	return Settings.readOk()
 end
 
--- 0.3.2 (S-M2): a registry read has succeeded at least once, so `revoked` (and `members`) are known.
+-- 0.3.2 (S-M2): a settings read has succeeded at least once (a missing record counts), so `revoked` (and `members`)
+-- are known.
 function Registry.known(): boolean
-	return known
+	return Settings.known()
 end
 
--- 0.3.2: another server-only ConfigService key of the same snapshot (e.g. "TypeTorchFleet"). Returns (ok, value): ok =
--- false while ConfigService is unavailable (keep what you have), value = nil when the key is missing. A missing key is
--- read again only after a publish (UpdateAvailable or the key's own changed signal): the engine warns on every read of
--- a missing key.
-local otherWatched: { [string]: boolean } = {}
-function Registry.readKey(key: string): (boolean, any)
-	if not snapshot then
-		return false, nil
-	end
-	if not otherWatched[key] then
-		otherWatched[key] = true
-		pcall(function()
-			snapshot:GetValueChangedSignal(key):Connect(function()
-				otherMissing[key] = nil
-			end)
-		end)
-		pcall(function()
-			snapshot.UpdateAvailable:Connect(function()
-				otherMissing[key] = nil
-			end)
-		end)
-	end
-	if otherMissing[key] then
-		return true, nil
-	end
-	local ok, value = pcall(function()
-		return snapshot:GetValue(key)
-	end)
-	if not ok then
-		return false, nil
-	end
-	if value == nil then
-		otherMissing[key] = true
-	end
-	return true, value
-end
-
--- 0.3.2: the last registry read error since the last success, or nil.
+-- The last settings problem (a failed read, a refused copy), or nil.
 function Registry.readError(): string?
-	return lastReadError
+	return Settings.readError()
 end
 
--- 0.3.2 (audit: one sync loop owner): THE periodic loop of the kernel. Every `interval` seconds it refreshes
--- ConfigService (or retries connecting to it), then calls `onTick` (the kernel re-reads the stored head and follows
--- it). Errors in a tick are logged and don't end the loop. Call once.
+-- (ok, value) of one settings field (e.g. "fleet"): ok = false until the first read finished, value = nil when missing.
+function Registry.settingsField(name: string): (boolean, any)
+	return Settings.field(name)
+end
+
+-- 0.3.2 (audit: one sync loop owner): THE periodic loop of the kernel. Every `interval` seconds it re-reads the
+-- settings (at most every SETTINGS_REFRESH_SECONDS), then calls `onTick` (the kernel re-reads the stored head and
+-- follows it). Errors in a tick are logged and don't end the loop. Call once.
 local syncStarted = false
 function Registry.startSync(interval: number, onTick: () -> ())
 	assert(not syncStarted, "Registry.startSync runs once")
@@ -283,20 +168,9 @@ function Registry.startSync(interval: number, onTick: () -> ())
 	task.spawn(function()
 		while true do
 			task.wait(interval)
-			if Registry.studioOverride() == nil then
-				if snapshot then
-					pcall(function()
-						snapshot:Refresh()
-					end)
-					if not keyMissing then
-						local ok, value = read()
-						if ok and (not known or HttpService:JSONEncode(normalize(value)) ~= HttpService:JSONEncode(state)) then
-							changed()
-						end
-					end
-				else
-					connect()
-				end
+			local settingsOk, settingsError = pcall(Settings.refresh, Constants.SETTINGS_REFRESH_SECONDS)
+			if not settingsOk then
+				warn(`[TypeTorch] settings refresh failed: {settingsError}`)
 			end
 			local ok, tickError = pcall(onTick)
 			if not ok then
@@ -307,7 +181,7 @@ function Registry.startSync(interval: number, onTick: () -> ())
 end
 
 function Registry.state()
-	return state or normalize(nil)
+	return state
 end
 
 -- fn(newState, oldState) after every change.
@@ -315,9 +189,9 @@ function Registry.onChange(fn)
 	table.insert(listeners, fn)
 end
 
--- Branch heads persisted by game servers from deploy messages. This keeps the system working when the CLI can't write
--- ConfigService (missing `universe:write` scope): every server that receives a deploy message records the head, so
--- servers started later still boot the right artifact. The head with the higher seq wins between the sources.
+-- Branch heads persisted by game servers from deploy messages (and, 0.3.5, by the CLI): every server that receives a
+-- deploy message records the head, so servers started later still boot the right artifact. The head with the higher
+-- seq wins between the sources.
 --
 -- All heads live in ONE key, { [branch] = head }, so a read is one request and listing branches needs no ListKeysAsync
 -- (its budget is a few calls per minute per server; the dev menu used to hit it on every Branch tab load):
@@ -678,29 +552,17 @@ function Registry.storedBranches(): { string }
 	return names
 end
 
--- The branch's head: the newer of the ConfigService head and the stored head. 0.3: with `accept`, only heads it
--- accepts count (prod servers pass a check for signed prod heads).
+-- The branch's stored head (0.3.8: the only source; the ConfigService head is gone). 0.3: with `accept`, only a head it
+-- accepts counts (prod servers pass a check for signed prod heads).
 function Registry.branchHead(name: string, accept: ((any) -> boolean)?)
-	local fromConfig = Registry.state().branches[name]
 	local fromStore = storedHeads[name]
-	if accept then
-		if fromConfig and not (isHead(fromConfig) and accept(fromConfig)) then
-			fromConfig = nil
-		end
-		if fromStore and not (isHead(fromStore) and accept(fromStore)) then
-			fromStore = nil
-		end
+	if fromStore and accept and not (isHead(fromStore) and accept(fromStore)) then
+		return nil
 	end
-	if fromConfig and fromStore then
-		local storeSeq, configSeq = fromStore.seq or 0, fromConfig.seq or 0
-		-- 0.2.3: the same deploy from a message carries its rollout %; a config head without one would undo it.
-		local sameWithRollout = storeSeq == configSeq and fromStore.assetId == fromConfig.assetId and fromStore.rollout ~= nil and fromConfig.rollout == nil
-		return if storeSeq > configSeq or sameWithRollout then fromStore else fromConfig
-	end
-	return fromConfig or fromStore
+	return fromStore
 end
 
--- 0.3 boot fail-safe: every head this server can find for `branch` (ConfigService, the cached copy, and what the boot
+-- 0.3 boot fail-safe: every head this server can find for `branch` (the cached copy, and what the boot
 -- reads of the MemoryStore and DataStore copies brought), distinct by asset and seq, newest seq first. 0.3.2: no yield.
 -- Untrusted: the kernel checks each one.
 function Registry.bootCandidates(branch: string): { any }
@@ -714,7 +576,6 @@ function Registry.bootCandidates(branch: string): { any }
 			end
 		end
 	end
-	add(Registry.state().branches[branch])
 	add(storedHeads[branch])
 	-- 0.3.2 (boot budget): the copies the boot reads brought (no new read here, so a slow store can't hold the boot).
 	if bootMemory.ok then
@@ -730,11 +591,10 @@ function Registry.bootCandidates(branch: string): { any }
 	return list
 end
 
--- 0.3.6 (plans/18): whether this server knows `branch` (ConfigService `channels` or `branches`, or a stored head). Prod
--- servers record deploy messages of unknown branches only when they are signed.
+-- 0.3.6 (plans/18): whether this server knows `branch` (the settings' `channels`, or a stored head). Prod servers record
+-- deploy messages of unknown branches only when they are signed.
 function Registry.knowsBranch(branch: string): boolean
-	local state = Registry.state()
-	return state.channels[branch] ~= nil or state.branches[branch] ~= nil or storedHeads[branch] ~= nil
+	return Registry.state().channels[branch] ~= nil or storedHeads[branch] ~= nil
 end
 
 -- A deploy message of an unknown branch was ignored: one line per minute at most, with the count.
@@ -754,11 +614,11 @@ function Registry.ignoredBranches(): number
 	return ignored.count
 end
 
--- 0.3: both candidate heads of a branch (ConfigService, stored), either may be nil.
+-- 0.3: the candidate heads of a branch: (nil, stored). 0.3.8: the first (the ConfigService head) is always nil; the
+-- shape stays for the callers.
 function Registry.headCandidates(name: string): (any?, any?)
-	local fromConfig = Registry.state().branches[name]
 	local fromStore = storedHeads[name]
-	return if isHead(fromConfig) then fromConfig else nil, if isHead(fromStore) then fromStore else nil
+	return nil, if isHead(fromStore) then fromStore else nil
 end
 
 function Registry.channelOf(branch: string): string
@@ -813,7 +673,7 @@ function Registry.setPrivateBranch(privateServerId: string, branch: string, user
 	return ok, if ok then nil else tostring(err)
 end
 
--- Deployment history (in-game DataStore key "deployments", merged with ConfigService `deployments`) -----------------
+-- Deployment history (in-game DataStore key "deployments") -----------------------------------------------------------
 -- Every server that hears a deploy message records it, so the dev menu can list and pin earlier artifacts without the
 -- CLI's registry. Entries are deduped by branch + seq (seq is global across branches); the newest 100 are kept.
 
@@ -996,11 +856,11 @@ function Registry.writeDeploymentsDurably(entries: { any })
 	writeDeployments(entries)
 end
 
--- Every known deployment, newest first: ConfigService `deployments` (when readable), then the stored list, then
+-- Every known deployment, newest first: the stored list, then
 -- `extra` (this server's own history), at most DEPLOYMENTS_KEPT plus any `keep` entries (branch heads) the cap cut.
 -- Plain tables; callers may add fields.
 function Registry.deployments(extra: { any }?, keep: { any }?): { any }
-	local lists = { Registry.state().deployments, storedDeployments, keep or {}, extra or {} }
+	local lists = { storedDeployments, keep or {}, extra or {} }
 	local merged = mergeDeployments(lists, Constants.DEPLOYMENTS_KEPT)
 	if keep and #keep > 0 then
 		local listed = {}

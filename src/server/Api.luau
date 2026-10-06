@@ -201,6 +201,23 @@ function Api.forEntry(entry: Script)
 		return services.accessCode()
 	end
 
+	-- Kernel 0.3.8 (additive): the signed settings record (plans/20; Settings.luau). SERVER ONLY: it holds tokens (fleet,
+	-- analytics); never send any of it to a client. `settings` doubles as the feature test.
+	-- A copy of the verified settings: { seq, at, defaultBranch?, channels?, access?, fleet?, analytics?, game? }, or nil
+	-- (no good copy yet: missing, unsigned, invalid or not read).
+	function api:settings()
+		return services.settings()
+	end
+	-- { state, seq?, at?, age?, verifiedBy?, fields, reads, error?, errorAt?, refused? } (no values).
+	function api:settingsStatus()
+		return services.settingsStatus()
+	end
+	-- fn(settings) with a fresh copy (or nil) after every new good copy while this generation runs. One handler per
+	-- generation; the framework installs it and fans out.
+	function api:onSettingsChanged(fn)
+		generation.settingsHandler = if typeof(fn) == "function" then fn else nil
+	end
+
 	-- Kernel 0.3.8 (additive): game messaging on one kernel-held topic, and the held roll call topic (plans/19 item 4,
 	-- Messaging.luau). Left out when the place doesn't map Messaging.luau; `messagingPublish` doubles as the feature test.
 	local Messaging = services.Messaging
