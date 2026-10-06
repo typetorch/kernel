@@ -52,6 +52,7 @@
 				"Fleet": { "$path": "src/server/Fleet.luau" },
 				"Fallback": { "$path": "src/server/Fallback.luau" },
 				"Health": { "$path": "src/server/Health.luau" },
+				"Messaging": { "$path": "src/server/Messaging.luau" },
 				"Registry": { "$path": "src/server/Registry.luau" },
 				"Transport": { "$path": "src/server/Transport.luau" },
 				"Signing": { "$path": "src/server/Signing.luau" },

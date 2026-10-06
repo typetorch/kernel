@@ -201,6 +201,30 @@ function Api.forEntry(entry: Script)
 		return services.accessCode()
 	end
 
+	-- Kernel 0.3.8 (additive): game messaging on one kernel-held topic, and the held roll call topic (plans/19 item 4,
+	-- Messaging.luau). Left out when the place doesn't map Messaging.luau; `messagingPublish` doubles as the feature test.
+	local Messaging = services.Messaging
+	if Messaging then
+		-- fn(data, meta) for every message on game topic `topic` while this generation runs; meta = { channel, branch,
+		-- jobId, serverType, placeVersion?, sentAt, self, replayed? } (the sender's tags). Returns a disconnect function.
+		function api:messagingSubscribe(topic: string, fn)
+			return Messaging.subscribe(generation, topic, fn)
+		end
+		-- One message to every server's listeners of `topic` (this server's too). `options.to` = "all" | "prod" | "branch".
+		-- Doesn't yield. Returns { ok, queued?, loopback?, size?, error?, detail?, limit?, overhead? }.
+		function api:messagingPublish(topic: string, data: any, options: any?)
+			return Messaging.publish(generation, topic, data, options)
+		end
+		-- Counters, the queue, the universe's rate on the game topic and this server's budget (cheap, no yield).
+		function api:messagingStatus()
+			return Messaging.status()
+		end
+		-- fn(data) for every roll call ask on TypeTorch/rollcall while this generation runs (one handler per generation).
+		function api:onRollCall(fn)
+			Messaging.onRollCall(generation, fn)
+		end
+	end
+
 	-- Entry-only (not on the TS interface).
 	function api.ready(stop: () -> ())
 		generation.stop = stop

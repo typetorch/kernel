@@ -155,6 +155,24 @@ do
 	end
 end
 
+-- 0.3.8: game messaging and the held roll call topic live in Messaging.luau (plans/19 item 4). A place project that
+-- lists the kernel's files one by one and doesn't map it yet still boots: the API leaves out the messaging methods (the
+-- framework says what is missing) and says so.
+local Messaging
+do
+	local module = script.Parent:FindFirstChild("Messaging")
+	if module then
+		Messaging = require(module)
+	else
+		warn("[TypeTorch] TypeTorchKernel.Messaging is missing (map src/server/Messaging.luau in the place project): no TypeTorch.messaging on this server")
+		Messaging = setmetatable({ missing = true }, {
+			__index = function()
+				return function() end
+			end,
+		})
+	end
+end
+
 Logs.start()
 
 -- 0.3.2 (busy-flag hazard, plans/12): work that game code starts (reload, rollback, switchBranch, pins) runs on a
@@ -902,6 +920,7 @@ local function stopGeneration(generation, info): number
 	local started = os.clock()
 	generation.stopping = true -- 0.3.2: its errors from here on don't count (a stop is not a health failure)
 	Transport.detach()
+	Messaging.dropGeneration(generation) -- 0.3.8: its game message listeners and roll call handler go with it
 	if generation.stop then
 		-- 0.3 (audit P-K4): the stop function gets STOP_DEADLINE seconds; a stop that yields longer is cancelled and
 		-- the hard stop below runs anyway, so one stuck onStop can't hold every swap (and this server) hostage.
@@ -2840,6 +2859,8 @@ local function status()
 		-- hold, peers, backup, recovery and moves ({ hold, backup, peers, chain, recovery, moving, clients }).
 		backup = if current and current.backup then true else nil,
 		fallback = Fallback.status(),
+		-- 0.3.8: game messaging on the held topic and the roll call (Messaging.status); nil without the module.
+		messaging = if Messaging.missing then nil else Messaging.status(),
 	}
 end
 
@@ -2991,9 +3012,34 @@ local function onKernel(fn)
 	end
 end
 
+-- 0.3.8: game messaging (Messaging.luau). Subscriptions and the sender run on kernel threads (a generation's hard stop
+-- must not end them); messages that arrive while a swap runs are kept for the next generation.
+Messaging.configure({
+	jobId = game.JobId,
+	placeVersion = game.PlaceVersion,
+	self = function()
+		return {
+			b = myBranch,
+			c = if current then current.channel else effectiveChannel(myBranch or "", nil),
+			s = serverType(),
+		}
+	end,
+	swapping = function()
+		return busy or current == nil
+	end,
+	closing = function()
+		return closing
+	end,
+	onKernel = spawnOnKernel,
+	warn = warn,
+	print = print,
+})
+
 Api.init({
 	KERNEL_API = Constants.KERNEL_API,
 	KERNEL_VERSION = Constants.KERNEL_VERSION,
+	-- 0.3.8: nil when the place doesn't map Messaging.luau (the API then has no messaging methods).
+	Messaging = if Messaging.missing then nil else Messaging,
 	Access = Access,
 	Transport = Transport,
 	Logs = Logs,

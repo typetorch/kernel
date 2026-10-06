@@ -11,6 +11,15 @@
 -- UIScale pop in and out, no emojis (the user's UI rules). It is built before anything else waits, from the `Hold`
 -- attribute on this script (the server sets it; ReplicatedFirst replicates first), so a joining player is covered at
 -- once. It never blocks the kernel: every UI call is guarded.
+--
+-- 0.3.8 (plans/19 item 13): LOADING SCREENS. Place scripts (a game's own loading screen in ReplicatedFirst) read
+-- attributes this script sets on itself: `ClientReady` = true once this player's first client generation runs,
+-- `ClientGeneration` = the running client generation's name (nil while none runs), `Holding` = the mode the holding
+-- screen is in ("start" | "load" | "move"; nil when nothing holds), whether or not the kernel draws it. The server copies
+-- the game's settings onto this script before anyone joins: `BootScreen` (a ScreenGui in ReplicatedFirst: cloned into
+-- PlayerGui at once, removed when the first client generation runs or after 60 s) and `KernelScreen` = false (the game
+-- shows its own loading screen). Either way the kernel's "Starting..." / "Loading..." screen stays off until the first
+-- client generation ran (one screen at a time; "Reconnecting..." for a move always shows).
 
 local scriptStartedAt = os.clock()
 local LogService = game:GetService("LogService")
@@ -31,8 +40,22 @@ do
 		ui = nil, -- { gui, backdrop, scale, label, fill, mode }
 		failed = false, -- building the UI failed once: don't try again
 		ticking = false,
+		-- 0.3.8 loading screens: the game's settings (from the server, on this script), the boot screen's clone, and
+		-- whether this player's first client generation ran.
+		bootName = script:GetAttribute("BootScreen"),
+		kernelScreen = script:GetAttribute("KernelScreen") ~= false,
+		bootPending = false, -- waiting for the boot screen to replicate
+		boot = nil, -- the boot screen's clone in PlayerGui
+		everReady = false, -- this player's first client generation ran (ClientReady)
+		handedOver = false, -- ... and the server's first hold ended: from now on the kernel's screen works as in 0.3.6
 	}
 	holdScreen = state
+	-- Constants.BOOT_SCREEN_WAIT / BOOT_SCREEN_TIMEOUT (this runs before Constants can be required).
+	local BOOT_WAIT, BOOT_TIMEOUT = 5, 60
+
+	local function mark(name: string, value: any)
+		pcall(script.SetAttribute, script, name, value)
+	end
 
 	local function tween(instance, seconds, goal, style, direction)
 		local TweenService = game:GetService("TweenService")
@@ -139,11 +162,23 @@ do
 		end)
 	end
 
+	-- 0.3.8: until this player's first client generation ran and the server's first hold ended, the game's own loading
+	-- screen (the boot screen, or one its scripts draw: KernelScreen = false) stands in for the kernel's "Starting..." /
+	-- "Loading..."; a move always shows.
+	local function suppressed(mode: string?): boolean
+		if mode == nil or mode == "move" or state.handedOver then
+			return false
+		end
+		return state.boot ~= nil or state.bootPending or not state.kernelScreen
+	end
+
 	refresh = function()
+		local raw = wanted()
+		mark("Holding", raw)
 		if state.failed then
 			return
 		end
-		local mode = wanted()
+		local mode = if suppressed(raw) then nil else raw
 		local ok, err = pcall(function()
 			if mode then
 				if not state.ui then
@@ -180,6 +215,9 @@ do
 			state.releasedAt = os.clock()
 		end
 		state.server = mode
+		if state.handOver then
+			state.handOver()
+		end
 		refresh()
 	end
 	-- The server marks the hold on this script (first) and on ReplicatedStorage.TypeTorch (`state.root`, once known).
@@ -192,6 +230,73 @@ do
 	end
 	state.serverHold = serverHold
 	script:GetAttributeChangedSignal("Hold"):Connect(serverHold)
+
+	-- 0.3.8: the boot screen goes (handed over, or BOOT_TIMEOUT passed).
+	local function removeBoot()
+		local gui = state.boot
+		state.boot = nil
+		state.bootPending = false
+		if gui then
+			pcall(gui.Destroy, gui)
+		end
+		refresh()
+	end
+	-- 0.3.8: the first client generation runs and the server's first hold is over (characters spawn): the game's loading
+	-- screen goes, and the kernel's holding screen works as in 0.3.6 for later holds.
+	function state.handOver()
+		if state.handedOver or not state.everReady or state.server ~= nil then
+			return
+		end
+		state.handedOver = true
+		removeBoot()
+	end
+	-- 0.3.8: this player's client generation `name` runs (nil: none runs now). The first one sets ClientReady.
+	function state.ran(name: string?)
+		mark("ClientGeneration", name)
+		if name and not state.everReady then
+			state.everReady = true
+			mark("ClientReady", true)
+			state.handOver()
+		end
+	end
+	-- 0.3.8: the boot screen: a clone of ReplicatedFirst.<BootScreen> (a ScreenGui), shown at once.
+	if typeof(state.bootName) == "string" and state.bootName ~= "" then
+		state.bootPending = true
+		task.spawn(function()
+			local ok, gui = pcall(function()
+				local first = game:GetService("ReplicatedFirst")
+				local source = first:FindFirstChild(state.bootName) or first:WaitForChild(state.bootName, BOOT_WAIT)
+				if state.handedOver then
+					return false -- (the game already runs: never shown)
+				end
+				if not (source and source:IsA("ScreenGui")) then
+					return nil
+				end
+				local copy = source:Clone()
+				copy.ResetOnSpawn = false
+				copy.Parent = player:WaitForChild("PlayerGui")
+				return copy
+			end)
+			state.bootPending = false
+			if ok and gui then
+				if state.handedOver then
+					pcall(gui.Destroy, gui)
+				else
+					state.boot = gui
+					task.delay(BOOT_TIMEOUT, function()
+						if state.boot == gui then
+							removeBoot()
+						end
+					end)
+				end
+			elseif not ok then
+				warn(`[TypeTorch] the boot screen {state.bootName} failed: {gui}`)
+			elseif gui == nil then
+				warn(`[TypeTorch] the boot screen ReplicatedFirst.{state.bootName} isn't a ScreenGui (or never arrived)`)
+			end
+			refresh()
+		end)
+	end
 	onServerHold(state.server)
 end
 
@@ -404,6 +509,7 @@ local function stopCurrent(info)
 		current.copy:Destroy()
 	end
 	current = nil
+	holdScreen.ran(nil) -- 0.3.8: ClientGeneration
 end
 
 -- 0.3.2 (P-K7): tells the server how this client's generation start went ({g, ok, e?, ms, retried?}, kernel channel
@@ -525,6 +631,7 @@ local function start(name: string, fresh: boolean?, source: Instance?): (boolean
 	end
 	current = generation
 	lastGeneration = generation
+	holdScreen.ran(name) -- 0.3.8: ClientGeneration, and ClientReady for the first one (place loading screens wait for it)
 	print(`[TypeTorch] client running {name}{if fresh then " (retry)" else ""} ({math.floor((os.clock() - started) * 1000)} ms)`)
 	return true, nil
 end

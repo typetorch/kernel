@@ -191,11 +191,47 @@ end
 
 local deadman -- () -> (), below: the kernel errored before its boot finished
 
+-- 0.3.8 LOADING SCREENS (plans/19 item 13): the game's settings, copied onto the kernel client script before any player
+-- joins (its attributes replicate before anything else): `BootScreen` = the name of a ScreenGui in ReplicatedFirst the
+-- kernel client shows at once and removes when this player's first client generation runs; `KernelScreen` = false: the
+-- game shows its own loading screen, so the kernel's "Starting..." stays off until then. Read from
+-- ServerScriptService.TypeTorchKernel's BootScreen / KernelScreen (stamped by `kernel deploy` from typetorch.json), else
+-- ReplicatedFirst's TypeTorchBootScreen / TypeTorchKernelScreen (the game's own place).
+local screens = { boot = nil, kernelScreen = true }
+
+local function stampScreens()
+	local function read(instance: Instance?, name: string): any
+		if not instance then
+			return nil
+		end
+		local ok, value = pcall(instance.GetAttribute, instance, name)
+		return if ok then value else nil
+	end
+	local okFirst, first = pcall(game.GetService, game, "ReplicatedFirst")
+	first = if okFirst then first else nil
+	local folder = script.Parent
+	local boot = read(folder, "BootScreen")
+	if boot == nil then
+		boot = read(first, Constants.BOOT_SCREEN_ATTRIBUTE)
+	end
+	local own = read(folder, "KernelScreen")
+	if own == nil then
+		own = read(first, Constants.KERNEL_SCREEN_ATTRIBUTE)
+	end
+	screens.boot = if typeof(boot) == "string" and boot ~= "" and #boot <= 100 then boot else nil
+	screens.kernelScreen = own ~= false
+	if clientScript then
+		pcall(clientScript.SetAttribute, clientScript, "BootScreen", screens.boot)
+		pcall(clientScript.SetAttribute, clientScript, "KernelScreen", if screens.kernelScreen then nil else false)
+	end
+end
+
 -- The kernel's FIRST call (before anything that yields): no character spawns until a generation is ready.
 function Fallback.hold(startedAt: number?)
 	local ok, value = pcall(Players.GetAttribute, Players, Constants.HOLD_ATTRIBUTE)
 	hold.optOut = ok and value == false
 	engage("start")
+	pcall(stampScreens) -- (engage found the client script)
 	hold.startedAt = startedAt or hold.startedAt
 	hold.heldMs = math.floor((os.clock() - (startedAt or os.clock())) * 1000 + 0.5)
 	-- If the kernel never reaches Fallback.start (it errored during its boot: a kernel bug), nothing would ever release or
@@ -1101,6 +1137,9 @@ function Fallback.status()
 			seconds = if hold.active and hold.startedAt then math.floor((now - hold.startedAt) * 10 + 0.5) / 10 else nil,
 			released = if hold.releasedAt then math.floor((hold.releasedAt - deps.startedAt) * 10 + 0.5) / 10 else nil,
 			spawned = hold.spawned,
+			-- 0.3.8: the game's loading screen settings the clients got (BootScreen, KernelScreen = false).
+			bootScreen = screens.boot,
+			kernelScreen = if screens.kernelScreen then nil else false,
 		},
 		backup = {
 			available = info ~= nil,

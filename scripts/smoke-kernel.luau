@@ -12,7 +12,11 @@
 -- `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
 -- `--kernel-crash`; and the security audit follow-ups `--heads-cap`, `--access`; described at "0.3.6 NEVER AN EMPTY SERVER" below; `--client` covers the client's holding screen and
 -- re-sent code), and 0.3.7's `--health-config` (health thresholds per build: custom ones used, bad ones fall back to
--- the defaults, HealthRollback = false keeps a failing build) and `--health-missing` (no Health module: boots, warns).
+-- the defaults, HealthRollback = false keeps a failing build) and `--health-missing` (no Health module: boots, warns),
+-- and 0.3.8's `--messaging` (game messaging: one lazy kernel-held TypeTorch/game subscription kept across swaps, dispatch
+-- per generation, the mid-swap replay, tags and `to`, publish limits, retries, the universe's rate, the queue, the held
+-- roll call topic), `--messaging-studio` (loopback only), `--messaging-missing`, `--client-boot` and `--client-own` (the
+-- game's loading screen and the ClientReady signal; `--client` and `--hold` check the new attributes too).
 -- Every mode also checks that no swap ran on a thread its own stopped generation owned.
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore, ConfigService unavailable), then drives it:
@@ -676,6 +680,9 @@ local function sortedMap(name: string)
 end
 local topics = {}
 local subscribeFailures = {} -- topic -> number of SubscribeAsync calls that fail first
+-- 0.3.8: SubscribeAsync calls per topic, the script whose thread made the last one (a generation's hard stop ends the
+-- subscriptions its threads made on Roblox), and PublishAsync calls that fail first, per topic.
+local msgStub = { calls = {}, owners = {}, publishFailures = {} }
 local assets = {}
 local assetVersions = {} -- version -> asset id
 local closeCallbacks = {} -- game:BindToClose
@@ -717,7 +724,7 @@ local services = {
 	LogService = { MessageOut = signal() },
 	RunService = {
 		IsStudio = function()
-			return table.find(process.args, "--studio-local") ~= nil
+			return table.find(process.args, "--studio-local") ~= nil or table.find(process.args, "--messaging-studio") ~= nil
 		end,
 	},
 	Stats = {
@@ -764,6 +771,8 @@ local services = {
 	},
 	MessagingService = {
 		SubscribeAsync = function(_, topic, fn)
+			msgStub.calls[topic] = (msgStub.calls[topic] or 0) + 1
+			msgStub.owners[topic] = ownerOf[coroutine.running()]
 			if (subscribeFailures[topic] or 0) > 0 then
 				subscribeFailures[topic] -= 1
 				error("MessagingService unavailable (smoke)")
@@ -781,6 +790,11 @@ local services = {
 		-- `peerReplies` on the asker's reply topic.
 		PublishAsync = function(_, topic, data)
 			simWait("publish")
+			if (msgStub.publishFailures[topic] or 0) > 0 then
+				msgStub.publishFailures[topic] -= 1
+				error("MessagingService: request throttled (smoke)")
+			end
+			assert(type(data) ~= "string" or #data <= 1024, `smoke: a message over 1 KiB on {topic} ({#data} bytes)`)
 			local decoded = serde.decode("json", data)
 			local subscribed = 0
 			for _ in topics do
@@ -956,7 +970,7 @@ end
 
 local kernelFolder = newInstance("Folder", "TypeTorchKernel")
 kernelFolder.Parent = services.ServerScriptService
-for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
+for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Messaging = "Messaging.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
 	sourceInstance(if name == "Kernel" then "Script" else "ModuleScript", name, `src/server/{file}`).Parent = kernelFolder
 end
 local entryTemplate = sourceInstance("Script", "Entry", "src/server/Entry.server.luau")
@@ -1014,7 +1028,7 @@ local VIP_MODE = table.find(process.args, "--vip") ~= nil
 -- server whose head fails to start at boot: the branch's signed deployment history, never an unsigned entry).
 -- `--client` (0.3.2, P-K7): runs the CLIENT kernel instead: a generation that fails once is retried on a fresh copy
 -- of its tree and reported to the server; one that keeps failing is reported as failed.
-local CLIENT_MODE = table.find(process.args, "--client") ~= nil
+local CLIENT_MODE = table.find(process.args, "--client") ~= nil or table.find(process.args, "--client-boot") ~= nil or table.find(process.args, "--client-own") ~= nil
 -- 0.3.6: the kernel client script in ReplicatedFirst (server modes: a stand-in that only carries the `Hold` attribute).
 local clientStandIn = nil
 if not CLIENT_MODE then
@@ -1042,6 +1056,23 @@ local LKG_BOOT_MODE = table.find(process.args, "--lkg-boot") ~= nil
 -- Health module still boots (no window) and says so.
 local HEALTH_CONFIG_MODE = table.find(process.args, "--health-config") ~= nil
 local HEALTH_MISSING_MODE = table.find(process.args, "--health-missing") ~= nil
+-- 0.3.8 game messaging (plans/19 item 4): `--messaging` (a public prod server: one lazy subscription to TypeTorch/game
+-- held across swaps, dispatch per generation, the mid-swap replay, the sender's tags and `to`, publish limits, retries,
+-- the universe's rate, the queue, the held roll call topic), `--messaging-studio` (Studio: loopback only, no
+-- MessagingService) and `--messaging-missing` (a place project without Messaging.luau boots; no messaging methods).
+-- (One table: the harness's main chunk is at Luau's 200-local limit.)
+local MODES38 = {
+	messaging = table.find(process.args, "--messaging") ~= nil,
+	messagingStudio = table.find(process.args, "--messaging-studio") ~= nil,
+	messagingMissing = table.find(process.args, "--messaging-missing") ~= nil,
+	clientBoot = table.find(process.args, "--client-boot") ~= nil,
+	clientOwn = table.find(process.args, "--client-own") ~= nil,
+}
+-- 0.3.8 loading screens (plans/19 item 13), client side: `--client-boot` (the game's BootScreen replaces the kernel's
+-- "Starting..." until the first client generation runs and the server's hold ends), `--client-own` (KernelScreen =
+-- false: the game draws its own; the kernel's shows only for moves and later holds). `--client` checks ClientReady,
+-- ClientGeneration and Holding too.
+
 if FLEET_MODE then
 	configValues.TypeTorchFleet = { url = "https://fleet.example.test/api/", token = FLEET_TOKEN }
 end
@@ -1689,6 +1720,24 @@ end
 if HEALTH_MISSING_MODE then
 	kernelFolder.Health.Parent = nil -- an older place project that lists the kernel's files one by one
 end
+if MODES38.messagingMissing then
+	kernelFolder.Messaging.Parent = nil -- an older place project that lists the kernel's files one by one
+end
+if MODES38.messaging or MODES38.messagingStudio then
+	Constants.MESSAGING_RETRY_DELAYS = { 0.05, 0.05, 0.05 }
+	Constants.MESSAGING_WARN_GAP = 0.05
+	Constants.MESSAGING_REPLAY_SECONDS = 2
+end
+-- 0.3.8 loading screens, server side: the game's settings are copied onto the kernel client script at the hold
+-- (`--hold`: ReplicatedFirst's attributes; `--hold-optout`: the kernel folder's, stamped by kernel deploy, win).
+if HOLD_MODE or HOLD_OPTOUT_MODE then
+	services.ReplicatedFirst:SetAttribute("TypeTorchBootScreen", "Loading")
+	services.ReplicatedFirst:SetAttribute("TypeTorchKernelScreen", false)
+end
+if HOLD_OPTOUT_MODE then
+	kernelFolder:SetAttribute("BootScreen", "FromConfig")
+	kernelFolder:SetAttribute("KernelScreen", true)
+end
 if BLIND_MODE then
 	Constants.POLL_SECONDS = 0.3 -- the forged newer head must meet several polls
 end
@@ -1818,7 +1867,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -1925,6 +1974,62 @@ if CLIENT_MODE then
 	clientTree("bbbbbbb-222222#2", 5)
 	local clientScript = sourceInstance("Script", "TypeTorchKernelClient", "src/client/KernelClient.client.luau")
 	clientScript.Parent = services.ReplicatedFirst
+	if MODES38.clientBoot or MODES38.clientOwn then
+		-- 0.3.8 loading screens: the server copied the game's settings onto this script before the player joined.
+		local boot = MODES38.clientBoot
+		local label = if boot then "client-boot" else "client-own"
+		local function kernelScreen()
+			return playerGui:FindFirstChild("TypeTorchHold")
+		end
+		local function bootScreen()
+			return playerGui:FindFirstChild("Loading")
+		end
+		if boot then
+			local source = newInstance("ScreenGui", "Loading")
+			newInstance("Frame", "Splash").Parent = source
+			-- It replicates a moment after the kernel client starts (ReplicatedFirst has no fixed order).
+			task.delay(0.1, function()
+				source.Parent = services.ReplicatedFirst
+			end)
+			clientScript:SetAttribute("BootScreen", "Loading")
+		else
+			clientScript:SetAttribute("KernelScreen", false)
+		end
+		clientScript:SetAttribute("Hold", "start")
+		Constants.CLIENT_RETRY_SECONDS = 0.1
+		runScript(clientScript, function(err)
+			table.insert(kernelErrors, err)
+		end)
+		task.wait(0.3)
+		check(`{label}: the server holds: the kernel's "Starting..." stays off ({if boot then "the boot screen is cloned into PlayerGui" else "the game draws its own"}); Holding = start, no ClientReady yet`, kernelScreen() == nil and clientScript:GetAttribute("Holding") == "start" and clientScript:GetAttribute("ClientReady") == nil and (if boot then bootScreen() ~= nil and bootScreen().ResetOnSpawn == false and bootScreen():FindFirstChild("Splash") ~= nil else bootScreen() == nil))
+		if not boot then
+			clientScript:SetAttribute("Hold", "move")
+			check("client-own: a move always shows the kernel's screen (Reconnecting...)", waitFor("move", function()
+				return kernelScreen() ~= nil and kernelScreen().Backdrop.Card.Label.Text == "Reconnecting..."
+			end))
+			clientScript:SetAttribute("Hold", "start")
+			check("client-own: back to the start hold: the kernel's screen goes again", waitFor("start", function()
+				return kernelScreen() == nil and clientScript:GetAttribute("Holding") == "start"
+			end, 2))
+		end
+		clientTree("aaaaaaa-111111#1", 0)
+		root:SetAttribute("ActiveGeneration", "aaaaaaa-111111#1")
+		check(`{label}: the first client generation runs: ClientReady = true, ClientGeneration = its name`, waitFor("ready", function()
+			return clientScript:GetAttribute("ClientReady") == true and clientScript:GetAttribute("ClientGeneration") == "aaaaaaa-111111#1"
+		end))
+		check(`{label}: the server still holds: the game's screen stays, the kernel's stays off`, kernelScreen() == nil and (not boot or bootScreen() ~= nil))
+		clientScript:SetAttribute("Hold", nil)
+		check(`{label}: the hold ends: {if boot then "the boot screen goes, " else ""}the kernel's never showed, Holding cleared`, waitFor("hand-over", function()
+			return bootScreen() == nil and clientScript:GetAttribute("Holding") == nil
+		end) and kernelScreen() == nil)
+		-- Later holds (a failed swap clears ActiveGeneration and the server holds again) are the kernel's, as in 0.3.6.
+		root:SetAttribute("ActiveGeneration", nil)
+		clientScript:SetAttribute("Hold", "start")
+		check(`{label}: a later hold shows the kernel's "Starting..."; ClientGeneration cleared, ClientReady stays`, waitFor("re-hold", function()
+			return kernelScreen() ~= nil and kernelScreen().Backdrop.Card.Label.Text == "Starting..." and clientScript:GetAttribute("ClientGeneration") == nil
+		end) and clientScript:GetAttribute("ClientReady") == true)
+		finish()
+	end
 	-- 0.3.6: the server holds players (nothing runs yet): the client covers the place from its first line.
 	clientScript:SetAttribute("Hold", "start")
 	runScript(clientScript, function(err)
@@ -1942,6 +2047,7 @@ if CLIENT_MODE then
 	end, 2)
 	local shownMs = if screen() then screen():GetAttribute("ShownMs") else nil
 	check(string.format("hold: the holding screen is up from the client's first line (time-to-held %s ms after the client script started; target < 1000)", tostring(shownMs)), shownMs ~= nil and shownMs < 1000 and screenText() == "Starting..." and screen().IgnoreGuiInset == true and screen().Backdrop.BackgroundTransparency == nil)
+	check("hold: Holding = start on the kernel client script (0.3.8), no ClientReady yet", clientScript:GetAttribute("Holding") == "start" and clientScript:GetAttribute("ClientReady") == nil)
 	check("hold: no emojis, a few words, a UIScale pop and a progress bar", (function()
 		local card = screen().Backdrop.Card
 		local text = screenText() or ""
@@ -1965,6 +2071,7 @@ if CLIENT_MODE then
 		return report ~= nil and report.g == "aaaaaaa-111111#1" and report.ok == true and report.retried == true and typeof(report.ms) == "number"
 	end) and SMOKE.clientKernel ~= nil and localPlayer.PlayerScripts:FindFirstChild("TypeTorchRetry") ~= nil)
 	check("hold: the screen stays while the server still holds", screen() ~= nil and screenText() == "Starting...")
+	check("client: ClientReady = true and ClientGeneration once the first client generation runs (0.3.8)", clientScript:GetAttribute("ClientReady") == true and clientScript:GetAttribute("ClientGeneration") == "aaaaaaa-111111#1")
 	clientScript:SetAttribute("Hold", nil)
 	check("hold: the server's hold ends and this client's generation runs: the screen pops out", waitFor("screen gone", function()
 		return screen() == nil
@@ -2932,6 +3039,12 @@ if HOLD_MODE or HOLD_OPTOUT_MODE then
 		return SMOKE.kernel ~= nil and running() == "aaaaaaa-111111"
 	end))
 	local hold = status().fallback.hold
+	-- 0.3.8: the game's loading screen settings reached the kernel client script with the hold (before any join).
+	if optOut then
+		check("hold-optout: the kernel folder's BootScreen / KernelScreen (kernel deploy) win over ReplicatedFirst's", clientStandIn:GetAttribute("BootScreen") == "FromConfig" and clientStandIn:GetAttribute("KernelScreen") == nil and hold.bootScreen == "FromConfig" and hold.kernelScreen == nil)
+	else
+		check("hold: ReplicatedFirst's TypeTorchBootScreen / TypeTorchKernelScreen are on the kernel client script (BootScreen, KernelScreen = false)", clientStandIn:GetAttribute("BootScreen") == "Loading" and clientStandIn:GetAttribute("KernelScreen") == false and hold.bootScreen == "Loading" and hold.kernelScreen == false)
+	end
 	if optOut then
 		check("hold-optout: the kernel never touched characters (no LoadCharacter), the screen hold ended", services.Players.CharacterAutoLoads == true and #loadedCharacters == 0 and hold.optOut == true and holdAttribute() == nil)
 	else
@@ -2972,7 +3085,7 @@ if PEERS_MODE then
 		end
 	end
 	check("peers: the ask rides TypeTorch/deploy ({rc = 1, q, j, b, t}); no new permanent subscription", ask ~= nil and ask.data.j == JOB and ask.data.b == "prod" and type(ask.data.q) == "number" and type(ask.data.t) == "number")
-	check(`peers: at most 5 MessagingService subscriptions during the ask (the empty-server limit 5 + 2 x players): {ask and ask.topics or "?"}`, ask ~= nil and ask.topics <= 5)
+	check(`peers: at most 5 MessagingService subscriptions during the ask (Roblox allows 20 + 8 x players): {ask and ask.topics or "?"}`, ask ~= nil and ask.topics <= 5)
 	check("peers: the reply subscription is gone after the ask; the ask isn't a deploy message", topics[`TypeTorch/peers/{JOB}`] == nil and s0.lastMessage == nil)
 	-- This kernel answers other kernels' asks once its generation ran healthy for PEER_MIN_UPTIME.
 	Constants.PEER_MIN_UPTIME = 1
@@ -3220,6 +3333,207 @@ if HEADS_CAP_MODE then
 	finish()
 end
 
+-- 0.3.8 GAME MESSAGING -------------------------------------------------------------------------------------------------
+do -- (scoped: the harness's main chunk is at Luau's 200-local limit)
+-- An envelope as another server's kernel publishes it on TypeTorch/game.
+local function envelope(topic: string, data: any, fields: { [string]: any }?)
+	local env = { v = 1, n = topic, d = data, j = "other-job-1", b = "prod", c = "prod", s = "public", p = 7 }
+	for key, value in fields or {} do
+		env[key] = value
+	end
+	return env
+end
+local function gamePublishes(): { any }
+	local list = {}
+	for _, entry in published do
+		if entry.topic == "TypeTorch/game" then
+			table.insert(list, entry.data)
+		end
+	end
+	return list
+end
+local function subscribedTopics(): number
+	local count = 0
+	for _ in topics do
+		count += 1
+	end
+	return count
+end
+
+if MODES38.messaging then
+	check("messaging: boots", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() == "aaaaaaa-111111"
+	end))
+	local apiA = SMOKE.kernel
+	check("messaging: the API has messagingSubscribe / messagingPublish / messagingStatus / onRollCall", type(apiA.messagingSubscribe) == "function" and type(apiA.messagingPublish) == "function" and type(apiA.messagingStatus) == "function" and type(apiA.onRollCall) == "function")
+	check("messaging: lazy: no TypeTorch/game or TypeTorch/rollcall subscription before a listener", msgStub.calls["TypeTorch/game"] == nil and msgStub.calls["TypeTorch/rollcall"] == nil and status().messaging.state == "off")
+	local heardA = {}
+	local disconnectA = apiA:messagingSubscribe("anticheat", function(data, meta)
+		table.insert(heardA, { data = data, meta = meta })
+	end)
+	apiA:onRollCall(function(data)
+		SMOKE.askA = (SMOKE.askA or 0) + 1
+	end)
+	check("messaging: the first listener subscribes TypeTorch/game once, on a kernel thread", waitFor("subscribed", function()
+		return status().messaging.state == "on"
+	end) and msgStub.calls["TypeTorch/game"] == 1 and msgStub.owners["TypeTorch/game"] == kernelFolder.Kernel)
+	check("messaging: onRollCall holds TypeTorch/rollcall (once, on a kernel thread)", waitFor("rollcall", function()
+		return status().messaging.rollCall.state == "on"
+	end) and msgStub.calls["TypeTorch/rollcall"] == 1 and msgStub.owners["TypeTorch/rollcall"] == kernelFolder.Kernel)
+	-- Publish from this server: tagged, queued, delivered to every server (this one too).
+	local report = apiA:messagingPublish("anticheat", { kind = "ban", userId = 5 })
+	check("messaging: publish is queued at once (no yield) with its size", report.ok == true and report.queued == true and type(report.size) == "number" and report.size < 1000)
+	check("messaging: the listener gets (data, meta): this server's tags, self = true", waitFor("own message", function()
+		local first = heardA[1]
+		return first ~= nil and first.data.kind == "ban" and first.data.userId == 5 and first.meta.self == true and first.meta.jobId == JOB and first.meta.branch == "prod" and first.meta.channel == "prod" and first.meta.serverType == "public" and first.meta.placeVersion == 7 and type(first.meta.sentAt) == "number"
+	end))
+	local wire = gamePublishes()[1]
+	check("messaging: one envelope on TypeTorch/game { v = 1, n, d, j, b, c, s, p }", wire ~= nil and wire.v == 1 and wire.n == "anticheat" and wire.d.kind == "ban" and wire.j == JOB and wire.b == "prod" and wire.c == "prod" and wire.s == "public" and wire.p == 7 and wire.to == nil)
+	-- Another server's messages: dispatched by game topic; malformed ones and `to` that excludes this server are dropped.
+	publish("TypeTorch/game", envelope("anticheat", { kind = "ban", userId = 6 }))
+	publish("TypeTorch/game", envelope("announce", "hello"))
+	publish("TypeTorch/game", envelope("anticheat", { kind = "skip" }, { to = "branch", b = "dev" }))
+	publish("TypeTorch/game", envelope("anticheat", { kind = "prod-only" }, { to = "prod", b = "dev", c = "dev" }))
+	publish("TypeTorch/game", { v = 2, n = "anticheat", d = 1, j = "x", c = "prod", s = "public" })
+	publish("TypeTorch/game", envelope("__reserved", 1))
+	check("messaging: another server's message reaches the topic's listener (self = false); other topics don't", waitFor("other", function()
+		return #heardA == 3 and heardA[2].data.userId == 6 and heardA[2].meta.self == false and heardA[2].meta.jobId == "other-job-1" and heardA[3].data.kind == "prod-only"
+	end))
+	local m = status().messaging
+	check("messaging: to = branch from another branch is filtered; bad envelopes are ignored", m.filtered == 1 and m.ignored == 2)
+	-- Limits, checked at once with clear errors.
+	local big = apiA:messagingPublish("anticheat", { text = string.rep("x", 1000) })
+	check(`messaging: over 1 KiB: too_big with the size, the limit and the envelope's overhead ({big.size} > {big.limit}, overhead {big.overhead})`, big.ok == false and big.error == "too_big" and big.size > 1000 and big.limit == 1000 and type(big.overhead) == "number" and big.overhead > 50 and big.overhead < 250)
+	local quotes = apiA:messagingPublish("anticheat", { text = string.rep('"', 300) })
+	check("messaging: the size counts JSON escapes (300 quotes: about 750 bytes of envelope, 1,400 escaped)", quotes.ok == false and quotes.error == "too_big")
+	local badTopics = 0
+	for _, topic in { "", "__x", "a b", string.rep("a", 65), 5 } do
+		local result = apiA:messagingPublish(topic, 1)
+		if result.ok == false and result.error == "bad_topic" then
+			badTopics += 1
+		end
+	end
+	check("messaging: bad topic names are refused (empty, __reserved, spaces, too long, not a string)", badTopics == 5)
+	local cycle = {}
+	cycle.self = cycle
+	local badData = 0
+	for _, data in { function() end, 0 / 0, math.huge, cycle, { 1, x = 2 }, { [1] = 1, [3] = 3 }, setmetatable({}, {}), { [true] = 1 } } do
+		local result = apiA:messagingPublish("anticheat", data)
+		if result.ok == false and result.error == "bad_data" and type(result.detail) == "string" then
+			badData += 1
+		end
+	end
+	check("messaging: data that can't travel as JSON is refused with the reason (function, NaN, inf, cycle, mixed, holes, metatable, key type)", badData == 8)
+	local badTo = apiA:messagingPublish("anticheat", 1, { to = "everyone" })
+	check("messaging: options.to must be all, prod or branch", badTo.ok == false and badTo.error == "bad_options")
+	local ok, err = pcall(apiA.messagingSubscribe, apiA, "__tt", function() end)
+	check("messaging: subscribe to a reserved topic errors", not ok and string.find(tostring(err), "reserved", 1, true) ~= nil)
+	-- A failing PublishAsync is retried, then delivered.
+	local before = #gamePublishes()
+	msgStub.publishFailures["TypeTorch/game"] = 2
+	apiA:messagingPublish("anticheat", { kind = "retry" })
+	check("messaging: PublishAsync failed twice: retried and delivered", waitFor("retry", function()
+		return #gamePublishes() == before + 1 and status().messaging.failed == 2 and heardA[#heardA].data.kind == "retry"
+	end, 3))
+	-- A swap: the next generation subscribes through the API again, but the kernel's subscription stays (no SubscribeAsync);
+	-- a message that arrives after the old generation stopped and before the new one listens is replayed to it.
+	local heardB = {}
+	SMOKE.behave["bbbbbbb-222222"] = function(kernel)
+		publish("TypeTorch/game", envelope("anticheat", { kind = "mid-swap" }, { j = "other-job-2" }))
+		SMOKE.task.wait(0.1)
+		kernel:messagingSubscribe("anticheat", function(data, meta)
+			table.insert(heardB, { data = data, meta = meta })
+		end)
+		kernel:onRollCall(function()
+			SMOKE.askB = (SMOKE.askB or 0) + 1
+		end)
+	end
+	local heardABefore = #heardA
+	publish("TypeTorch/deploy", deployMessage("M2", FIELDS.M2, { "sig" }))
+	check("messaging: swapped to B", waitFor("swap", function()
+		return running() == "bbbbbbb-222222"
+	end))
+	check("messaging: the swap didn't subscribe again (TypeTorch/game and TypeTorch/rollcall: still 1 SubscribeAsync each)", msgStub.calls["TypeTorch/game"] == 1 and msgStub.calls["TypeTorch/rollcall"] == 1)
+	check("messaging: the message that arrived mid-swap is replayed to B's listener (meta.replayed), not to A", waitFor("replay", function()
+		local first = heardB[1]
+		return first ~= nil and first.data.kind == "mid-swap" and first.meta.replayed == true
+	end) and #heardA == heardABefore and status().messaging.replayed == 1)
+	publish("TypeTorch/game", envelope("anticheat", { kind = "after" }))
+	check("messaging: after the swap only B's listener hears new messages (A's went with its generation)", waitFor("after", function()
+		return heardB[#heardB] ~= nil and heardB[#heardB].data.kind == "after"
+	end) and #heardA == heardABefore and status().messaging.listeners == 1)
+	publish("TypeTorch/rollcall", { q = 1, j = "asker-1", t = nowMs() })
+	check("messaging: a roll call ask goes to the running generation's handler only", waitFor("ask", function()
+		return SMOKE.askB == 1
+	end) and SMOKE.askA == nil)
+	disconnectA() -- (a stopped generation's disconnect is harmless)
+	-- The universe's rate on the game topic: at the soft limit publishes wait, then go.
+	local seen = status().messaging.rate
+	Constants.MESSAGING_TOPIC_SOFT = seen
+	local beforeWait = #gamePublishes()
+	local waiting = SMOKE.kernel:messagingPublish("anticheat", { kind = "waits" })
+	task.wait(0.4)
+	local m2 = status().messaging
+	check(`messaging: at the soft limit ({seen} seen this minute) a publish waits in the queue (throttled, logged)`, waiting.ok == true and #gamePublishes() == beforeWait and m2.queued == 1 and m2.throttled == 1 and said("publishes are waiting"))
+	Constants.MESSAGING_TOPIC_SOFT = 1000
+	check("messaging: below the limit again it goes out", waitFor("released", function()
+		return #gamePublishes() == beforeWait + 1 and status().messaging.queued == 0
+	end, 4))
+	-- Too old in the queue: dropped (counted, logged); a full queue refuses at once.
+	Constants.MESSAGING_TOPIC_SOFT = 0
+	Constants.MESSAGING_MAX_DELAY = 0.3
+	local droppedBefore = status().messaging.dropped
+	SMOKE.kernel:messagingPublish("anticheat", { kind = "stale" })
+	check("messaging: a message older than MESSAGING_MAX_DELAY in the queue is dropped", waitFor("dropped", function()
+		return status().messaging.dropped == droppedBefore + 1 and status().messaging.queued == 0
+	end, 4) and said("dropped a message"))
+	Constants.MESSAGING_MAX_DELAY = 30
+	Constants.MESSAGING_QUEUE_MAX = 2
+	SMOKE.kernel:messagingPublish("anticheat", 1)
+	SMOKE.kernel:messagingPublish("anticheat", 2)
+	local full = SMOKE.kernel:messagingPublish("anticheat", 3)
+	check("messaging: a full queue refuses at once (queue_full)", full.ok == false and full.error == "queue_full")
+	Constants.MESSAGING_TOPIC_SOFT = 1000
+	Constants.MESSAGING_QUEUE_MAX = 100
+	waitFor("drained", function()
+		return status().messaging.queued == 0
+	end, 4)
+	local final = status().messaging
+	check("messaging: status().messaging has the counters, the universe's rate and this server's budget", final.topic == "TypeTorch/game" and final.state == "on" and final.topics == 1 and type(final.rate) == "number" and final.softLimit == 1000 and final.budget == 150 and final.published >= 5 and final.received >= 8 and final.rollCall.asks == 1 and final.rollCall.handled == 1)
+	check(`messaging: subscriptions held: deploy, pin, rekey, game, roll call ({subscribedTopics()}; Roblox allows 20 + 8 x players)`, subscribedTopics() == 5 and topics["TypeTorch/game"] ~= nil and topics["TypeTorch/rollcall"] ~= nil)
+	finish()
+end
+
+if MODES38.messagingStudio then
+	check("messaging-studio: boots the local payload", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and string.sub(running() or "", 1, 6) == "local-"
+	end))
+	local api = SMOKE.kernel
+	local heard = {}
+	api:messagingSubscribe("announce", function(data, meta)
+		table.insert(heard, { data = data, meta = meta })
+	end)
+	api:onRollCall(function() end)
+	local report = api:messagingPublish("announce", "hi")
+	local prodOnly = api:messagingPublish("announce", "prod only", { to = "prod" })
+	check("messaging-studio: publish loops back to this session (self = true), never MessagingService", waitFor("loopback", function()
+		return heard[1] ~= nil and heard[1].data == "hi" and heard[1].meta.self == true and heard[1].meta.serverType == "studio"
+	end) and report.ok == true and report.loopback == true and prodOnly.ok == true and #gamePublishes() == 0)
+	task.wait(0.1)
+	local m = status().messaging
+	check("messaging-studio: no TypeTorch/game or roll call subscription; to = prod skips a dev session", msgStub.calls["TypeTorch/game"] == nil and msgStub.calls["TypeTorch/rollcall"] == nil and m.state == "local" and m.rollCall.state == "local" and #heard == 1 and m.filtered == 1)
+	finish()
+end
+
+if MODES38.messagingMissing then
+	check("messaging-missing: boots without Messaging.luau and says so", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() ~= nil
+	end) and said("TypeTorchKernel.Messaging is missing"))
+	check("messaging-missing: no messaging methods on the API (the framework says what is missing); status().messaging is nil", SMOKE.kernel.messagingPublish == nil and SMOKE.kernel.onRollCall == nil and status().messaging == nil)
+	finish()
+end
+end
+
 if ACCESS_MODE then
 	check("access: boots", waitFor("boot", function()
 		return SMOKE.kernel ~= nil and running() ~= nil
@@ -3347,7 +3661,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.7")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.8")
 
 -- 0.3.5: the engine's warning for a ConfigService key nobody published becomes ONE info line per TypeTorch key in the
 -- kernel's log ring (the registry is optional and, with API keys, never written); the game's own keys stay warnings.

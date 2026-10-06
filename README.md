@@ -6,8 +6,8 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
 - `src/server/` → `ServerScriptService.TypeTorchKernel`: boot, branch choice, LoadAsset + side-by-side mounting,
   swaps with soft + hard stop, automatic rollback, registry (ConfigService + in-game DataStore), dev access,
   stable transport, logs, the fleet API sender (`Fleet`), the fallbacks (`Fallback`), `/tt` chat commands. A place
-  project that maps these files one by one must map `Fleet` (0.3.2) and `Fallback` (0.3.6) too; without them the kernel
-  boots without the fleet API, or without the hold, peers, backup and moves, and says so.
+  project that maps these files one by one must map `Fleet` (0.3.2), `Fallback` (0.3.6), `Health` (0.3.7) and
+  `Messaging` (0.3.8) too; without them the kernel boots without that part and says so.
 - `src/shared/` → `ReplicatedStorage.TypeTorchKernelShared`: constants, client API, ClientEntry template.
 - `src/client/` → `ReplicatedFirst.TypeTorchKernelClient`: follows `ActiveGeneration`, swaps client generations.
 - `place.project.json`: the whole place (kernel + baseplate + spawn, HTTP on). `rojo build place.project.json -o
@@ -130,12 +130,30 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   key holds at most 32 branches, and prod servers record another branch's deploy only when they know the branch or the
   message is signed; `place.project.json` sets `LoadStringEnabled` false (`kernel deploy --loadstring` turns it on for
   a test place).
+- Game messaging (0.3.8, `src/server/Messaging.luau`; plans/19 item 4): game topics ride ONE MessagingService topic,
+  `TypeTorch/game`, subscribed on the first listener and held for the server's life (a swap never subscribes again).
+  `api:messagingSubscribe(topic, fn)` (fn(data, meta), dropped with the generation), `api:messagingPublish(topic, data,
+  {to})` (checks topic, JSON data and the 1 KiB limit counted on the JSON-escaped envelope at once, then queues: a
+  per-server bucket of 150 + 60 x players a minute, the universe's rate on the topic (every server sees every message;
+  at 60 a minute publishes wait), retries after 1, 3, 9 s), `api:messagingStatus()`, `status().messaging`. Envelopes
+  carry the sender's JobId, branch, effective channel, server type and place version; `to = "prod" | "branch"` is
+  filtered by the receivers. A message that arrives mid-swap is replayed to the next generation's first listener of its
+  topic. Studio loops back and never touches MessagingService. `api:onRollCall(fn)` holds the framework's roll call ask
+  topic `TypeTorch/rollcall` for the running generation (same protocol as before). Subscriptions: deploy, pin, rekey,
+  plus game and roll call once used (Roblox allows 20 + 8 x players per server).
+- Loading screens (0.3.8, plans/19 item 13): the kernel client sets `ClientReady = true` (the first client generation
+  runs), `ClientGeneration` and `Holding` (the holding screen's mode) on `ReplicatedFirst.TypeTorchKernelClient`. The
+  game's `ReplicatedFirst` attributes `TypeTorchBootScreen = "<ScreenGui name>"` (cloned at once, removed when the
+  first client generation runs and the hold ends, at most 60 s) and `TypeTorchKernelScreen = false` (the game draws its
+  own) are copied onto that script by the server before anyone joins; until then the kernel's "Starting..." stays off.
+  Moves ("Reconnecting...") and later holds always show the kernel's screen.
 - Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
   `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, `--durable`, 0.3.6's `--hold`, `--hold-optout`,
   `--peers`, `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
-  `--kernel-crash`, `--heads-cap`, `--access`, 0.3.7's `--health-config` and `--health-missing`, and `--boot-budget`, which runs 25 boot scenarios with simulated slow or failing dependencies and
+  `--kernel-crash`, `--heads-cap`, `--access`, 0.3.7's `--health-config` and `--health-missing`, 0.3.8's
+  `--messaging`, `--messaging-studio`, `--messaging-missing`, `--client-boot` and `--client-own`, and `--boot-budget`, which runs 25 boot scenarios with simulated slow or failing dependencies and
   checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.

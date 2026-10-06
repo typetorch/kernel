@@ -7,7 +7,7 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.3.7",
+	KERNEL_VERSION = "0.3.8",
 
 	-- Interim registry (until the backend exists): a DataStore written by the CLI through Open Cloud.
 	DATASTORE = "TypeTorch",
@@ -182,4 +182,58 @@ return {
 	-- after the client's own retry failed); the client waits at most CLIENT_RESEND_WAIT s for it.
 	CHANNEL_RESEND = "__tt/resend",
 	CLIENT_RESEND_WAIT = 15,
+
+	-- 0.3.8 GAME MESSAGING (plans/19 item 4; src/server/Messaging.luau; plans/01 "Game messaging"). Roblox's
+	-- MessagingService limits (create.roblox.com MessagingService "Limitations", checked 2026-10-06): a message is at most
+	-- 1 KiB; a game server sends at most 600 + 240 x players messages a minute; a topic receives at most 40 + 80 x servers
+	-- messages a minute (every subscribed server receiving a message counts, so about 80 messages a minute on one topic
+	-- for the whole universe); the whole game receives 400 + 200 x servers a minute; a server holds at most 20 + 8 x
+	-- players subscriptions and makes at most 240 subscribe requests a minute.
+	-- Game topics ("anticheat", "announce", ...) ride ONE kernel-held topic, subscribed on first use and held for the
+	-- server's life (a swap never subscribes again); listeners belong to their generation.
+	GAME_TOPIC = "TypeTorch/game",
+	-- The framework's roll call asks (Manage > Servers, TypeTorch.servers()) arrive on this topic; 0.3.8 holds it for the
+	-- running generation (api:onRollCall) instead of every generation subscribing again. Same protocol as before.
+	ROLLCALL_TOPIC = "TypeTorch/rollcall",
+	-- The envelope as published, counted JSON-escaped (the worst case of how Roblox may count it), must fit this.
+	MESSAGE_MAX_BYTES = 1000,
+	-- A game topic name: 1-64 characters of [%w_%-.:/], not starting with "__" (reserved).
+	MESSAGING_TOPIC_MAX = 64,
+	-- Data: JSON-compatible values only, nested at most this deep.
+	MESSAGING_DEPTH_MAX = 16,
+	-- This server publishes game messages at most MESSAGING_PUBLISH_BASE + MESSAGING_PUBLISH_PER_PLAYER x players a minute
+	-- (a quarter of Roblox's per-server send limit; the kernel, the roll call and the game's own MessagingService use share
+	-- the rest), bursts of MESSAGING_BURST.
+	MESSAGING_PUBLISH_BASE = 150,
+	MESSAGING_PUBLISH_PER_PLAYER = 60,
+	MESSAGING_BURST = 20,
+	-- Every server sees every game message, so each one knows the universe's rate on the game topic. At this many messages
+	-- in the last 60 s, publishes wait (with jitter) until the rate drops: the universe stays under Roblox's per-topic
+	-- receive limit (about 80 a minute) cooperatively.
+	MESSAGING_TOPIC_SOFT = 60,
+	-- Queued publishes wait at most MESSAGING_MAX_DELAY s (then dropped, counted, warned); at most MESSAGING_QUEUE_MAX wait.
+	MESSAGING_QUEUE_MAX = 100,
+	MESSAGING_MAX_DELAY = 30,
+	-- A failed PublishAsync is retried after these delays (seconds), then the message is dropped.
+	MESSAGING_RETRY_DELAYS = { 1, 3, 9 },
+	-- Messages that arrive while a swap runs (no listener for their topic yet) are kept this long, at most
+	-- MESSAGING_REPLAY_MAX, and replayed to the next generation's first listener of their topic.
+	MESSAGING_REPLAY_SECONDS = 10,
+	MESSAGING_REPLAY_MAX = 50,
+	-- One "messaging" warning line (throttled, dropped, failing) per this many seconds at most.
+	MESSAGING_WARN_GAP = 60,
+
+	-- 0.3.8 LOADING SCREENS (plans/19 item 13). The kernel client sets, on its own script (client-side attributes):
+	-- ClientReady = true once this player's first client generation runs, ClientGeneration = the running one's name, and
+	-- Holding = the holding screen's mode ("start" | "load" | "move") while the kernel would show it. The game configures
+	-- its screen with attributes on ReplicatedFirst (or, stamped by `kernel deploy`, on ServerScriptService.TypeTorchKernel
+	-- as BootScreen / KernelScreen, which win); the server kernel copies them onto the kernel client script at once:
+	--   TypeTorchBootScreen = "<name>": the kernel clones ReplicatedFirst.<name> (a ScreenGui) into PlayerGui at once and
+	--     removes it when the first client generation runs (at most BOOT_SCREEN_TIMEOUT s);
+	--   TypeTorchKernelScreen = false: the game shows its own loading screen; the kernel's "Starting..." screen stays off
+	--     until the first client generation ran (moves always show it).
+	BOOT_SCREEN_ATTRIBUTE = "TypeTorchBootScreen",
+	KERNEL_SCREEN_ATTRIBUTE = "TypeTorchKernelScreen",
+	BOOT_SCREEN_WAIT = 5,
+	BOOT_SCREEN_TIMEOUT = 60,
 }
