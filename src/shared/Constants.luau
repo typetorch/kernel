@@ -7,7 +7,7 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.3.5",
+	KERNEL_VERSION = "0.3.6",
 
 	-- Interim registry (until the backend exists): a DataStore written by the CLI through Open Cloud.
 	DATASTORE = "TypeTorch",
@@ -121,4 +121,49 @@ return {
 	-- queued? }. One request per player per SWITCH_GAP seconds (2 s, like the dev menu's swaps).
 	CHANNEL_SWITCH = "__tt/switch",
 	SWITCH_GAP = 2,
+
+	-- 0.3.6 NEVER AN EMPTY SERVER (user requirement: "IN NO POSSIBLE WAY players should load into an empty baseplate";
+	-- plans/01 "Never an empty server", src/server/Fallback.luau).
+	-- Hold: until the first generation is ready, characters don't spawn (Players.CharacterAutoLoads off) and the kernel
+	-- client shows its holding screen. A Players attribute HOLD_ATTRIBUTE = false opts a game out of the character part
+	-- (games that spawn characters themselves); default on.
+	HOLD_ATTRIBUTE = "TypeTorchHoldCharacters",
+	-- server -> client, tagged "*": "move" (this player is being moved to another server) or "load" (client code re-sent).
+	CHANNEL_HOLD = "__tt/hold",
+	-- The backup payload `typetorch kernel deploy` bakes into the place (the prod head's payload, modules only):
+	-- ServerStorage.<BACKUP_NAME>, attributes BackupArtifactId, BackupSeq, BackupBranch, BackupChannel, BackupAt.
+	BACKUP_NAME = "TypeTorchBackup",
+	-- When a fallback is ready (a peer build or the backup), no new boot candidate starts after this many seconds from
+	-- the kernel start; the rest are retried in the background. Keeps the backup inside the boot budget.
+	FALLBACK_AT = 9,
+	-- Peers (a kernel roll call): an ask { rc = 1, q, j, b, t } rides DEPLOY_TOPIC (every kernel subscribes to it, so
+	-- no new permanent subscription); kernels on branch `b` that run a healthy generation for PEER_MIN_UPTIME seconds
+	-- answer on "<PEER_TOPIC>/<asker JobId>" after up to PEER_REPLY_JITTER s (at most PEER_REPLIES_PER_MINUTE a minute,
+	-- one per asker per PEER_REPLY_GAP s, never to an ask older than PEER_ASK_MAX_AGE s). The asker collects for
+	-- PEER_COLLECT s (less once PEER_ENOUGH replied) and keeps the list PEER_CACHE s.
+	PEER_TOPIC = "TypeTorch/peers",
+	PEER_COLLECT = 2,
+	PEER_ENOUGH = 6,
+	PEER_MIN_UPTIME = 30,
+	PEER_REPLY_JITTER = 0.5,
+	PEER_REPLIES_PER_MINUTE = 12,
+	PEER_REPLY_GAP = 5,
+	PEER_ASK_MAX_AGE = 30,
+	PEER_CACHE = 15,
+	-- Recovery: while the backup (or nothing) runs, the head, the last known good and peers are retried after these
+	-- delays (then every last delay) until the head runs.
+	RECOVER_DELAYS = { 15, 30, 60 },
+	-- Nothing runs after BOOT_BUDGET (or for TELEPORT_GRACE s later in the server's life): players are moved to another
+	-- server of the branch. A player still here TELEPORT_RETRY s after a teleport is tried again, at most TELEPORT_TRIES
+	-- times; one who arrives with a bounce count of BOUNCE_MAX is kicked with KICK_MESSAGE instead.
+	TELEPORT_GRACE = 5,
+	TELEPORT_RETRY = 10,
+	TELEPORT_TRIES = 3,
+	BOUNCE_MAX = 3,
+	KICK_MESSAGE = "Servers are restarting. Please rejoin in a minute.",
+	CLIENT_KICK_MESSAGE = "The game didn't load. Please rejoin.",
+	-- server -> client, tagged "*": { g } the client tree of generation g was re-sent to PlayerGui.TypeTorchResend (once,
+	-- after the client's own retry failed); the client waits at most CLIENT_RESEND_WAIT s for it.
+	CHANNEL_RESEND = "__tt/resend",
+	CLIENT_RESEND_WAIT = 15,
 }

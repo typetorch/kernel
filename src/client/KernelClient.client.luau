@@ -4,17 +4,206 @@
 -- through a fresh ClientEntry clone in PlayerScripts. Also routes the kernel's stable remotes, keeps a log ring buffer,
 -- and shows kernel notices (/tt replies) as system chat messages.
 
+--
+-- 0.3.6 (never an empty server): the HOLDING SCREEN. While the server holds players (nothing runs yet, or players are
+-- being moved), and while this client's own generation can't start, the kernel client covers the bare place with its own
+-- minimal screen: an opaque backdrop, a few words ("Starting...", "Loading...", "Reconnecting..."), a progress bar, a
+-- UIScale pop in and out, no emojis (the user's UI rules). It is built before anything else waits, from the `Hold`
+-- attribute on this script (the server sets it; ReplicatedFirst replicates first), so a joining player is covered at
+-- once. It never blocks the kernel: every UI call is guarded.
+
+local scriptStartedAt = os.clock()
 local LogService = game:GetService("LogService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TextChatService = game:GetService("TextChatService")
 
 local player = Players.LocalPlayer
+
+local holdScreen
+do
+	local TEXT = { start = "Starting...", load = "Loading...", move = "Reconnecting..." }
+	local state = {
+		server = script:GetAttribute("Hold"), -- "start" | "move" | nil, from the server
+		mine = nil, -- "load" (this client's generation failed) | "move" (the server is moving this player) | nil
+		running = false, -- this client's generation runs
+		releasedAt = nil, -- os.clock() the server's hold ended
+		ui = nil, -- { gui, backdrop, scale, label, fill, mode }
+		failed = false, -- building the UI failed once: don't try again
+		ticking = false,
+	}
+	holdScreen = state
+
+	local function tween(instance, seconds, goal, style, direction)
+		local TweenService = game:GetService("TweenService")
+		local info = TweenInfo.new(seconds, style or Enum.EasingStyle.Quad, direction or Enum.EasingDirection.Out)
+		local playing = TweenService:Create(instance, info, goal)
+		playing:Play()
+		return playing
+	end
+
+	local function build(mode: string)
+		local gui = Instance.new("ScreenGui")
+		gui.Name = "TypeTorchHold"
+		gui.IgnoreGuiInset = true
+		gui.ResetOnSpawn = false
+		gui.DisplayOrder = 2147483000
+		gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+		local backdrop = Instance.new("Frame") -- opaque: the bare place never shows through
+		backdrop.Name = "Backdrop"
+		backdrop.Size = UDim2.fromScale(1, 1)
+		backdrop.BackgroundColor3 = Color3.fromRGB(16, 18, 23)
+		backdrop.BorderSizePixel = 0
+		backdrop.Parent = gui
+		local card = Instance.new("Frame")
+		card.Name = "Card"
+		card.AnchorPoint = Vector2.new(0.5, 0.5)
+		card.Position = UDim2.fromScale(0.5, 0.5)
+		card.Size = UDim2.fromScale(0.6, 0.2)
+		card.BackgroundTransparency = 1
+		card.Parent = backdrop
+		local aspect = Instance.new("UIAspectRatioConstraint")
+		aspect.AspectRatio = 4
+		aspect.Parent = card
+		local scale = Instance.new("UIScale") -- pop in and out (never a Size tween)
+		scale.Scale = 0.8
+		scale.Parent = card
+		local label = Instance.new("TextLabel")
+		label.Name = "Label"
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.fromScale(1, 0.5)
+		label.Font = Enum.Font.GothamBold
+		label.TextColor3 = Color3.fromRGB(236, 239, 245)
+		label.TextScaled = true
+		label.Text = TEXT[mode] or TEXT.start
+		label.Parent = card
+		local textSize = Instance.new("UITextSizeConstraint")
+		textSize.MaxTextSize = 40
+		textSize.Parent = label
+		local track = Instance.new("Frame") -- the progress hint
+		track.Name = "Track"
+		track.AnchorPoint = Vector2.new(0.5, 0)
+		track.Position = UDim2.fromScale(0.5, 0.72)
+		track.Size = UDim2.fromScale(0.7, 0.1)
+		track.BackgroundColor3 = Color3.fromRGB(44, 49, 60)
+		track.BorderSizePixel = 0
+		track.Parent = card
+		Instance.new("UICorner").Parent = track
+		local fill = Instance.new("Frame")
+		fill.Name = "Fill"
+		fill.Size = UDim2.fromScale(0, 1)
+		fill.BackgroundColor3 = Color3.fromRGB(96, 168, 255)
+		fill.BorderSizePixel = 0
+		fill.Parent = track
+		Instance.new("UICorner").Parent = fill
+		gui:SetAttribute("ShownMs", math.floor((os.clock() - scriptStartedAt) * 1000 + 0.5)) -- time-to-held (client)
+		gui.Parent = player:WaitForChild("PlayerGui")
+		tween(scale, 0.25, { Scale = 1 }, Enum.EasingStyle.Back)
+		return { gui = gui, backdrop = backdrop, scale = scale, label = label, fill = fill, mode = mode, shownAt = os.clock() }
+	end
+
+	-- The mode to show, or nil. After the server's hold ends the screen stays until this client's generation runs (at
+	-- most 10 s), so the half-loaded game never flashes.
+	local function wanted(): string?
+		if state.mine == "move" or state.server == "move" then
+			return "move"
+		end
+		if state.mine then
+			return state.mine
+		end
+		if state.server then
+			return state.server
+		end
+		if state.ui and not state.running and state.releasedAt and os.clock() - state.releasedAt < 10 then
+			return state.ui.mode
+		end
+		return nil
+	end
+
+	local refresh
+	local function tick()
+		if state.ticking then
+			return
+		end
+		state.ticking = true
+		task.spawn(function()
+			while state.ui do
+				local ui = state.ui
+				-- A progress hint that never claims to be done: it eases toward 92% (a fill tween, as the UI rules allow).
+				local progress = math.min(0.92, 1 - math.exp(-(os.clock() - ui.shownAt) / 6))
+				pcall(tween, ui.fill, 0.45, { Size = UDim2.fromScale(progress, 1) })
+				task.wait(0.5)
+				refresh()
+			end
+			state.ticking = false
+		end)
+	end
+
+	refresh = function()
+		if state.failed then
+			return
+		end
+		local mode = wanted()
+		local ok, err = pcall(function()
+			if mode then
+				if not state.ui then
+					state.ui = build(mode)
+				elseif state.ui.mode ~= mode then
+					state.ui.mode = mode
+					state.ui.label.Text = TEXT[mode] or TEXT.start
+				end
+			elseif state.ui then
+				local ui = state.ui
+				state.ui = nil
+				tween(ui.fill, 0.15, { Size = UDim2.fromScale(1, 1) })
+				tween(ui.backdrop, 0.3, { BackgroundTransparency = 1 })
+				local out = tween(ui.scale, 0.25, { Scale = 0 }, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+				out.Completed:Connect(function()
+					ui.gui:Destroy()
+				end)
+			end
+		end)
+		if not ok then
+			state.failed = true
+			warn(`[TypeTorch] the holding screen failed: {err}`)
+			return
+		end
+		if state.ui then
+			tick()
+		end
+	end
+	state.refresh = refresh
+
+	local function onServerHold(value)
+		local mode = if value == "start" or value == "move" then value else nil
+		if state.server and not mode then
+			state.releasedAt = os.clock()
+		end
+		state.server = mode
+		refresh()
+	end
+	-- The server marks the hold on this script (first) and on ReplicatedStorage.TypeTorch (`state.root`, once known).
+	local function serverHold()
+		local value = script:GetAttribute("Hold")
+		if value == nil and state.root then
+			value = state.root:GetAttribute("Hold")
+		end
+		onServerHold(value)
+	end
+	state.serverHold = serverHold
+	script:GetAttributeChangedSignal("Hold"):Connect(serverHold)
+	onServerHold(state.server)
+end
+
 local kernelShared = ReplicatedStorage:WaitForChild("TypeTorchKernelShared")
 local Constants = require(kernelShared:WaitForChild("Constants"))
 local ClientApi = require(kernelShared:WaitForChild("ClientApi"))
 local template = kernelShared:WaitForChild("ClientEntry")
 local root = ReplicatedStorage:WaitForChild("TypeTorch")
+-- 0.3.6: the hold is marked here too (a place whose kernel client isn't ReplicatedFirst.TypeTorchKernelClient).
+holdScreen.root = root
+root:GetAttributeChangedSignal("Hold"):Connect(holdScreen.serverHold)
+holdScreen.serverHold()
 local generations = root:WaitForChild("Generations")
 local net: RemoteEvent = root:WaitForChild("Net")
 local netU: UnreliableRemoteEvent = root:WaitForChild("NetU")
@@ -58,6 +247,7 @@ local eventListeners = {}
 local current = nil -- the running client generation (see Generations below)
 local switchReplies = {} -- 0.3.4: answers to this player's switch requests, by id
 local nextSwitchId = 0
+local onResend -- 0.3.6: (info) the server re-sent a client tree to this player's PlayerGui (Generations below)
 
 local function systemMessage(text: string)
 	local channels = TextChatService:FindFirstChild("TextChannels")
@@ -97,6 +287,19 @@ local function onClientEvent(artifactId, channel, ...)
 			local name = ...
 			for _, listener in eventListeners do
 				task.spawn(listener, name)
+			end
+		elseif channel == (Constants.CHANNEL_RESEND or "__tt/resend") then
+			-- 0.3.6: this client's generation failed after its retry; the server re-sent its client code once.
+			local info = ...
+			if typeof(info) == "table" and typeof(info.g) == "string" and onResend then
+				task.spawn(onResend, info)
+			end
+		elseif channel == (Constants.CHANNEL_HOLD or "__tt/hold") then
+			-- 0.3.6: the server is moving this player to another server ("move").
+			local mode = ...
+			if mode == "move" or mode == "load" then
+				holdScreen.mine = mode
+				holdScreen.refresh()
 			end
 		end
 		return
@@ -205,7 +408,7 @@ end
 
 -- 0.3.2 (P-K7): tells the server how this client's generation start went ({g, ok, e?, ms, retried?}, kernel channel
 -- tagged "*"). The server records it per player (status().clients); it is never trusted for anything else.
-local function reportStart(name: string, ok: boolean, err: string?, seconds: number, retried: boolean)
+local function reportStart(name: string, ok: boolean, err: string?, seconds: number, retried: boolean, resent: boolean?)
 	pcall(function()
 		net:FireServer("*", Constants.CHANNEL_CLIENT, {
 			g = name,
@@ -213,15 +416,17 @@ local function reportStart(name: string, ok: boolean, err: string?, seconds: num
 			e = if ok then nil else string.sub(tostring(err or "?"), 1, 200),
 			ms = math.floor(seconds * 1000),
 			retried = retried or nil,
+			resent = resent or nil, -- 0.3.6: the start of the copy the server re-sent
 		})
 	end)
 end
 
 -- Starts the client generation `name`. Returns (ok, error). `fresh` (0.3.2, the retry): run a client-side copy of the
--- tree, since a module that failed to load stays failed in the require cache of the replicated one.
-local function start(name: string, fresh: boolean?): (boolean, string?)
+-- tree, since a module that failed to load stays failed in the require cache of the replicated one. `source` (0.3.6):
+-- the tree the server re-sent to this player's PlayerGui (a fresh replication of the whole tree).
+local function start(name: string, fresh: boolean?, source: Instance?): (boolean, string?)
 	local started = os.clock()
-	local tree = generations:WaitForChild(name, 30)
+	local tree = source or generations:WaitForChild(name, 30)
 	if not tree then
 		warn(`[TypeTorch] generation {name} never replicated`)
 		return false, "never replicated"
@@ -358,11 +563,55 @@ local function follow()
 			end
 		end
 		reportStart(wanted, ok, err, os.clock() - began, retried)
+		-- 0.3.6: running: the holding screen can go. Failed after the retry: the holding screen covers the broken UI while
+		-- the server re-sends the client code (then moves this player if that fails too).
+		holdScreen.running = ok
+		holdScreen.mine = if ok then nil elseif retried then "load" else holdScreen.mine
+		holdScreen.refresh()
 		if current == nil or current.name == root:GetAttribute("ActiveGeneration") then
 			break
 		end
 	end
+	if root:GetAttribute("ActiveGeneration") == nil then
+		-- 0.3.6: nothing runs on the server (a failed swap stopped the old generation): the dead client generation was
+		-- stopped above; the server's hold covers the screen.
+		holdScreen.running = false
+		holdScreen.refresh()
+	end
 	switching = false
+end
+
+-- 0.3.6: the server re-sent the client tree of generation `info.g` to PlayerGui.TypeTorchResend (once, after this
+-- client's own retry failed): start that copy and report it (`resent`). It failing too makes the server move the player.
+onResend = function(info)
+	local name = info.g
+	if current and current.name == name then
+		return
+	end
+	local gui = player:FindFirstChildOfClass("PlayerGui") or player:FindFirstChild("PlayerGui")
+	local wait = Constants.CLIENT_RESEND_WAIT or 15
+	local folder = gui and gui:WaitForChild("TypeTorchResend", wait)
+	local tree = folder and folder:WaitForChild(name, wait)
+	while switching do
+		task.wait()
+	end
+	if current or root:GetAttribute("ActiveGeneration") ~= name then
+		return -- started meanwhile, or the server moved on (follow() takes the new one)
+	end
+	switching = true
+	local began = os.clock()
+	local ok, err = false, "the re-sent client code never arrived"
+	if tree then
+		ok, err = start(name, false, tree)
+	end
+	reportStart(name, ok, err, os.clock() - began, false, true)
+	holdScreen.running = ok
+	holdScreen.mine = if ok then nil else "move"
+	holdScreen.refresh()
+	switching = false
+	if root:GetAttribute("ActiveGeneration") ~= name then
+		follow()
+	end
 end
 
 root:GetAttributeChangedSignal("ActiveGeneration"):Connect(follow)

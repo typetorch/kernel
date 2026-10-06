@@ -5,8 +5,9 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
 
 - `src/server/` → `ServerScriptService.TypeTorchKernel`: boot, branch choice, LoadAsset + side-by-side mounting,
   swaps with soft + hard stop, automatic rollback, registry (ConfigService + in-game DataStore), dev access,
-  stable transport, logs, the fleet API sender (`Fleet`), `/tt` chat commands. A place project that maps these files
-  one by one must map `Fleet` too (0.3.2; without it the kernel boots without the fleet API).
+  stable transport, logs, the fleet API sender (`Fleet`), the fallbacks (`Fallback`), `/tt` chat commands. A place
+  project that maps these files one by one must map `Fleet` (0.3.2) and `Fallback` (0.3.6) too; without them the kernel
+  boots without the fleet API, or without the hold, peers, backup and moves, and says so.
 - `src/shared/` → `ReplicatedStorage.TypeTorchKernelShared`: constants, client API, ClientEntry template.
 - `src/client/` → `ReplicatedFirst.TypeTorchKernelClient`: follows `ActiveGeneration`, swaps client generations.
 - `place.project.json`: the whole place (kernel + baseplate + spawn, HTTP on). `rojo build place.project.json -o
@@ -90,11 +91,43 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   registry (optional)` (the dev menu shows it dim); repeats are dropped, and `TypeTorchFleet` / `TypeTorchAnalytics`
   get the same treatment. The game's own missing keys stay warnings. Roblox's own console still shows the engine's
   line.
+- Never an empty server (0.3.6; the user: "IN NO POSSIBLE WAY players should load into an empty baseplate";
+  `src/server/Fallback.luau`):
+  - **Hold:** from the kernel's first line until a generation is ready, characters don't spawn
+    (`Players.CharacterAutoLoads` off; on release it is back on and waiting players get `LoadCharacter`), and the kernel
+    client covers the place with its own holding screen (opaque, "Starting...", a progress bar, a UIScale pop, no
+    emojis), built from the `Hold` attribute on `ReplicatedFirst.TypeTorchKernelClient` before anything else waits.
+    Measured: the server holds 2 ms after the kernel starts (before any player can join); the client's screen is up
+    0 ms after its script starts. A swap of a running generation never holds. Games that spawn characters themselves
+    set the `Players` attribute `TypeTorchHoldCharacters = false` (or keep `CharacterAutoLoads` off in the place): the
+    kernel then never touches characters (the screen still shows while nothing runs).
+  - **Fallbacks** when the head and the last-known-good chain ran nothing, in this order: (4) a build the branch's
+    other servers run healthy for 30 s+ (a kernel roll call: an ask `{rc = 1}` on `TypeTorch/deploy`, so no extra
+    permanent subscription; replies on `TypeTorch/peers/<JobId>`; the most common build wins; prod servers take it only
+    when this kernel trusts it: a valid signature, a deployment entry that verifies, or `BootstrapHeads`); (3) the backup
+    build `typetorch kernel deploy` bakes into the place, `ServerStorage.TypeTorchBackup`, mounted as a fresh clone with
+    the payload checks (Channel `prod`, modules only), flagged `status().backup`, fleet `backup = true` and
+    `h = "backup"`, alert `backup_build`; (5) background retries of the head, the last known good and peers (15 s,
+    30 s, then every 60 s) until the head runs, each a normal swap; (2) at the boot budget, players (and new joiners)
+    move to a healthy server of the branch (roll call), else a fresh one (private/reserved: a new reserved server on the
+    branch), with a bounce count in the teleport data; the 3rd bounce is kicked ("Servers are restarting. Please rejoin
+    in a minute."), logged and alerted (`bounce_kick`); alert `boot_failed_teleport`. Boot timings (simulated): peers
+    5.0 s, asset outage to the backup 4.6 s (10.0 s when every LoadAsset hangs), moves at 15.1 s.
+  - **Mid-swap failure:** when a swap stopped the old generation and nothing replaced it, `ActiveGeneration` is cleared
+    (clients stop the dead client code) and the hold arms again until the chain above runs something. BindToClose in
+    the middle of a swap runs the starting (else the stopped) generation's `onClose`. If the kernel itself errors before
+    its boot finishes, the held players are still moved 5 s past the budget.
+  - **Clients:** a client generation that failed after its own retry gets its client tree re-sent once
+    (`PlayerGui.TypeTorchResend`, `__tt/resend`); if that fails too, the player moves to a healthy server of the branch
+    (or rejoins). `status().clients` and the fleet status `clients` count `resent` and `moved`.
+  - `status().fallback` = `{hold, backup, peers, chain, recovery, moving, clients}`.
 - Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
-  `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, and `--boot-budget`, which runs 21 boot scenarios with
-  simulated slow or failing dependencies and checks each one runs a generation within 15 s).
+  `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, `--durable`, 0.3.6's `--hold`, `--hold-optout`,
+  `--peers`, `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
+  `--kernel-crash`, and `--boot-budget`, which runs 25 boot scenarios with simulated slow or failing dependencies and
+  checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.
 

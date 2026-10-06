@@ -8,7 +8,10 @@
 -- signed public server) and `--lkg-boot` (a prod head that fails to start at boot: the signed deployment history,
 -- never an unsigned entry), and 0.3.5's `--durable` (deploys no running server heard: the CLI wrote only the DataStore
 -- copy; a new server boots it, a running one follows it within one durable read, MemoryStore is written back, and the
--- DataStore read budget holds). Every mode also checks that no swap ran on a thread its own stopped generation owned.
+-- DataStore read budget holds), and 0.3.6's never-an-empty-server modes (`--hold`, `--hold-optout`, `--peers`,
+-- `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
+-- `--kernel-crash`; described at "0.3.6 NEVER AN EMPTY SERVER" below; `--client` covers the client's holding screen and
+-- re-sent code). Every mode also checks that no swap ran on a thread its own stopped generation owned.
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore, ConfigService unavailable), then drives it:
 -- signed / unsigned / dev-channel / replayed deploy messages, a payload holding a Script (S-L4), a payload that fails to
@@ -173,6 +176,9 @@ end
 
 local SIGNALS = { Event = true, OnServerEvent = true, OnClientEvent = true, Triggered = true }
 local firedToServer = {} -- 0.3.2 `--client`: every RemoteEvent:FireServer call ({ remote name, args... })
+local kicked = {} -- names of players Kick was called on
+local kickMessages = {} -- 0.3.6: name -> the Kick message
+local loadedCharacters = {} -- 0.3.6: names of players LoadCharacter was called on
 
 local function newInstance(className: string, name: string?)
 	local self = setmetatable({}, instanceMeta)
@@ -253,12 +259,29 @@ function Methods.FindFirstChild(self, name, recursive)
 	return nil
 end
 
-function Methods.WaitForChild(self, name)
+function Methods.WaitForChild(self, name, timeout)
 	local child = self:FindFirstChild(name)
+	if not child and type(timeout) == "number" then
+		local deadline = os.clock() + timeout * SCALE
+		while not child and os.clock() < deadline do
+			task.wait(0.02)
+			child = self:FindFirstChild(name)
+		end
+		return child
+	end
 	if not child then
 		error(`smoke: {self:GetFullName()} has no child {name}`, 2)
 	end
 	return child
+end
+
+function Methods.FindFirstChildOfClass(self, className)
+	for _, child in internals[self].children do
+		if internals[child].props.ClassName == className then
+			return child
+		end
+	end
+	return nil
 end
 
 function Methods.GetChildren(self)
@@ -333,8 +356,27 @@ function Methods.GetAttributeChangedSignal(self, name)
 	return inner.attributeSignals[name]
 end
 
-function Methods.Kick(self)
+function Methods.Kick(self, message)
 	table.insert(kicked, internals[self].props.Name)
+	kickMessages[internals[self].props.Name] = message
+end
+
+-- 0.3.6: the hold's release spawns waiting players; moves read the bounce count from the join data.
+function Methods.LoadCharacter(self)
+	table.insert(loadedCharacters, internals[self].props.Name)
+	internals[self].props.Character = newInstance("Model", internals[self].props.Name)
+end
+
+function Methods.GetJoinData(self)
+	return internals[self].props.JoinData or {}
+end
+
+function Methods.SetTeleportData(self, data)
+	internals[self].props.TeleportData = data
+end
+
+function Methods.GetTeleportData(self)
+	return internals[self].props.TeleportData
 end
 
 function Methods.FireServer(self, ...)
@@ -403,9 +445,47 @@ local function hook(kind: string)
 end
 
 local DateTimeMock
-local Enum = {
+-- Enum members the kernel compares are fixed; any other (Font, EasingStyle, ...) is a "Enum.X.Y" string (0.3.6 UI).
+local Enum = setmetatable({
 	CreatorType = { User = "CreatorType.User", Group = "CreatorType.Group" },
 	MessageType = { MessageOutput = 1, MessageInfo = 2, MessageWarning = 3, MessageError = 4 },
+}, {
+	__index = function(_, kind)
+		return setmetatable({}, {
+			__index = function(_, member)
+				return `Enum.{kind}.{member}`
+			end,
+		})
+	end,
+})
+-- 0.3.6: the datatypes the client's holding screen uses (plain tables here).
+local DATATYPES = {
+	UDim2 = {
+		new = function(xs, xo, ys, yo)
+			return { xs = xs, xo = xo, ys = ys, yo = yo }
+		end,
+		fromScale = function(x, y)
+			return { xs = x, xo = 0, ys = y, yo = 0 }
+		end,
+		fromOffset = function(x, y)
+			return { xs = 0, xo = x, ys = 0, yo = y }
+		end,
+	},
+	Color3 = {
+		fromRGB = function(r, g, b)
+			return { r = r, g = g, b = b }
+		end,
+	},
+	Vector2 = {
+		new = function(x, y)
+			return { x = x, y = y }
+		end,
+	},
+	TweenInfo = {
+		new = function(...)
+			return { ... }
+		end,
+	},
 }
 
 local requireInstance
@@ -464,6 +544,10 @@ local function runSource(scriptInstance)
 		},
 		DateTime = DateTimeMock,
 		Enum = Enum,
+		UDim2 = DATATYPES.UDim2,
+		Color3 = DATATYPES.Color3,
+		Vector2 = DATATYPES.Vector2,
+		TweenInfo = DATATYPES.TweenInfo,
 		task = ownedTask,
 		warn = hook("warn"),
 		print = hook("print"),
@@ -594,7 +678,6 @@ local assets = {}
 local assetVersions = {} -- version -> asset id
 local closeCallbacks = {} -- game:BindToClose
 local fakePlayers = {} -- 0.3.4 `--switch`: the players in this server
-local kicked = {} -- names of players Kick was called on
 local SMOKE_CONFIG = nil -- the ConfigService snapshot in `--fleet`
 -- 0.3.2 fleet API: every RequestAsync ({ url, method, headers, body (decoded), status }); `httpScript` = status codes
 -- (or "error") for the next requests, then 200.
@@ -602,6 +685,15 @@ local httpRequests = {}
 local httpScript = {}
 local FLEET_TOKEN = "smoke-fleet-token-0123456789abcdef"
 local configValues = {} -- ConfigService keys in `--fleet` (the "TypeTorch" registry key stays missing)
+-- 0.3.6: MessagingService publishes ({ topic, data (decoded) }); `peerReplies` answers the kernel's roll call ask with
+-- these rows (each { delay?, row }), as other kernels would; teleports ({ placeId, players (names), options props });
+-- `teleportFails` = errors for the next TeleportAsync calls; Players attributes; reserved servers made.
+local published = {}
+local peerReplies = {}
+local teleports = {}
+local teleportFails = 0
+local playersAttributes = {}
+local reservedServers = {}
 
 local GAME_ROOT_PROPS = {
 	JobId = "smoke-job-0001",
@@ -618,6 +710,7 @@ local services = {
 	ServerScriptService = newInstance("ServerScriptService"),
 	ServerStorage = newInstance("ServerStorage"),
 	TextChatService = newInstance("TextChatService"),
+	ReplicatedFirst = newInstance("ReplicatedFirst"),
 	LogService = { MessageOut = signal() },
 	RunService = {
 		IsStudio = function()
@@ -648,6 +741,10 @@ local services = {
 	},
 	Players = {
 		MaxPlayers = 10,
+		CharacterAutoLoads = true, -- 0.3.6: the hold turns it off until a generation is ready
+		GetAttribute = function(_, name)
+			return playersAttributes[name]
+		end,
 		PlayerAdded = signal(),
 		PlayerRemoving = signal(),
 		GetPlayers = function()
@@ -669,14 +766,63 @@ local services = {
 				error("MessagingService unavailable (smoke)")
 			end
 			topics[topic] = fn
-			return { Disconnect = function() end }
+			return {
+				Disconnect = function()
+					if topics[topic] == fn then
+						topics[topic] = nil
+					end
+				end,
+			}
+		end,
+		-- 0.3.6: like Roblox, the publisher's own subscription hears the message too; a roll call ask is answered with
+		-- `peerReplies` on the asker's reply topic.
+		PublishAsync = function(_, topic, data)
+			simWait("publish")
+			local decoded = serde.decode("json", data)
+			local subscribed = 0
+			for _ in topics do
+				subscribed += 1
+			end
+			table.insert(published, { topic = topic, data = decoded, at = os.clock(), topics = subscribed })
+			if topics[topic] then
+				task.spawn(topics[topic], { Data = data, Sent = os.time() })
+			end
+			if topic == "TypeTorch/deploy" and type(decoded) == "table" and decoded.rc == 1 then
+				for _, reply in peerReplies do
+					task.delay((reply.delay or 0.1) * SCALE, function()
+						local row = table.clone(reply.row)
+						row.q = decoded.q
+						local handler = topics[`TypeTorch/peers/{decoded.j}`]
+						if handler then
+							handler({ Data = serde.encode("json", row), Sent = os.time() })
+						end
+					end)
+				end
+			end
 		end,
 	},
 	ScriptContext = { Error = signal(true) },
+	-- 0.3.6: tweens land at once; Completed fires a moment later (after the caller connected).
+	TweenService = {
+		Create = function(_, instance, _info, goal)
+			local completed = signal()
+			return {
+				Completed = completed,
+				Play = function()
+					for key, value in goal do
+						instance[key] = value
+					end
+					task.delay(0.01, function()
+						completed:Fire()
+					end)
+				end,
+			}
+		end,
+	},
 	ConfigService = {
 		GetConfigAsync = function()
 			simWait("config")
-			if not table.find(process.args, "--fleet") and not table.find(process.args, "--switch") then
+			if not (table.find(process.args, "--fleet") or table.find(process.args, "--switch") or table.find(process.args, "--backup") or table.find(process.args, "--teleport") or table.find(process.args, "--bounce")) then
 				error("ConfigService unavailable (smoke)")
 			end
 			local snapshot = { UpdateAvailable = signal() }
@@ -716,7 +862,27 @@ local services = {
 			return {}
 		end,
 	},
-	TeleportService = {},
+	TeleportService = {
+		-- 0.3.6: moves. Records every call; `teleportFails` makes the next calls throw.
+		TeleportAsync = function(_, placeId, players, options)
+			local names = {}
+			for _, player in players do
+				table.insert(names, player.Name)
+			end
+			local props = internals[options] and table.clone(internals[options].props) or {}
+			table.insert(teleports, { placeId = placeId, players = names, options = props, at = os.clock() })
+			if teleportFails > 0 then
+				teleportFails -= 1
+				error("TeleportAsync failed (smoke)")
+			end
+			return {}
+		end,
+		ReserveServer = function(_, placeId)
+			local n = #reservedServers + 1
+			table.insert(reservedServers, { placeId = placeId, code = `code-{n}`, id = `ps-new-{n}` })
+			return `code-{n}`, `ps-new-{n}`
+		end,
+	},
 	InsertService = {
 		LoadAsset = function(_, id)
 			local asset = assets[id] or error(`smoke: asset {id} not found`)
@@ -770,7 +936,7 @@ game = setmetatable({}, {
 		return GAME_ROOT_PROPS[key]
 	end,
 })
-for _, name in { "ReplicatedStorage", "ServerScriptService", "ServerStorage", "TextChatService" } do
+for _, name in { "ReplicatedStorage", "ServerScriptService", "ServerStorage", "TextChatService", "ReplicatedFirst" } do
 	services[name].Parent = GAME_ROOT
 end
 
@@ -784,7 +950,7 @@ end
 
 local kernelFolder = newInstance("Folder", "TypeTorchKernel")
 kernelFolder.Parent = services.ServerScriptService
-for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
+for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
 	sourceInstance(if name == "Kernel" then "Script" else "ModuleScript", name, `src/server/{file}`).Parent = kernelFolder
 end
 local entryTemplate = sourceInstance("Script", "Entry", "src/server/Entry.server.luau")
@@ -843,6 +1009,12 @@ local VIP_MODE = table.find(process.args, "--vip") ~= nil
 -- `--client` (0.3.2, P-K7): runs the CLIENT kernel instead: a generation that fails once is retried on a fresh copy
 -- of its tree and reported to the server; one that keeps failing is reported as failed.
 local CLIENT_MODE = table.find(process.args, "--client") ~= nil
+-- 0.3.6: the kernel client script in ReplicatedFirst (server modes: a stand-in that only carries the `Hold` attribute).
+local clientStandIn = nil
+if not CLIENT_MODE then
+	clientStandIn = newInstance("LocalScript", "TypeTorchKernelClient")
+	clientStandIn.Parent = services.ReplicatedFirst
+end
 -- `--fleet` (0.3.2): ConfigService holds TypeTorchFleet, so the kernel sends its fleet data over HTTP (stubbed): a
 -- reserved dev server whose head fails to start (nothing runs: the alerts and heartbeats still go out), then recovers.
 local FLEET_MODE = table.find(process.args, "--fleet") ~= nil
@@ -1087,6 +1259,157 @@ elseif LKG_BOOT_MODE then
 		},
 	}
 end
+-- 0.3.6 NEVER AN EMPTY SERVER ----------------------------------------------------------------------------------------
+-- `--hold` / `--hold-optout`: the hold (no character spawns until a generation is ready; the client's Hold attribute),
+-- a swap never holds; the Players attribute TypeTorchHoldCharacters = false leaves characters alone.
+-- `--peers`: no usable head anywhere; live servers of the branch run B (signed) healthy: the kernel roll call boots it;
+-- this kernel answers other kernels' asks. `--peers-untrusted`: peers run an unsigned build and a forged signature:
+-- refused; a peer build whose deployment entry verifies runs. `--backup`: an asset outage (every LoadAsset fails): the
+-- backup baked into the place runs. `--recover`: the outage ends: the background retry swaps to the head, players stay.
+-- `--teleport`: nothing runs (outage, the backup holds a Script): at the boot budget players are moved (matchmaking,
+-- then a healthy peer), retried, then kicked. `--bounce`: a reserved dev server: the 3rd bounce is kicked, others go to a
+-- new reserved server on the branch or a reserved peer. `--mid-swap`: a swap whose new generation fails after the old one
+-- stopped and whose last known good fails too: ActiveGeneration cleared, the hold arms, the backup runs; BindToClose in
+-- the middle of a swap runs the starting generation's onClose. `--client-fail`: a client that failed after its retry
+-- gets the client code re-sent, then is moved (rejoin).
+local HOLD_MODE = table.find(process.args, "--hold") ~= nil
+local HOLD_OPTOUT_MODE = table.find(process.args, "--hold-optout") ~= nil
+local PEERS_MODE = table.find(process.args, "--peers") ~= nil
+local PEERS_UNTRUSTED_MODE = table.find(process.args, "--peers-untrusted") ~= nil
+local BACKUP_MODE = table.find(process.args, "--backup") ~= nil
+local RECOVER_MODE = table.find(process.args, "--recover") ~= nil
+local TELEPORT_MODE = table.find(process.args, "--teleport") ~= nil
+local BOUNCE_MODE = table.find(process.args, "--bounce") ~= nil
+local MIDSWAP_MODE = table.find(process.args, "--mid-swap") ~= nil
+local CLIENT_FAIL_MODE = table.find(process.args, "--client-fail") ~= nil
+-- `--kernel-crash`: the kernel errors right after the hold (a kernel bug): the held players are still moved.
+local KERNEL_CRASH_MODE = table.find(process.args, "--kernel-crash") ~= nil
+if KERNEL_CRASH_MODE then
+	services.TextChatService = nil -- game:GetService("TextChatService") throws a few lines after the hold
+end
+-- Modes where swaps fail on purpose (outages, refused backups): their "swap failed" warnings are expected.
+local NOISY_MODE = BACKUP_MODE or RECOVER_MODE or TELEPORT_MODE or BOUNCE_MODE or MIDSWAP_MODE or PEERS_UNTRUSTED_MODE
+local FALLBACK_FLEET = BACKUP_MODE or TELEPORT_MODE or BOUNCE_MODE
+
+-- The backup `typetorch kernel deploy` bakes in: a payload named TypeTorchBackup with the Backup* attributes.
+local function addBackup(artifactId: string, extraScript: boolean?)
+	local model = payload(artifactId, "prod", extraScript)()
+	model.Name = "TypeTorchBackup"
+	model:SetAttribute("BackupArtifactId", artifactId)
+	model:SetAttribute("BackupSeq", 11)
+	model:SetAttribute("BackupBranch", "prod")
+	model:SetAttribute("BackupChannel", "prod")
+	model:SetAttribute("BackupAt", "2026-10-06T10:00:00Z")
+	model.Parent = services.ServerStorage
+	return model
+end
+-- A roll call reply from another kernel running the deploy `name` (FIELDS/SIGS), healthy for 2 minutes.
+local function peerReply(job: string, name: string, extra)
+	local fields = FIELDS[name]
+	local sigs = SIGS[name] or {}
+	local row = { j = job, b = fields.b, a = fields.a, i = fields.i, s = fields.s, c = fields.c, ch = fields.ch, t = fields.t, r = fields.r, sig = sigs.sig, sigF = sigs.sigF, st = "public", n = 3, m = 10, h = "ok", u = 120 }
+	for key, value in extra or {} do
+		row[key] = value
+	end
+	return { row = row, delay = 0.05 }
+end
+-- A player in the game (Parent set, in Players:GetPlayers()), with a PlayerGui; `bounce` = the teleport data's count.
+local function joinPlayer(userId: number, name: string, bounce: number?, fire: boolean?)
+	local instance = newInstance("Player", name)
+	instance.UserId = userId
+	instance.Parent = GAME_ROOT
+	newInstance("PlayerGui", "PlayerGui").Parent = instance
+	if bounce then
+		instance.JoinData = { TeleportData = { TypeTorch = { bounce = bounce } } }
+	end
+	table.insert(fakePlayers, instance)
+	if fire ~= false then
+		services.Players.PlayerAdded:Fire(instance)
+	end
+	return instance
+end
+
+if FALLBACK_FLEET then
+	configValues.TypeTorchFleet = { url = "https://fleet.example.test/api", token = FLEET_TOKEN }
+end
+if HOLD_OPTOUT_MODE then
+	playersAttributes.TypeTorchHoldCharacters = false
+end
+if HOLD_MODE or HOLD_OPTOUT_MODE then
+	LATENCY.payloadLoad = 0.6 -- the boot takes a moment: a player joins during it
+end
+if PEERS_MODE or PEERS_UNTRUSTED_MODE then
+	-- No head anywhere (both stores empty, no deployment list, no BootstrapHeads): only peers can help.
+	dataStore.data.heads, memoryStore.data.heads, dataStore.data.deployments = {}, {}, nil
+end
+if PEERS_MODE then
+	peerReplies = {
+		peerReply("peer-b-1", "M2"),
+		peerReply("peer-b-2", "M2"),
+		peerReply("peer-b-3", "M2"),
+		peerReply("peer-b-young", "M2", { u = 5 }), -- not up long enough: not counted
+		peerReply("peer-d-1", "Q5"),
+		peerReply("peer-g-1", "Q1", { h = "degraded" }), -- unhealthy: not counted
+		peerReply("peer-g-2", "Q1", { h = "degraded" }),
+		peerReply("peer-g-3", "Q1", { h = "degraded" }),
+		peerReply("peer-g-4", "Q1", { h = "degraded" }),
+		peerReply("peer-dev-1", "M2", { b = "dev" }), -- another branch: not counted
+	}
+end
+if PEERS_UNTRUSTED_MODE then
+	-- Most common: an unsigned build (C), then B with a forged signature; least common: D, unsigned in the reply, but the
+	-- deployment list holds its signed entry (Q5).
+	local forged = string.rep("A", 86) .. "=="
+	local function unsigned(extra)
+		extra.sig, extra.sigF = "", "" -- (an empty string: the reply carries no usable signature)
+		return extra
+	end
+	peerReplies = {
+		peerReply("peer-c-1", "M3", unsigned({ s = 50, ch = "prod" })),
+		peerReply("peer-c-2", "M3", unsigned({ s = 50, ch = "prod" })),
+		peerReply("peer-c-3", "M3", unsigned({ s = 50, ch = "prod" })),
+		peerReply("peer-b-1", "M2", { sig = forged, sigF = forged }),
+		peerReply("peer-b-2", "M2", { sig = forged, sigF = forged }),
+		peerReply("peer-d-1", "Q5", unsigned({})),
+	}
+	-- The deployment list is unreadable at boot (D isn't a boot candidate); it reads fine when the peer reply is checked.
+	dataStore.failGets.deployments = 3 -- (the boot prefetch, the boot, the boot again once the heads are in)
+	local fields = FIELDS.Q5
+	dataStore.data.deployments = {
+		list = { { seq = fields.s, branch = fields.b, channel = fields.ch, artifactId = fields.i, assetId = fields.a, commit = fields.c, at = "2026-10-04T00:00:00Z", t = fields.t, sig = SIGS.Q5.sig, sigF = SIGS.Q5.sigF } },
+	}
+end
+if BACKUP_MODE or RECOVER_MODE or TELEPORT_MODE or BOUNCE_MODE then
+	-- An asset outage: every payload LoadAsset fails (the key asset still loads).
+	for id = 1001, 1009 do
+		assets[id].failLoads = math.huge
+	end
+end
+if BACKUP_MODE or RECOVER_MODE then
+	addBackup("bbbbbbb-222222")
+end
+if TELEPORT_MODE then
+	addBackup("bbbbbbb-222222", true) -- holds a Script: refused at mount like any payload
+end
+if BOUNCE_MODE then
+	GAME_ROOT_PROPS.PrivateServerId = "ps-bounce"
+	GAME_ROOT_PROPS.PrivateServerOwnerId = 0
+	dataStore.data["private/ps-bounce"] = { branch = "dev", setBy = 1, setAt = "2026-10-04T00:00:00Z", code = "own-code" }
+end
+if MIDSWAP_MODE then
+	addBackup("ddddddd-444444")
+	SMOKE.behave["aaaaaaa-111111"] = function()
+		if SMOKE.breakA then
+			return "fail" -- the last known good fails too
+		end
+	end
+end
+if CLIENT_FAIL_MODE then
+	GAME_ROOT_PROPS.PrivateServerId = "ps-smoke"
+	GAME_ROOT_PROPS.PrivateServerOwnerId = 0
+	dataStore.data["private/ps-smoke"] = { branch = "dev", setBy = 1, setAt = "2026-10-04T00:00:00Z", code = "smoke-access-code" }
+end
+
 -- 0.3.2 behaviors: G's scripts error after ready (3 times; one from a ModuleScript in its tree), H reports a failed
 -- onStart (as the framework does), I fails to start (boot returns no stop function).
 local function generationModule(kernel)
@@ -1189,6 +1512,40 @@ local BOOT_SCENARIOS = {
 		dataStore.data.deployments = { list = { entry } }
 	end },
 	{ name = "studio-local", first = "local", within = 1 },
+	-- 0.3.6 never an empty server: the time to each fallback (a player waits on the holding screen meanwhile).
+	{ name = "peers-only", first = "bbbbbbb-222222", setup = function()
+		-- No head anywhere; live servers of the branch run B (signed). Publish 0.2 s, replies 0.4-0.6 s later.
+		memoryStore.data.heads, dataStore.data.heads, dataStore.data.deployments = {}, {}, nil
+		LATENCY.publish = 0.2
+		peerReplies = { peerReply("peer-1", "M2"), peerReply("peer-2", "M2"), peerReply("peer-3", "M2") }
+		for index, reply in peerReplies do
+			reply.delay = 0.4 + index * 0.1
+		end
+	end },
+	{ name = "outage-backup", first = "ddddddd-444444", setup = function()
+		-- An asset outage: every payload LoadAsset fails after its usual latency; the backup baked into the place runs.
+		for id = 1001, 1009 do
+			assets[id].failLoads = math.huge
+		end
+		LATENCY.publish = 0.2
+		addBackup("ddddddd-444444")
+	end },
+	{ name = "outage-hang-backup", first = "ddddddd-444444", setup = function()
+		-- Every payload LoadAsset hangs (each boot attempt waits out its cap); the backup runs inside the budget.
+		for id = 1001, 1009 do
+			assets[id].hangLoads = math.huge
+		end
+		LATENCY.publish = 0.2
+		addBackup("ddddddd-444444")
+	end },
+	{ name = "nothing-teleport", first = "teleport", setup = function()
+		-- Everything fails, no backup: the waiting player is moved at the boot budget.
+		for id = 1001, 1009 do
+			assets[id].failLoads = math.huge
+		end
+		LATENCY.publish = 0.2
+		joinPlayer(7, "Waiting", nil, false)
+	end },
 }
 local scenario = nil
 if BOOT_SCENARIO then
@@ -1226,7 +1583,7 @@ Constants.PRIVATE_READ_RETRY_DELAYS = { 0.05, 0.05, 0.05 }
 Constants.CLOSE_DEADLINE = 1
 if BOOT_SCENARIO then
 	-- Real kernel timing, SCALE times faster (and the same constants an older kernel had, for before/after runs).
-	for _, name in { "BOOT_BUDGET", "BOOT_READS_WAIT", "KEYS_BOOT_WAIT", "CONFIG_BOOT_WAIT", "BOOT_OWNER_CHECK", "BOOT_DEADLINE", "BOOT_LOAD_TIMEOUT", "BOOT_READY_TIMEOUT", "BOOT_LATE_LOAD", "BOOT_LATE_READY", "READY_TIMEOUT", "POLL_SECONDS", "STOP_DEADLINE", "PUBLIC_JITTER_SECONDS" } do
+	for _, name in { "BOOT_BUDGET", "BOOT_READS_WAIT", "KEYS_BOOT_WAIT", "CONFIG_BOOT_WAIT", "BOOT_OWNER_CHECK", "BOOT_DEADLINE", "BOOT_LOAD_TIMEOUT", "BOOT_READY_TIMEOUT", "BOOT_LATE_LOAD", "BOOT_LATE_READY", "READY_TIMEOUT", "POLL_SECONDS", "STOP_DEADLINE", "PUBLIC_JITTER_SECONDS", "FALLBACK_AT", "PEER_COLLECT", "PEER_CACHE", "PEER_REPLY_JITTER", "TELEPORT_GRACE", "TELEPORT_RETRY" } do
 		if type(Constants[name]) == "number" then
 			Constants[name] *= SCALE
 		end
@@ -1236,6 +1593,7 @@ if BOOT_SCENARIO then
 	Constants.LOAD_RETRY_DELAYS = { 5 * SCALE, 15 * SCALE, 60 * SCALE }
 	Constants.PRIVATE_READ_RETRY_DELAYS = { 1 * SCALE, 2 * SCALE, 4 * SCALE }
 	Constants.POLL_SECONDS = 60 * SCALE
+	Constants.RECOVER_DELAYS = { 15 * SCALE, 30 * SCALE, 60 * SCALE }
 end
 if SWITCH_MODE then
 	Constants.SWITCH_GAP = 0.3
@@ -1252,6 +1610,26 @@ if FLEET_MODE then
 	Constants.FLEET_ALERT_GAP = 0.3
 	Constants.FLEET_SPIKE_GAP = 0.3
 	Constants.FLEET_RATE_PER_MINUTE = 6000
+end
+if HOLD_MODE or HOLD_OPTOUT_MODE or PEERS_MODE or PEERS_UNTRUSTED_MODE or BACKUP_MODE or RECOVER_MODE or TELEPORT_MODE or BOUNCE_MODE or MIDSWAP_MODE or CLIENT_FAIL_MODE or KERNEL_CRASH_MODE then
+	Constants.PEER_COLLECT = 0.4
+	Constants.PEER_CACHE = 0.5
+	Constants.RECOVER_DELAYS = { 0.5, 0.8, 1 }
+	Constants.TELEPORT_RETRY = 0.4
+	Constants.TELEPORT_GRACE = 0.5
+	Constants.CLIENT_TREE_GRACE = 0.2
+	Constants.FLEET_RETRY_DELAYS = { 0.05 }
+	Constants.FLEET_RATE_PER_MINUTE = 6000
+	Constants.FLEET_ALERT_GAP = 0.05
+	if TELEPORT_MODE or BOUNCE_MODE then
+		Constants.BOOT_BUDGET = 3 -- (the real budget is 15 s; the moves start at the budget)
+	end
+	if KERNEL_CRASH_MODE then
+		Constants.BOOT_BUDGET = 0.5 -- the dead-man moves start 5 s after it
+	end
+	if MIDSWAP_MODE then
+		Constants.READY_TIMEOUT = 1.5
+	end
 end
 if HEALTH_MODE or HEALTH_PROD_MODE or LKG_BOOT_MODE or FLEET_MODE then
 	Constants.HEALTH_WINDOW = 1.5
@@ -1360,7 +1738,7 @@ local function finish()
 	check(`no unexpected errors on kernel threads{if #unexpected > 0 then ": " .. unexpected[1] else ""}`, #unexpected == 0)
 	check(`no swap ran on a thread its own stopped generation owned (busy-flag hazard){if #hazards > 0 then ": " .. hazards[1] else ""}`, #hazards == 0)
 	check("the kernel never used a MemoryStore sorted map (0.3.2: fleet status and reports are API only)", #sortedMapRequests == 0)
-	if not FLEET_MODE and not SWITCH_MODE then
+	if not FLEET_MODE and not SWITCH_MODE and not FALLBACK_FLEET then
 		check("no HTTP request without TypeTorchFleet", #httpRequests == 0)
 	end
 	local leaked = false
@@ -1369,7 +1747,7 @@ local function finish()
 	end
 	check("the fleet token never appears in any output", not leaked)
 	for _, line in output do
-		if not BOOT_SCENARIO and line.kind == "warn" and string.find(line.text, "swap failed", 1, true) and not string.find(line.text, "eeeeeee", 1, true) and not string.find(line.text, "1006", 1, true) and not string.find(line.text, "ccccccc", 1, true) and not string.find(line.text, "Sneaky", 1, true) then
+		if not BOOT_SCENARIO and not NOISY_MODE and line.kind == "warn" and string.find(line.text, "swap failed", 1, true) and not string.find(line.text, "eeeeeee", 1, true) and not string.find(line.text, "1006", 1, true) and not string.find(line.text, "ccccccc", 1, true) and not string.find(line.text, "Sneaky", 1, true) then
 			check(`unexpected: {line.text}`, false)
 		end
 	end
@@ -1386,11 +1764,28 @@ local function finish()
 			end
 		end
 	end
-	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
 
+if scenario and scenario.first == "teleport" then
+	-- 0.3.6: nothing can run: the time until the waiting player is moved (and that nothing ran meanwhile).
+	local movedAt = nil
+	local limit = os.clock() + 60 * SCALE
+	while os.clock() < limit do
+		if #teleports > 0 then
+			movedAt = (teleports[1].at - kernelStartClock) / SCALE
+			break
+		end
+		task.wait(0.002)
+	end
+	local shown = if movedAt then string.format("%.1f", movedAt) else ">60"
+	print(`BOOT {scenario.name} first={shown} artifact=moved final=moved`)
+	check(`{scenario.name}: the waiting player is moved at the boot budget (simulated {shown} s)`, movedAt ~= nil and movedAt >= 14.9 and movedAt <= 17)
+	check(`{scenario.name}: nothing ran, the player never spawned`, SMOKE.kernel == nil and #loadedCharacters == 0)
+	finish()
+end
 if scenario then
 	-- The first running generation, then (with `final`) what it settles on.
 	local firstAt, firstArtifact = nil, nil
@@ -1440,8 +1835,9 @@ if CLIENT_MODE then
 	newInstance("UnreliableRemoteEvent", "NetU").Parent = root
 	local localPlayer = newInstance("Player", "LocalPlayer")
 	newInstance("Folder", "PlayerScripts").Parent = localPlayer
+	local playerGui = newInstance("PlayerGui", "PlayerGui") -- 0.3.6: the holding screen and re-sent client trees
+	playerGui.Parent = localPlayer
 	services.Players.LocalPlayer = localPlayer
-	services.ReplicatedFirst = newInstance("ReplicatedFirst")
 	-- A client tree whose Client.boot fails `failures` times when required (each copy of the tree requires it anew).
 	local function clientTree(name: string, failures: number)
 		SMOKE.clientFailures = SMOKE.clientFailures or {}
@@ -1475,9 +1871,28 @@ if CLIENT_MODE then
 	clientTree("bbbbbbb-222222#2", 5)
 	local clientScript = sourceInstance("Script", "TypeTorchKernelClient", "src/client/KernelClient.client.luau")
 	clientScript.Parent = services.ReplicatedFirst
+	-- 0.3.6: the server holds players (nothing runs yet): the client covers the place from its first line.
+	clientScript:SetAttribute("Hold", "start")
 	runScript(clientScript, function(err)
 		table.insert(kernelErrors, err)
 	end)
+	local function screen()
+		return playerGui:FindFirstChild("TypeTorchHold")
+	end
+	local function screenText(): string?
+		local gui = screen()
+		return gui and gui.Backdrop.Card.Label.Text
+	end
+	waitFor("the holding screen", function()
+		return screen() ~= nil
+	end, 2)
+	local shownMs = if screen() then screen():GetAttribute("ShownMs") else nil
+	check(string.format("hold: the holding screen is up from the client's first line (time-to-held %s ms after the client script started; target < 1000)", tostring(shownMs)), shownMs ~= nil and shownMs < 1000 and screenText() == "Starting..." and screen().IgnoreGuiInset == true and screen().Backdrop.BackgroundTransparency == nil)
+	check("hold: no emojis, a few words, a UIScale pop and a progress bar", (function()
+		local card = screen().Backdrop.Card
+		local text = screenText() or ""
+		return card:FindFirstChildOfClass("UIScale") ~= nil and card.Track.Fill ~= nil and #string.split(text, " ") <= 2 and not string.find(text, "[ -¤]")
+	end)())
 	local function lastReport()
 		for index = #firedToServer, 1, -1 do
 			local call = firedToServer[index]
@@ -1488,12 +1903,18 @@ if CLIENT_MODE then
 		return nil
 	end
 	Constants.CLIENT_RETRY_SECONDS = 0.1
+	Constants.CLIENT_RESEND_WAIT = 1
 	task.wait(0.1)
 	root:SetAttribute("ActiveGeneration", "aaaaaaa-111111#1")
 	check("client: a generation that fails once starts on the retry (fresh copy of its tree)", waitFor("client A", function()
 		local report = lastReport()
 		return report ~= nil and report.g == "aaaaaaa-111111#1" and report.ok == true and report.retried == true and typeof(report.ms) == "number"
 	end) and SMOKE.clientKernel ~= nil and localPlayer.PlayerScripts:FindFirstChild("TypeTorchRetry") ~= nil)
+	check("hold: the screen stays while the server still holds", screen() ~= nil and screenText() == "Starting...")
+	clientScript:SetAttribute("Hold", nil)
+	check("hold: the server's hold ends and this client's generation runs: the screen pops out", waitFor("screen gone", function()
+		return screen() == nil
+	end, 2))
 	-- P-N1: a resync naming this generation's artifact reaches it (the framework fails its pending calls); one naming
 	-- another artifact doesn't.
 	local net = root.Net
@@ -1508,6 +1929,58 @@ if CLIENT_MODE then
 		return report ~= nil and report.g == "bbbbbbb-222222#2" and report.ok == false and report.retried == true and string.find(report.e or "", "client boot boom", 1, true) ~= nil
 	end) and SMOKE.clientFailures["bbbbbbb-222222#2"] == 3)
 	check("client: the retry copy of the stopped generation was destroyed", #localPlayer.PlayerScripts.TypeTorchRetry:GetChildren() == 0)
+	-- 0.3.6: failed after its retry: the holding screen covers the broken UI; the server re-sends the client code.
+	check("client-fail: after the retry failed the holding screen shows Loading...", waitFor("loading", function()
+		return screenText() == "Loading..."
+	end))
+	local function resend(name: string, failures: number)
+		local folder = playerGui:FindFirstChild("TypeTorchResend") or newInstance("Folder", "TypeTorchResend")
+		folder.Parent = playerGui
+		local before = #generations:GetChildren()
+		clientTree(name, failures) -- builds into Generations; the server's copy goes to PlayerGui instead
+		local tree = generations:FindFirstChild(name)
+		if #generations:GetChildren() > before then
+			tree.Parent = folder
+		else
+			local copy = tree:Clone()
+			copy.Parent = folder
+		end
+		root.Net.OnClientEvent:Fire("*", "__tt/resend", { g = name })
+	end
+	SMOKE.clientFailures["bbbbbbb-222222#2"] = 0
+	resend("bbbbbbb-222222#2", 0)
+	check("client-fail: the re-sent client code starts and is reported (resent), the screen goes", waitFor("resent B", function()
+		local report = lastReport()
+		return report ~= nil and report.g == "bbbbbbb-222222#2" and report.ok == true and report.resent == true
+	end) and waitFor("screen gone", function()
+		return screen() == nil
+	end, 2))
+	-- A generation that fails everywhere, the re-sent copy too: reported, the screen says Reconnecting... (the server moves
+	-- this player).
+	clientTree("ccccccc-333333#3", 10)
+	root:SetAttribute("ActiveGeneration", "ccccccc-333333#3")
+	waitFor("C failed", function()
+		local report = lastReport()
+		return report ~= nil and report.g == "ccccccc-333333#3" and report.retried == true
+	end)
+	resend("ccccccc-333333#3", 10)
+	check("client-fail: the re-sent copy fails too: reported (resent), the screen shows Reconnecting...", waitFor("resent C", function()
+		local report = lastReport()
+		return report ~= nil and report.g == "ccccccc-333333#3" and report.ok == false and report.resent == true
+	end) and screenText() == "Reconnecting...")
+	-- The server lost its generation (a failed swap cleared ActiveGeneration): the client stops the dead one.
+	root:SetAttribute("ActiveGeneration", "aaaaaaa-111111#1")
+	SMOKE.clientFailures["aaaaaaa-111111#1"] = 0
+	waitFor("A again", function()
+		local report = lastReport()
+		return report ~= nil and report.g == "aaaaaaa-111111#1" and report.ok == true
+	end)
+	local stopsBefore = SMOKE.clientKernel
+	root:SetAttribute("ActiveGeneration", nil)
+	clientScript:SetAttribute("Hold", "start")
+	check("hold: ActiveGeneration cleared (nothing runs on the server): the dead client generation stops, the screen covers", waitFor("stopped", function()
+		return #localPlayer.PlayerScripts:GetChildren() <= 1 and screenText() == "Starting..."
+	end) and stopsBefore ~= nil)
 	finish()
 end
 
@@ -2267,6 +2740,360 @@ if LKG_BOOT_MODE then
 	finish()
 end
 
+-- 0.3.6 NEVER AN EMPTY SERVER: the modes ------------------------------------------------------------------------------
+local function alertsOf(code: string): { any }
+	local list = {}
+	for _, request in httpRequests do
+		if request.body and request.body.code == code and string.find(request.url, "/v1/fleet/alert", 1, true) then
+			table.insert(list, request.body)
+		end
+	end
+	return list
+end
+local function sinceKernel(): number
+	return os.clock() - kernelStartClock
+end
+local function holdAttribute()
+	return clientStandIn:GetAttribute("Hold"), services.ReplicatedStorage.TypeTorch:GetAttribute("Hold")
+end
+local function teleportsOf(name: string): { any }
+	local list = {}
+	for _, entry in teleports do
+		if table.find(entry.players, name) then
+			table.insert(list, entry)
+		end
+	end
+	return list
+end
+local function bounceData(entry): any
+	local data = entry.options.TeleportData
+	return data and data.TypeTorch
+end
+
+if HOLD_MODE or HOLD_OPTOUT_MODE then
+	local optOut = HOLD_OPTOUT_MODE
+	-- The hold is the kernel's first statement: before the boot reads, before any player can join.
+	check(`hold: {if optOut then "opt-out: CharacterAutoLoads untouched" else "CharacterAutoLoads off from the kernel's first line"}, the client's Hold attribute "start"`, waitFor("hold", function()
+		local first, root = holdAttribute()
+		return first == "start" and root == "start" and services.Players.CharacterAutoLoads == optOut
+	end, 1))
+	-- A player joins while the boot is still loading (LoadAsset takes 0.6 s here).
+	task.wait(0.1)
+	local early = joinPlayer(11, "Early")
+	task.wait(0.1)
+	check("hold: a player who joins during the boot has no character yet", SMOKE.kernel == nil and early.Character == nil and #loadedCharacters == 0)
+	check("hold: the first generation runs", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() == "aaaaaaa-111111"
+	end))
+	local hold = status().fallback.hold
+	if optOut then
+		check("hold-optout: the kernel never touched characters (no LoadCharacter), the screen hold ended", services.Players.CharacterAutoLoads == true and #loadedCharacters == 0 and hold.optOut == true and holdAttribute() == nil)
+	else
+		check(string.format("hold: released when the generation was ready: CharacterAutoLoads back on, the waiting player spawned, Hold cleared (held %d ms after the kernel start)", hold.heldMs or -1), waitFor("release", function()
+			local first, root = holdAttribute()
+			return services.Players.CharacterAutoLoads == true and table.find(loadedCharacters, "Early") ~= nil and first == nil and root == nil
+		end) and hold.heldMs ~= nil and hold.heldMs < 50 and hold.active == false and hold.spawned == 1)
+	end
+	-- A swap of the running generation never holds anybody.
+	SMOKE.behave["bbbbbbb-222222"] = function()
+		local first = holdAttribute()
+		SMOKE.midSwap = { autoLoads = services.Players.CharacterAutoLoads, hold = first }
+	end
+	local spawnedBefore = #loadedCharacters
+	publish("TypeTorch/deploy", deployMessage("M2", FIELDS.M2, { "sig" }))
+	check("hold: a swap of a running generation doesn't hold (CharacterAutoLoads stays on, no Hold, nobody respawned)", waitFor("swap", function()
+		return running() == "bbbbbbb-222222"
+	end) and SMOKE.midSwap ~= nil and SMOKE.midSwap.autoLoads == true and SMOKE.midSwap.hold == nil and holdAttribute() == nil and #loadedCharacters == spawnedBefore)
+	local late = joinPlayer(12, "Late")
+	task.wait(0.2)
+	check("hold: a player who joins while a generation runs isn't held (Roblox spawns them as usual)", services.Players.CharacterAutoLoads == true and late.Character == nil and #loadedCharacters == spawnedBefore)
+	finish()
+end
+
+if PEERS_MODE then
+	check("peers: no head anywhere: the kernel roll call boots the build most healthy servers of the branch run (B, 3 servers)", waitFor("peer boot", function()
+		return SMOKE.kernel ~= nil and running() == "bbbbbbb-222222"
+	end, 15))
+	local s0 = status()
+	local seconds = sinceKernel()
+	check(string.format("peers: within the boot budget (%.1f s after the kernel start), verified by its signature, appliedSeq 11", seconds), seconds < 15 and s0.generation.artifact.verified ~= nil and s0.appliedSeq == 11 and s0.fallback.chain.result == "peers")
+	local chosen = s0.fallback.peers.chosen
+	check("peers: young, unhealthy and other-branch servers aren't counted; D (1 server) lost to B (3)", chosen ~= nil and chosen.servers == 3 and chosen.assetId == 1002 and (assets[1004].loads or 0) == 0 and (assets[1007].loads or 0) == 0)
+	local ask = nil
+	for _, entry in published do
+		if entry.topic == "TypeTorch/deploy" and type(entry.data) == "table" and entry.data.rc == 1 then
+			ask = entry
+		end
+	end
+	check("peers: the ask rides TypeTorch/deploy ({rc = 1, q, j, b, t}); no new permanent subscription", ask ~= nil and ask.data.j == JOB and ask.data.b == "prod" and type(ask.data.q) == "number" and type(ask.data.t) == "number")
+	check(`peers: at most 5 MessagingService subscriptions during the ask (the empty-server limit 5 + 2 x players): {ask and ask.topics or "?"}`, ask ~= nil and ask.topics <= 5)
+	check("peers: the reply subscription is gone after the ask; the ask isn't a deploy message", topics[`TypeTorch/peers/{JOB}`] == nil and s0.lastMessage == nil)
+	-- This kernel answers other kernels' asks once its generation ran healthy for PEER_MIN_UPTIME.
+	Constants.PEER_MIN_UPTIME = 1
+	task.wait(2.1)
+	local function repliesTo(job: string): { any }
+		local list = {}
+		for _, entry in published do
+			if entry.topic == `TypeTorch/peers/{job}` then
+				table.insert(list, entry.data)
+			end
+		end
+		return list
+	end
+	publish("TypeTorch/deploy", { rc = 1, q = 7, j = "other-job-1", b = "prod", t = nowMs() })
+	publish("TypeTorch/deploy", { rc = 1, q = 8, j = "other-job-2", b = "dev", t = nowMs() })
+	publish("TypeTorch/deploy", { rc = 1, q = 9, j = "other-job-3", b = "prod", t = nowMs() - 120000 })
+	check("peers: answers an ask of its branch: its build with the signatures, server type, players, health, uptime", waitFor("reply", function()
+		local reply = repliesTo("other-job-1")[1]
+		return reply ~= nil and reply.q == 7 and reply.j == JOB and reply.a == 1002 and reply.i == "bbbbbbb-222222" and reply.s == 11 and reply.sig ~= nil and reply.st == "public" and reply.h == "ok" and reply.u >= 1 and reply.k == nil
+	end, 2))
+	publish("TypeTorch/deploy", { rc = 1, q = 10, j = "other-job-1", b = "prod", t = nowMs() })
+	task.wait(0.8)
+	check("peers: no reply to another branch, a stale ask, or the same asker within 5 s", #repliesTo("other-job-2") == 0 and #repliesTo("other-job-3") == 0 and #repliesTo("other-job-1") == 1)
+	finish()
+end
+
+if PEERS_UNTRUSTED_MODE then
+	check("peers-untrusted: the unsigned build (3 servers) and the forged signature (2) are refused; D runs (its deployment entry verifies)", waitFor("D", function()
+		return SMOKE.kernel ~= nil and running() == "ddddddd-444444"
+	end, 15))
+	check("peers-untrusted: the refused builds were never loaded; refusals counted", (assets[1003].loads or 0) == 0 and (assets[1002].loads or 0) == 0 and rejected("peer") >= 2)
+	check("peers-untrusted: D is verified (the signed deployment entry), not unverified", status().generation.artifact.verified ~= nil and status().unverified == nil and status().appliedSeq == 34)
+	finish()
+end
+
+if BACKUP_MODE or RECOVER_MODE then
+	local player1 = joinPlayer(21, "Player1")
+	check("backup: an asset outage (every LoadAsset fails): the backup baked into the place runs", waitFor("backup", function()
+		return SMOKE.kernel ~= nil and running() == "bbbbbbb-222222" and status().backup == true
+	end, 15))
+	local seconds = sinceKernel()
+	local s0 = status()
+	check(string.format("backup: within the boot budget (%.1f s after the kernel start); hold released, the waiting player spawned", seconds), seconds < 15 and holdAttribute() == nil and services.Players.CharacterAutoLoads == true and table.find(loadedCharacters, "Player1") ~= nil)
+	check("backup: flagged (status backup, fallback.backup {runs, at, seq}), no verified badge, appliedSeq untouched", s0.fallback.backup.runs == 1 and s0.fallback.backup.at == "2026-10-06T10:00:00Z" and s0.fallback.backup.seq == 11 and s0.generation.artifact.verified == nil and s0.appliedSeq == -1 and s0.fallback.chain.result == "backup")
+	check("backup: mounted as a fresh clone with the payload checks (prod channel, modules only); the source stays", services.ServerStorage:FindFirstChild("TypeTorchBackup") ~= nil and s0.generation.artifact.channel == "prod" and s0.generation.artifact.assetId == nil)
+	if BACKUP_MODE then
+		check("backup: fleet status backup = true, h = backup; alert backup_build (critical), no health_backup alert", waitFor("alert", function()
+			local alert = alertsOf("backup_build")[1]
+			return alert ~= nil and alert.level == "critical" and fleet().backup == true and fleet().h == "backup"
+		end, 3) and #alertsOf("health_backup") == 0 and hasEvent("backup_build", "artifactId", "bbbbbbb-222222"))
+		local commandSignal = services.TextChatService.TypeTorchCommand.Triggered
+		local owner = joinPlayer(1, "Owner")
+		commandSignal:Fire({ UserId = 1 }, "/tt status")
+		check("backup: /tt status says BACKUP", waitFor("tt status", function()
+			for _, call in firedToClient do
+				if call[1] == owner and call[3] == "__tt/notice" and string.find(tostring(call[4]), "BACKUP build", 1, true) then
+					return true
+				end
+			end
+			return false
+		end))
+		task.wait(1.5)
+		check("backup: the outage goes on: the backup keeps running while the recovery retries in the background", running() == "bbbbbbb-222222" and status().fallback.recovery.running == true and status().fallback.recovery.attempts >= 1)
+		finish()
+	end
+	-- RECOVER: the outage ends; the next background retry swaps to the head (A) as a normal swap.
+	local generationBefore = status().generation.number
+	assets[1001].failLoads = 0
+	check("recover: the outage ends: the background retry swaps to the real head (A)", waitFor("recovered", function()
+		return running() == "aaaaaaa-111111"
+	end, 5))
+	local s1 = status()
+	check("recover: a normal swap (players stay: no kick, no teleport; the backup stopped; the head verified, appliedSeq 10)", s1.backup == nil and s1.generation.number > generationBefore and #kicked == 0 and #teleports == 0 and table.find(SMOKE.stops, "bbbbbbb-222222") ~= nil and s1.generation.artifact.verified ~= nil and s1.appliedSeq == 10 and player1.Parent ~= nil)
+	check("recover: a deploy report swapped #10", waitFor("report", function()
+		return reported(10, "swapped")
+	end))
+	task.wait(2.5)
+	local attempts = status().fallback.recovery.attempts
+	task.wait(1.5)
+	check("recover: the retries stop once the head runs", status().fallback.recovery.running == false and status().fallback.recovery.attempts == attempts and running() == "aaaaaaa-111111")
+	finish()
+end
+
+if TELEPORT_MODE then
+	local p1 = joinPlayer(31, "P1")
+	local p2 = joinPlayer(32, "P2", 1)
+	teleportFails = 1 -- the first TeleportAsync throws
+	check("teleport: the backup holds a Script: refused at mount like any payload", waitFor("backup refused", function()
+		return said("the backup build failed (mount)")
+	end, 6))
+	task.wait(0.5)
+	check("teleport: before the boot budget nobody moves; players are held", #teleports == 0 and holdAttribute() == "start" and services.Players.CharacterAutoLoads == false and p1.Character == nil)
+	check("teleport: at the boot budget nothing runs: players are moved, by bounce count (P1 -> bounce 1, P2 -> bounce 2)", waitFor("moves", function()
+		local one, two = teleportsOf("P1"), teleportsOf("P2")
+		return #one >= 1 and #two >= 1 and bounceData(one[#one]).bounce == 1 and bounceData(two[#two]).bounce == 2
+	end, 8))
+	local first = teleportsOf("P1")[1]
+	check(string.format("teleport: a public server's fresh server is matchmaking (no ServerInstanceId, no reserved code); data carries the source JobId (%.1f s after the kernel start)", first.at - kernelStartClock), first.options.ServerInstanceId == nil and first.options.ReservedServerAccessCode == nil and bounceData(first).from == JOB and first.placeId == 42 and first.at - kernelStartClock >= Constants.BOOT_BUDGET)
+	check("teleport: the screen says Reconnecting (Hold move), new joiners are held too", holdAttribute() == "move" and services.Players.CharacterAutoLoads == false)
+	check("teleport: alert boot_failed_teleport (critical) and an event", waitFor("alert", function()
+		local alert = alertsOf("boot_failed_teleport")[1]
+		return alert ~= nil and alert.level == "critical"
+	end) and hasEvent("boot_failed_teleport"))
+	check("teleport: a failed TeleportAsync is warned and retried", said("TeleportAsync failed (smoke)") and waitFor("retry", function()
+		return #teleportsOf("P1") + #teleportsOf("P2") >= 3
+	end, 3))
+	local p3 = joinPlayer(33, "P3")
+	check("teleport: a new joiner is moved at once", waitFor("P3", function()
+		return #teleportsOf("P3") >= 1
+	end, 2) and p3.Character == nil)
+	-- A healthy server of the branch answers now: the next joiner goes there.
+	peerReplies = { peerReply("peer-ok-1", "M2") }
+	task.wait(Constants.PEER_CACHE + 0.1)
+	local p4 = joinPlayer(34, "P4")
+	check("teleport: with a healthy server of the branch (the roll call), players go there (ServerInstanceId)", waitFor("P4", function()
+		local list = teleportsOf("P4")
+		return #list >= 1 and list[1].options.ServerInstanceId == "peer-ok-1"
+	end, 3) and p4.Parent ~= nil)
+	-- Players still here after their tries are kicked with the message (logged and alerted).
+	check("teleport: a player still here after 3 teleports is kicked with the restart message (event + alert bounce_kick)", waitFor("kick", function()
+		return table.find(kicked, "P1") ~= nil
+	end, 8) and kickMessages.P1 == "Servers are restarting. Please rejoin in a minute." and #teleportsOf("P1") == 3 and hasEvent("bounce_kick", "userId", 31) and waitFor("kick alert", function()
+		return #alertsOf("bounce_kick") >= 1 and alertsOf("bounce_kick")[1].level == "critical"
+	end))
+	check("teleport: nothing ever ran here (no generation, no character)", SMOKE.kernel == nil and p1.Character == nil and #loadedCharacters == 0)
+	finish()
+end
+
+if BOUNCE_MODE then
+	local p1 = joinPlayer(41, "Bounced3", 3)
+	local p2 = joinPlayer(42, "Bounced1", 1)
+	check("bounce: a player who arrives with 3 bounces is kicked with the restart message, never teleported (event + alert)", waitFor("kick", function()
+		return table.find(kicked, "Bounced3") ~= nil
+	end, 8) and kickMessages.Bounced3 == "Servers are restarting. Please rejoin in a minute." and #teleportsOf("Bounced3") == 0 and hasEvent("bounce_kick", "bounce", 3) and waitFor("kick alert", function()
+		return #alertsOf("bounce_kick") >= 1
+	end))
+	check("bounce: a reserved server's players go to a NEW reserved server on the same branch (bounce 2)", waitFor("reserved", function()
+		local list = teleportsOf("Bounced1")
+		return #list >= 1 and list[1].options.ReservedServerAccessCode == "code-1" and bounceData(list[1]).bounce == 2
+	end, 4))
+	check("bounce: the new reserved server's record says branch dev (it boots the same branch)", (function()
+		local record = dataStore.data["private/ps-new-1"]
+		return record ~= nil and record.branch == "dev" and record.code == "code-1"
+	end)())
+	-- A healthy reserved server of the branch answers with its access code: the next joiner goes there.
+	peerReplies = { peerReply("peer-res-1", "M2", { b = "dev", st = "reserved", k = "peer-code", ch = "dev" }) }
+	task.wait(Constants.PEER_CACHE + 0.1)
+	joinPlayer(43, "Joiner")
+	check("bounce: with a healthy reserved server of the branch, players go there (its access code)", waitFor("peer", function()
+		local list = teleportsOf("Joiner")
+		return #list >= 1 and list[1].options.ReservedServerAccessCode == "peer-code"
+	end, 3))
+	check("bounce: the kicked player isn't moved again", p1 and #teleportsOf("Bounced3") == 0 and p2 ~= nil)
+	finish()
+end
+
+if MIDSWAP_MODE then
+	check("mid-swap: boots A", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() == "aaaaaaa-111111"
+	end))
+	local p1 = joinPlayer(51, "InGame")
+	p1.Character = newInstance("Model", "InGame")
+	-- The next deploy (I) fails to start after A stopped, and A fails too now: nothing runs.
+	SMOKE.breakA = true
+	local seen = { cleared = false, held = false, autoLoadsOff = false }
+	local watching = true
+	task.spawn(function()
+		while watching do
+			local root = services.ReplicatedStorage.TypeTorch
+			if root:GetAttribute("ActiveGeneration") == nil and status().generation == nil then
+				seen.cleared = true
+				seen.held = seen.held or holdAttribute() == "start"
+				seen.autoLoadsOff = seen.autoLoadsOff or services.Players.CharacterAutoLoads == false
+			end
+			task.wait(0.01)
+		end
+	end)
+	publish("TypeTorch/deploy", deployMessage("Q3", FIELDS.Q3, { "sig" }))
+	check("mid-swap: I fails after A stopped, A fails again: ActiveGeneration cleared (clients stop the dead client code), the hold arms", waitFor("lost", function()
+		return seen.cleared and seen.held and seen.autoLoadsOff
+	end, 5))
+	local joiner = joinPlayer(52, "Joiner")
+	check("mid-swap: then the chain runs the backup (no peers): the hold ends, the joiner spawns, the player in game keeps their character", waitFor("backup", function()
+		return running() == "ddddddd-444444" and status().backup == true and holdAttribute() == nil and services.Players.CharacterAutoLoads == true
+	end, 6) and table.find(loadedCharacters, "Joiner") ~= nil and table.find(loadedCharacters, "InGame") == nil and joiner.Parent ~= nil)
+	watching = false
+	check("mid-swap: ActiveGeneration names the backup generation now", services.ReplicatedStorage.TypeTorch:GetAttribute("ActiveGeneration") == status().generation.name)
+	-- BindToClose between the stop of the old generation and the ready of the new one: the starting generation's onClose.
+	SMOKE.behave["bbbbbbb-222222"] = function()
+		SMOKE.task.wait(1e6) -- never calls ready
+	end
+	publish("TypeTorch/deploy", deployMessage("M2", FIELDS.M2, { "sig" }))
+	check("mid-swap: a swap is between stop and ready", waitFor("starting", function()
+		return status().generation == nil and table.find(SMOKE.boots, "bbbbbbb-222222") ~= nil
+	end, 3))
+	local closeDone = false
+	task.spawn(function()
+		closeCallbacks[1]()
+		closeDone = true
+	end)
+	check("close: BindToClose during a swap runs the starting generation's onClose", waitFor("close", function()
+		return closeDone
+	end, 3) and table.find(SMOKE.closed, "bbbbbbb-222222") ~= nil)
+	finish()
+end
+
+if KERNEL_CRASH_MODE then
+	local held = joinPlayer(71, "Held")
+	check("kernel-crash: the kernel errored after the hold: players are held (no character, Hold start)", waitFor("crash", function()
+		return #kernelErrors == 1 and string.find(kernelErrors[1], "no service TextChatService", 1, true) ~= nil
+	end, 2) and services.Players.CharacterAutoLoads == false and clientStandIn:GetAttribute("Hold") == "start" and held.Character == nil)
+	check("kernel-crash: 5 s past the budget the dead man moves them anyway (a fresh server, bounce 1)", waitFor("moved", function()
+		local list = teleportsOf("Held")
+		return #list >= 1 and bounceData(list[1]).bounce == 1 and list[1].options.ServerInstanceId == nil
+	end, 8) and clientStandIn:GetAttribute("Hold") == "move" and said("the kernel didn't finish its boot"))
+	local late = joinPlayer(72, "Late")
+	check("kernel-crash: new joiners are moved too", waitFor("late", function()
+		return #teleportsOf("Late") >= 1
+	end, 3) and late.Character == nil)
+	-- The kernel error was the point of this mode.
+	table.clear(kernelErrors)
+	table.clear(scriptErrors)
+	finish()
+end
+
+if CLIENT_FAIL_MODE then
+	check("client-fail: boots the dev head", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() == "ddddddd-444444"
+	end))
+	local player = joinPlayer(61, "Client1")
+	local net = services.ReplicatedStorage.TypeTorch.Net
+	local generation = status().generation.name
+	local function sentTo(who, channel: string): { any }
+		local list = {}
+		for _, call in firedToClient do
+			if call[1] == who and call[3] == channel then
+				table.insert(list, call[4])
+			end
+		end
+		return list
+	end
+	net.OnServerEvent:Fire(player, "*", "__tt/client", { g = generation, ok = false, e = "client boom", ms = 40, retried = true })
+	check("client-fail: failed after its retry: the server re-sends the client code once (PlayerGui.TypeTorchResend, __tt/resend)", waitFor("resend", function()
+		local folder = player.PlayerGui:FindFirstChild("TypeTorchResend")
+		local tree = folder and folder:FindFirstChild(generation)
+		return tree ~= nil and tree:FindFirstChild("Client") ~= nil and #sentTo(player, "__tt/resend") == 1 and sentTo(player, "__tt/resend")[1].g == generation
+	end) and status().clients.resent == 1)
+	net.OnServerEvent:Fire(player, "*", "__tt/client", { g = generation, ok = false, e = "client boom again", ms = 40, resent = true })
+	check("client-fail: the re-sent copy fails too: the player is told (hold move) and moved: no healthy peer, so a rejoin of this reserved server", waitFor("move", function()
+		local list = teleportsOf("Client1")
+		return #list == 1 and list[1].options.ReservedServerAccessCode == "smoke-access-code" and sentTo(player, "__tt/hold")[1] == "move"
+	end, 3))
+	check("client-fail: reported in status().clients and the fleet status `clients`, logged", status().clients.moved == 1 and fleet().clients ~= nil and fleet().clients.resent == 1 and fleet().clients.moved == 1 and hasEvent("client_moved", "userId", 61))
+	local bounced = joinPlayer(62, "Client2", 3)
+	net.OnServerEvent:Fire(bounced, "*", "__tt/client", { g = generation, ok = false, retried = true })
+	net.OnServerEvent:Fire(bounced, "*", "__tt/client", { g = generation, ok = false, resent = true })
+	check("client-fail: a player who already bounced 3 times is kicked instead (the client message)", waitFor("kick", function()
+		return table.find(kicked, "Client2") ~= nil
+	end, 3) and kickMessages.Client2 == "The game didn't load. Please rejoin." and #teleportsOf("Client2") == 0)
+	-- The re-sent copies go with their generation (after the client tree grace).
+	publish("TypeTorch/deploy", { b = "dev", a = 1002, i = "bbbbbbb-222222", s = 20, c = "bbbbbbb", ch = "dev", t = nowMs() })
+	check("client-fail: after a swap the old generation's re-sent copy is removed", waitFor("cleanup", function()
+		return running() == "bbbbbbb-222222" and player.PlayerGui.TypeTorchResend:FindFirstChild(generation) == nil
+	end, 3))
+	finish()
+end
+
 check("kernel booted the signed head from the durable copy (not the forged MemoryStore head)", waitFor("boot", function()
 	return running() == "aaaaaaa-111111"
 end))
@@ -2298,7 +3125,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.5")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.6")
 
 -- 0.3.5: the engine's warning for a ConfigService key nobody published becomes ONE info line per TypeTorch key in the
 -- kernel's log ring (the registry is optional and, with API keys, never written); the game's own keys stay warnings.

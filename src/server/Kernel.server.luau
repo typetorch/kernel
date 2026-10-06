@@ -26,8 +26,34 @@
 -- client through the kernel transport (or /tt): a public switch lasts for this server's lifetime and is never stored, so
 -- new servers still boot the signed prod head. No admin role: owners and devs. See "Owner switch" below.
 
+--
+-- 0.3.6 (never an empty server; user: "IN NO POSSIBLE WAY players should load into an empty baseplate"): players are
+-- held (no character, the kernel client's holding screen) from this script's first line until a generation is ready;
+-- when the head and the last known good run nothing, a build other servers run fine (peers), then the backup baked into
+-- the place, then background retries, then moving players to another server. See Fallback.luau and plans/01 "Never an
+-- empty server".
+
 -- 0.3.2 (boot budget): every boot wait and cap counts from here.
 local kernelStartedAt = os.clock()
+
+-- 0.3.6: the hold comes FIRST, before anything that yields, so no player who joins can spawn on a bare place. A place
+-- project that lists the kernel's files one by one and doesn't map Fallback yet (an older template studio.project.json)
+-- still boots, without the hold and the fallbacks, and says so.
+local Fallback
+do
+	local module = script.Parent:FindFirstChild("Fallback")
+	if module then
+		Fallback = require(module)
+	else
+		warn("[TypeTorch] TypeTorchKernel.Fallback is missing (map src/server/Fallback.luau in the place project): no hold, peers, backup or moves on this server")
+		Fallback = setmetatable({}, {
+			__index = function()
+				return function() end
+			end,
+		})
+	end
+	Fallback.hold(kernelStartedAt)
+end
 
 local HttpService = game:GetService("HttpService")
 local InsertService = game:GetService("InsertService")
@@ -214,6 +240,9 @@ local restoring = false -- 0.3.2: restoreLastKnownGood is running (a failed cand
 local lastErrorText, lastErrorAt = nil, nil -- 0.3.2: the newest error worth a look (fleet status `e`)
 local lastHealthRollback = nil -- 0.3.2: { from, to?, why, at } of the last health-window rollback
 local closing = false -- 0.3.2: BindToClose ran: no more swaps
+-- 0.3.6: the generation a running swap has stopped while its replacement isn't ready yet (BindToClose runs its onClose
+-- handler when no generation runs then).
+local stoppedInSwap = nil
 -- 0.3.4 (owner switch): the last branch switch or build load on THIS server, for status().switched ("switched by
 -- <name> 3m ago"): { by, name, at, branch, artifact? }. `ownerBranch`: the dev branch the owner switched THIS public
 -- server to; it follows dev rules here (in memory only: never stored, so new servers still boot the signed prod head).
@@ -382,6 +411,7 @@ local function cloneHead(head)
 	local copy = table.clone(head)
 	admitted[copy] = admitted[head]
 	localHeads[copy] = localHeads[head]
+	Fallback.markCopy(copy, head) -- 0.3.6: a copy of the backup head is the backup too
 	return copy
 end
 
@@ -863,6 +893,7 @@ local function stopGeneration(generation, info): number
 	task.delay(Constants.CLIENT_TREE_GRACE, function()
 		clientTree:Destroy()
 	end)
+	Fallback.stopped(generation) -- 0.3.6: its client trees re-sent to players' PlayerGui go after the same grace
 	return os.clock() - started
 end
 
@@ -1187,6 +1218,9 @@ local function healthState(): string
 	if current.unverified then
 		return "unverified"
 	end
+	if current.backup then
+		return "backup" -- 0.3.6: the backup baked into the place runs (nothing else could)
+	end
 	local health = current.health
 	if failing ~= nil or health.failed or health.startFailed or health.errors >= Constants.HEALTH_ERRORS then
 		return "degraded" -- (a failed onStart after the window too: that module isn't running)
@@ -1206,7 +1240,12 @@ local function fleetStatus()
 	local kind = serverType()
 	local health = healthState()
 	local recentError = lastErrorText ~= nil and (health ~= "ok" or (lastErrorAt ~= nil and os.time() - lastErrorAt <= 900))
+	-- 0.3.6: clients whose generation failed after their retry: re-sent the client code, moved to another server.
+	local resent, moved = Fallback.clientCounts()
 	return {
+		-- 0.3.6: the backup baked into the place runs (h = "backup" too); `clients` only once something happened.
+		backup = if current and current.backup then true else nil,
+		clients = if (resent or 0) + (moved or 0) > 0 then { resent = resent, moved = moved } else nil,
 		t = kind,
 		b = myBranch,
 		c = if current then current.channel else nil,
@@ -1285,6 +1324,8 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 	if isLocal and not RunService:IsStudio() then
 		return { ok = false, reason = reason, artifactId = head.artifactId, error = "local payloads run only in Studio", stage = "gate" }
 	end
+	-- 0.3.6: the backup baked into the place (ServerStorage.TypeTorchBackup): a fresh clone, admitted "backup".
+	local isBackup = Fallback.isBackup(head) == true
 	busy = true
 	Fleet.heartbeat("swap")
 	local report = { reason = reason, assetId = head.assetId, artifactId = head.artifactId, ok = false }
@@ -1298,16 +1339,21 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		report.stage = "load"
 		local loadCap, readyCap = bootCaps()
 		report.bootCaps = if loadCap then { load = loadCap, ready = readyCap } else nil
-		local payload = if isLocal then loadLocalPayload(head) else loadPayload(head.assetId, loadCap)
+		local payload = if isLocal then loadLocalPayload(head) elseif isBackup then Fallback.loadBackup(head) else loadPayload(head.assetId, loadCap)
 		report.loadSeconds = os.clock() - loadStarted
 		report.stage = "mount"
 		-- Signed deploys and heads (and bootstrap heads) on prod servers: Channel exactly "prod"; pins keep their own rule
 		-- (head.requireChannel); experiments (signed remote pins) may be any channel. Local payloads: modules only.
+		-- 0.3.6: the backup is a prod build on every server: Channel exactly "prod", modules only.
 		local generation = mount(payload, head, {
-			requireChannel = if signedOnly and (how == "signed" or how == "bootstrap" or how == "blind") then "prod" else nil,
-			modulesOnly = signedOnly or isLocal or serverType() == "public",
+			requireChannel = if isBackup or (signedOnly and (how == "signed" or how == "bootstrap" or how == "blind")) then "prod" else nil,
+			modulesOnly = signedOnly or isLocal or isBackup or serverType() == "public",
 		})
 		generation.localPayload = isLocal or nil
+		if isBackup then
+			generation.backup = true
+			generation.backupInfo = { seq = head.backupSeq, at = head.backupAt, branch = head.branch }
+		end
 		-- 0.3 boot fail-safe: a generation from an unverified head is flagged until a verified head replaces or vouches
 		-- for it (status().unverified, an Attention error, no verified badge).
 		generation.unverified = signedOnly and how == "blind" or nil
@@ -1348,6 +1394,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 				},
 			})
 			oldStopped = true
+			stoppedInSwap = old -- 0.3.6: BindToClose runs its onClose if the server closes before the next one is ready
 			dropReportListeners(old)
 			current = nil
 			generation.start.stopSeconds = report.stopSeconds
@@ -1369,6 +1416,12 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 			else
 				-- 0.3.2 (P-K3): never again automatically on this server; then the last known good (the previous head).
 				markFailed(head.assetId, generation.artifact.id, head.seq, `start: {startError}`)
+			end
+			if old then
+				-- 0.3.6 (plans/17 "Should fix" 1): the old generation is stopped and nothing replaced it. Clients stop the dead
+				-- generation's client code (and joiners don't start it), and the hold arms again until something runs.
+				replicatedRoot:SetAttribute("ActiveGeneration", nil)
+				Fallback.lost(`{generation.artifact.id} failed to start after {old.name} stopped`)
 			end
 			if old and not restoring then
 				report.rollbackTo = if failedHere[old.artifact.assetId] then nil else old.artifact.id
@@ -1405,6 +1458,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 	end)
 	busy = false
 	startingGeneration = nil
+	stoppedInSwap = nil
 	if not ok then
 		if typeof(err) == "table" then
 			report.transient = err.transient == true or nil -- 0.3.2: a boot-capped LoadAsset
@@ -1421,6 +1475,8 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 	end
 	if not report.ok then
 		noteLastError(report.error)
+		-- 0.3.6: boot load failures are remembered, the first one starts the peer roll call, a failed backup is final.
+		Fallback.attemptFailed(head, report)
 	end
 	if not report.ok and old and not oldStopped then
 		notifyPending(head, reason, 0, true) -- load or mount failed: the old generation keeps running
@@ -1444,6 +1500,8 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		-- 0.3.2 (P-F1): a failure reported before ready (a thrown onStart, early errors) is judged now.
 		if generation then
 			checkHealth(generation)
+			-- 0.3.6: the hold ends (waiting players spawn); a backup is reported (status, fleet, alert backup_build).
+			Fallback.ready(generation)
 		end
 	end
 	if pendingHead then
@@ -1781,6 +1839,11 @@ end
 local function onDeployMessage(message)
 	local ok, data = pcall(HttpService.JSONDecode, HttpService, message.Data)
 	if not ok or typeof(data) ~= "table" then
+		return
+	end
+	-- 0.3.6: a kernel roll call ask ({ rc = 1, q, j, b, t }) rides this topic (no extra subscription); not a deploy.
+	if data.rc == 1 then
+		Fallback.onAsk(data)
 		return
 	end
 	lastMessage = {
@@ -2152,11 +2215,16 @@ local function lkgCandidates(exclude: number?): { any }
 	if signedOnly then
 		consider(bootstrapFor(myBranch))
 	end
+	-- 0.3.6: never the backup (it has no asset id): when this chain runs nothing, Fallback's chain keeps the user's
+	-- order, a build other servers run fine first, then the backup.
 	return list
 end
 
 -- Runs the first last-known-good candidate that starts. Returns its swap report, or nil. Kernel threads only.
-restoreLastKnownGood = function(exclude: number?, why: string)
+-- `options` (0.3.6): { quiet = no event or alert when nothing runs (the background recovery) }. While nothing runs, a
+-- boot past FALLBACK_AT with a fallback ready stops here (Fallback.cutOff).
+restoreLastKnownGood = function(exclude: number?, why: string, options)
+	local quiet = typeof(options) == "table" and options.quiet == true
 	if restoring or closing then
 		return nil
 	end
@@ -2172,6 +2240,10 @@ restoreLastKnownGood = function(exclude: number?, why: string)
 	local ok, err = pcall(function()
 		for _, head in lkgCandidates(exclude) do
 			if tries >= Constants.LKG_MAX_TRIES or closing then
+				break
+			end
+			if not current and not quiet and Fallback.cutOff() then
+				print("[TypeTorch] last known good: out of boot time with a fallback ready; the rest are retried in the background")
 				break
 			end
 			tries += 1
@@ -2191,6 +2263,8 @@ restoreLastKnownGood = function(exclude: number?, why: string)
 	end
 	if result then
 		Registry.logEvent({ action = "auto_rollback", to = result.artifactId, generation = result.generation, why = clip(why, 300), job = game.JobId })
+	elseif quiet then
+		return nil
 	else
 		warn(`[TypeTorch] no last-known-good artifact could run (after: {why}); {if current then `{current.artifact.id} keeps running` else "nothing runs"}`)
 		Registry.logEvent({ action = "auto_rollback_failed", tries = tries, why = clip(why, 300), job = game.JobId })
@@ -2616,9 +2690,12 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 			error = if not ok and info.e ~= nil then clip(tostring(info.e), 200) else nil,
 			ms = if typeof(info.ms) == "number" and info.ms == info.ms then math.clamp(math.floor(info.ms), 0, 10 ^ 7) else nil,
 			retried = info.retried == true or nil,
+			resent = info.resent == true or nil, -- 0.3.6: the start of the client code the server re-sent
 			at = os.time(),
 		}
 		clientStatus[player] = entry
+		-- 0.3.6: failed after its own retry: the server re-sends the client code once; failed again: the player moves.
+		Fallback.onClientReport(player, { g = entry.generation, ok = ok, retried = entry.retried, resent = entry.resent })
 		if not ok then
 			clientFailures += 1
 			lastClientFailure = { userId = player.UserId, generation = entry.generation, error = entry.error, at = entry.at }
@@ -2633,7 +2710,8 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 	-- { players, reported, ok, failed, behind (reported another generation than the running one), failures (since boot),
 	-- lastFailure? }.
 	clientSummary = function()
-		local summary = { players = #Players:GetPlayers(), reported = 0, ok = 0, failed = 0, behind = 0, failures = clientFailures, lastFailure = lastClientFailure }
+		local resent, moved = Fallback.clientCounts() -- 0.3.6
+		local summary = { players = #Players:GetPlayers(), reported = 0, ok = 0, failed = 0, behind = 0, failures = clientFailures, lastFailure = lastClientFailure, resent = resent or 0, moved = moved or 0 }
 		for _, entry in clientStatus do
 			summary.reported += 1
 			if entry.ok then
@@ -2824,6 +2902,10 @@ local function status()
 		clients = clientSummary(),
 		-- 0.3.4: the last branch switch or build load here: { by, name, at, branch, artifact? }.
 		switched = if lastSwitch then table.clone(lastSwitch) else nil,
+		-- 0.3.6 (never an empty server): the backup baked into the place runs (flagged like the boot fail-safe), and the
+		-- hold, peers, backup, recovery and moves ({ hold, backup, peers, chain, recovery, moving, clients }).
+		backup = if current and current.backup then true else nil,
+		fallback = Fallback.status(),
 	}
 end
 
@@ -3042,6 +3124,12 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 			if s.localPayload then
 				pinned ..= ", local payload"
 			end
+			if s.backup then
+				pinned ..= ", BACKUP build (retrying the real one)"
+			end
+			if s.fallback and s.fallback.moving and s.fallback.moving.active then
+				pinned ..= ", moving players out"
+			end
 			local signing = if s.signedOnly then `, signed only ({s.signing.mode}{if s.rejected.total > 0 then `, {s.rejected.total} rejected` else ""})` else ""
 			if s.switched then
 				pinned ..= `, switched by {s.switched.name}`
@@ -3192,7 +3280,7 @@ task.spawn(function()
 			local health = healthState()
 			if health ~= lastHealth then
 				Fleet.heartbeat("health")
-				if health ~= "ok" then
+				if health ~= "ok" and health ~= "backup" then -- (0.3.6: the backup has its own alert, backup_build)
 					local detail = if current and current.health.lastError then `: {current.health.lastError}` else ""
 					fleetAlert(if health == "degraded" then "warning" else "critical", `health_{health}`, `health {lastHealth} -> {health}{detail}`, nil)
 				end
@@ -3214,7 +3302,16 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 		closing = true
 		-- The fleet API hears a clean close (not a lost server), in parallel with the generation's handler.
 		task.spawn(Fleet.closing, 3)
+		-- 0.3.6 (plans/17): closing in the middle of a swap (the old generation stopped, the next not ready yet): the
+		-- starting generation's handler if it installed one, else the stopped generation's (its last flush).
 		local generation = current
+		if not generation then
+			if startingGeneration and startingGeneration.closeHandler then
+				generation = startingGeneration
+			elseif stoppedInSwap and stoppedInSwap.closeHandler then
+				generation = stoppedInSwap
+			end
+		end
 		local handler = generation and generation.closeHandler
 		if handler then
 			local done = false
@@ -3270,11 +3367,18 @@ end
 -- an empty game"). Each must still be Channel "prod" and only Folders and ModuleScripts at mount; a head that fails is
 -- skipped for the next one. Blind trust is for this first generation only: everything after boot stays strictly
 -- verified, and a blind boot doesn't move appliedSeq (a forged seq can't block the next signed deploy).
-local function bootSigned()
+local bootSigned
+local function bootSignedOnce()
 	local tried = {}
+	local cut = false -- 0.3.6: out of boot time with a fallback ready (Fallback.cutOff): the rest are retried later
 	local function try(head, how: string): boolean
 		local key = `{tostring(head.assetId)}#{tostring(head.seq)}`
-		if tried[key] then
+		if tried[key] or cut then
+			return false
+		end
+		if not current and Fallback.cutOff() then
+			cut = true
+			print("[TypeTorch] boot: out of boot time with a fallback ready; the other candidates are retried in the background")
 			return false
 		end
 		tried[key] = true
@@ -3341,8 +3445,215 @@ local function bootSigned()
 			end
 		end
 	end
-	warn(`[TypeTorch] branch {myBranch}: nothing loaded (no verified, bootstrap or usable stored head){if err then ` (registry: {err})` else ""}; waiting for a signed deploy`)
+	if cut then
+		return
+	end
+	warn(`[TypeTorch] branch {myBranch}: nothing loaded (no verified, bootstrap or usable stored head){if err then ` (registry: {err})` else ""}; peers and the backup next, and waiting for a signed deploy`)
 	fleetAlert("critical", "no_trusted_head", `branch {myBranch}: nothing loaded (no verified, bootstrap or usable stored head)`, nil)
+end
+-- 0.3.6: Fallback's chain waits while a boot is between its candidates.
+bootSigned = function()
+	Fallback.bootBegin()
+	local ok, bootError = pcall(bootSignedOnce)
+	Fallback.bootEnd()
+	if not ok then
+		warn(`[TypeTorch] boot failed: {bootError}`)
+	end
+end
+
+-- 0.3.6 NEVER AN EMPTY SERVER: the kernel side of Fallback.luau (what the fallbacks may do, under the kernel's rules).
+do -- (scoped: the main chunk is near Luau's 200-local limit)
+	-- A peer's reply as a head, its fields checked one by one (untrusted: any server of the universe can answer).
+	local function peerHead(row)
+		local function text(value, max)
+			return if typeof(value) == "string" and #value > 0 and #value <= max then value else nil
+		end
+		if typeof(row) ~= "table" or typeof(row.a) ~= "number" or row.a % 1 ~= 0 or row.a <= 0 then
+			return nil
+		end
+		return {
+			assetId = row.a,
+			artifactId = text(row.i, 100),
+			seq = if typeof(row.s) == "number" and row.s == row.s then row.s else nil,
+			commit = text(row.c, 64),
+			channel = if row.ch == "prod" or row.ch == "dev" then row.ch else nil,
+			branch = myBranch,
+			t = if typeof(row.t) == "number" then row.t else nil,
+			r = if row.r == 1 or row.r == "resign" then row.r else nil,
+			rollback = if row.r == 1 then true else nil,
+			sig = text(row.sig, 100),
+			sigF = text(row.sigF, 100),
+		}
+	end
+
+	Fallback.configure({
+		startedAt = kernelStartedAt,
+		jobId = game.JobId,
+		placeId = game.PlaceId,
+		replicatedRoot = replicatedRoot,
+		serverType = serverType,
+		branch = function()
+			return myBranch
+		end,
+		current = function()
+			return current
+		end,
+		everRan = function()
+			return lastGeneration ~= nil
+		end,
+		-- No swap, deploy worker, last-known-good chain or queued swap is in flight.
+		idle = function()
+			return not busy and not workerRunning and not restoring and pendingHead == nil
+		end,
+		closing = function()
+			return closing
+		end,
+		localMode = function()
+			return localMode
+		end,
+		swapTo = function(head, reason)
+			return swapTo(head, reason)
+		end,
+		admitBackup = function(head)
+			return admit(head, "backup")
+		end,
+		-- 4. On prod servers a peer's build runs only when this kernel trusts it: a valid signature by the strict rule, a
+		-- deployment entry of this branch for the same asset that verifies, or the BootstrapHeads match. Peers can never
+		-- make a prod server trust an unsigned build. Dev servers take it like a deploy message (same trust).
+		trustPeer = function(row)
+			local head = peerHead(row)
+			if not head then
+				return nil, "a malformed reply"
+			end
+			if failedHere[head.assetId] then
+				return nil, `{head.artifactId or head.assetId} failed on this server before`
+			end
+			if not requiresSignatures(myBranch) then
+				return head
+			end
+			if head.channel == "prod" and trustedProd(myBranch, head) then
+				return admit(head, if signedProd(myBranch, head) then "signed" else "bootstrap")
+			end
+			local entriesOk, entries = pcall(deploymentEntries)
+			if entriesOk then
+				for _, entry in entries do
+					if entry.branch == myBranch and entry.assetId == head.assetId then
+						local candidate = pinHead(entry)
+						candidate.pinned = nil
+						if trustedProd(myBranch, candidate) then
+							return admit(candidate, if signedProd(myBranch, candidate) then "signed" else "bootstrap")
+						end
+					end
+				end
+			end
+			return nil, "not signed, and no verified deployment entry or BootstrapHeads entry for it"
+		end,
+		noteApplied = function(head)
+			if typeof(head.seq) == "number" and (not requiresSignatures(myBranch) or admitted[head] == "signed" or admitted[head] == "bootstrap") then
+				appliedSeq = math.max(appliedSeq, head.seq)
+			end
+		end,
+		-- 5. The branch head, as a normal swap (players stay). nil when there is nothing to try.
+		retryHead = function()
+			if not myBranch or localMode or closing then
+				return nil
+			end
+			Registry.refreshStoredHead(myBranch, 0)
+			local head = headFor(myBranch)
+			if not head or typeof(head.assetId) ~= "number" or failedHere[head.assetId] then
+				return nil
+			end
+			if current and not current.backup and head.assetId == current.artifact.assetId then
+				return nil
+			end
+			local reason = if current then "deploy" elseif lastGeneration then "auto-rollback" else "boot"
+			local report = swapTo(head, reason)
+			if report.ok then
+				if typeof(head.seq) == "number" then
+					appliedSeq = math.max(appliedSeq, head.seq)
+				end
+				failing = nil
+				if reason == "deploy" then
+					reportOutcome(head, "swapped", { d = (report.loadSeconds or 0) + (report.swapSeconds or 0) })
+				end
+			end
+			return report
+		end,
+		retryLastKnownGood = function()
+			return restoreLastKnownGood(nil, "recovery", { quiet = true })
+		end,
+		-- The branch head runs here (a pin or a Studio local payload count as "where it should be": a person chose them).
+		headRunning = function()
+			if localMode then
+				return true
+			end
+			if not current or current.backup then
+				return false
+			end
+			if current.pinned then
+				return true
+			end
+			local head = myBranch and headFor(myBranch)
+			return head ~= nil and (head.assetId == current.artifact.assetId or (head.artifactId ~= nil and head.artifactId == current.artifact.id))
+		end,
+		hasHead = function()
+			return myBranch ~= nil and headFor(myBranch) ~= nil
+		end,
+		-- What this server tells an asking kernel: its build, if it runs healthy, unpinned, for PEER_MIN_UPTIME seconds.
+		peerRow = function()
+			local kind = serverType()
+			if kind == "studio" or not current or current.backup or current.unverified or current.pinned or current.localPayload or current.head.experiment then
+				return nil
+			end
+			local artifact, head = current.artifact, current.head
+			if typeof(artifact.assetId) ~= "number" or healthState() ~= "ok" or os.time() - current.startedAt < Constants.PEER_MIN_UPTIME then
+				return nil
+			end
+			return {
+				b = myBranch,
+				a = artifact.assetId,
+				i = artifact.id,
+				s = head.seq,
+				c = artifact.commit,
+				ch = head.channel or artifact.channel,
+				t = head.t,
+				r = head.r,
+				sig = head.sig,
+				sigF = head.sigF,
+				st = kind,
+				n = #Players:GetPlayers(),
+				m = Players.MaxPlayers,
+				h = "ok",
+				u = os.time() - current.startedAt,
+				-- A reserved server's access code (universe-internal, like the framework's roll call), so players of a
+				-- reserved server on this branch can be moved here.
+				k = if kind == "reserved" then ownAccessCode else nil,
+			}
+		end,
+		-- 2. A new reserved server on this branch (private and reserved servers' moves).
+		reserveServer = function()
+			local ok, code, privateServerId = pcall(TeleportService.ReserveServer, TeleportService, game.PlaceId)
+			if not ok then
+				return nil, tostring(code)
+			end
+			Registry.setPrivateBranch(privateServerId, myBranch, 0, nil, code)
+			return code
+		end,
+		ownAccessCode = function()
+			return ownAccessCode
+		end,
+		kernelSend = Transport.kernelSend,
+		alert = function(level, code, message, head)
+			fleetAlert(level, code, message, head)
+		end,
+		logEvent = function(entry)
+			entry.job = game.JobId
+			Registry.logEvent(entry)
+		end,
+		refuse = refuse,
+		warn = warn,
+		print = print,
+	})
 end
 
 local bootHead = headFor(myBranch)
@@ -3382,6 +3693,9 @@ elseif bootHead then
 else
 	warn(`[TypeTorch] branch {myBranch} has no artifact yet{if err then ` (registry: {err})` else ""}; waiting for a deploy`)
 end
+-- 0.3.6: the boot section returned. If nothing runs once it settles: peers, the backup, background retries, and at the
+-- boot budget the moves (Fallback.luau).
+Fallback.start()
 
 -- 0.3.2 (boot budget): heads that were still on their way at the gate. When both copies are in: a server that runs
 -- nothing boots again (a usable head may have come), one that runs something follows the head now instead of at the
@@ -3395,7 +3709,7 @@ task.spawn(function()
 	if closing or localMode then
 		return
 	end
-	if not current and not busy and not workerRunning then
+	if not current and not busy and not workerRunning and not Fallback.busy() then
 		print("[TypeTorch] the stored heads are in: booting again")
 		if requiresSignatures(myBranch) then
 			bootSigned()
