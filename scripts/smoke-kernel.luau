@@ -10,7 +10,7 @@
 -- copy; a new server boots it, a running one follows it within one durable read, MemoryStore is written back, and the
 -- DataStore read budget holds), and 0.3.6's never-an-empty-server modes (`--hold`, `--hold-optout`, `--peers`,
 -- `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
--- `--kernel-crash`; described at "0.3.6 NEVER AN EMPTY SERVER" below; `--client` covers the client's holding screen and
+-- `--kernel-crash`; and the security audit follow-ups `--heads-cap`, `--access`; described at "0.3.6 NEVER AN EMPTY SERVER" below; `--client` covers the client's holding screen and
 -- re-sent code). Every mode also checks that no swap ran on a thread its own stopped generation owned.
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore, ConfigService unavailable), then drives it:
@@ -685,6 +685,7 @@ local httpRequests = {}
 local httpScript = {}
 local FLEET_TOKEN = "smoke-fleet-token-0123456789abcdef"
 local configValues = {} -- ConfigService keys in `--fleet` (the "TypeTorch" registry key stays missing)
+local configThrows = {} -- 0.3.6 `--access`: keys whose GetValue throws
 -- 0.3.6: MessagingService publishes ({ topic, data (decoded) }); `peerReplies` answers the kernel's roll call ask with
 -- these rows (each { delay?, row }), as other kernels would; teleports ({ placeId, players (names), options props });
 -- `teleportFails` = errors for the next TeleportAsync calls; Players attributes; reserved servers made.
@@ -822,11 +823,14 @@ local services = {
 	ConfigService = {
 		GetConfigAsync = function()
 			simWait("config")
-			if not (table.find(process.args, "--fleet") or table.find(process.args, "--switch") or table.find(process.args, "--backup") or table.find(process.args, "--teleport") or table.find(process.args, "--bounce")) then
+			if not (table.find(process.args, "--fleet") or table.find(process.args, "--switch") or table.find(process.args, "--backup") or table.find(process.args, "--teleport") or table.find(process.args, "--bounce") or table.find(process.args, "--access")) then
 				error("ConfigService unavailable (smoke)")
 			end
 			local snapshot = { UpdateAvailable = signal() }
 			function snapshot:GetValue(key)
+				if configThrows[key] then
+					error(`ConfigService GetValue({key}) failed (smoke)`)
+				end
 				return deepCopy(configValues[key])
 			end
 			function snapshot:Refresh() end
@@ -1168,6 +1172,9 @@ local FIELDS = {
 	M9 = { b = "prod", a = 1001, i = "aaaaaaa-111111", s = 18, c = "aaaaaaa", ch = "prod", t = 1759580170000 },
 	-- The CLI re-signs the running head after `keys rotate`: same asset, new seq, r = "resign".
 	M10 = { b = "prod", a = 1006, i = "fffffff-666666", s = 19, c = "fffffff", ch = "prod", t = 1759580180000, r = "resign" },
+	-- 0.3.6 `--heads-cap`: signed deploys of branches the server doesn't know yet.
+	E1 = { b = "eu", a = 1002, i = "bbbbbbb-222222", s = 40, c = "bbbbbbb", ch = "prod", t = 1759580400000 },
+	E2 = { b = "eu2", a = 1004, i = "ddddddd-444444", s = 41, c = "ddddddd", ch = "prod", t = 1759580410000 },
 	P2 = { j = { "smoke-job-0001" }, a = 1001, b = "prod", by = 1, t = 1759580200000 },
 	P3 = { j = { "smoke-job-0001" }, b = "prod", by = 1, t = 1759580200000, unpin = true },
 	-- 0.3.2 health tests: G errors after ready, H's onStart fails, I fails to start, G again, then a good D.
@@ -1282,6 +1289,25 @@ local TELEPORT_MODE = table.find(process.args, "--teleport") ~= nil
 local BOUNCE_MODE = table.find(process.args, "--bounce") ~= nil
 local MIDSWAP_MODE = table.find(process.args, "--mid-swap") ~= nil
 local CLIENT_FAIL_MODE = table.find(process.args, "--client-fail") ~= nil
+-- 0.3.6 (plans/18): `--heads-cap` (a public prod server: deploy messages of unknown branches are recorded only when
+-- signed; the stored heads hold at most HEADS_MAX_BRANCHES branches) and `--access` (the dev lists from TypeTorchAccess
+-- apply at once on a ConfigService update, even when the registry key can't be read).
+local HEADS_CAP_MODE = table.find(process.args, "--heads-cap") ~= nil
+local ACCESS_MODE = table.find(process.args, "--access") ~= nil
+if HEADS_CAP_MODE then
+	-- 31 branches stored: prod (signed H1) and b01..b30 (dev heads).
+	for index = 1, 30 do
+		local name = string.format("b%02d", index)
+		local head = { assetId = 1004, artifactId = "ddddddd-444444", seq = index, commit = "ddddddd", channel = "dev", t = 1759580000000, deployedAt = "2026-10-04T00:00:00Z" }
+		memoryStore.data.heads[name] = head
+		dataStore.data.heads[name] = deepCopy(head)
+	end
+	memoryStore.data.heads.prod = deepCopy(dataStore.data.heads.prod) -- (no forged MemoryStore head here)
+	memoryStore.data.heads.dev = nil
+end
+if ACCESS_MODE then
+	configValues.TypeTorch = { defaultBranch = "prod" }
+end
 -- `--kernel-crash`: the kernel errors right after the hold (a kernel bug): the held players are still moved.
 local KERNEL_CRASH_MODE = table.find(process.args, "--kernel-crash") ~= nil
 if KERNEL_CRASH_MODE then
@@ -1738,7 +1764,7 @@ local function finish()
 	check(`no unexpected errors on kernel threads{if #unexpected > 0 then ": " .. unexpected[1] else ""}`, #unexpected == 0)
 	check(`no swap ran on a thread its own stopped generation owned (busy-flag hazard){if #hazards > 0 then ": " .. hazards[1] else ""}`, #hazards == 0)
 	check("the kernel never used a MemoryStore sorted map (0.3.2: fleet status and reports are API only)", #sortedMapRequests == 0)
-	if not FLEET_MODE and not SWITCH_MODE and not FALLBACK_FLEET then
+	if not FLEET_MODE and not SWITCH_MODE and not FALLBACK_FLEET and not ACCESS_MODE then
 		check("no HTTP request without TypeTorchFleet", #httpRequests == 0)
 	end
 	local leaked = false
@@ -1764,7 +1790,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -3030,6 +3056,82 @@ if MIDSWAP_MODE then
 	check("close: BindToClose during a swap runs the starting generation's onClose", waitFor("close", function()
 		return closeDone
 	end, 3) and table.find(SMOKE.closed, "bbbbbbb-222222") ~= nil)
+	finish()
+end
+
+if HEADS_CAP_MODE then
+	check("heads-cap: boots the signed prod head", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() == "aaaaaaa-111111"
+	end))
+	local function stored(branch: string)
+		return memoryStore.data.heads[branch], dataStore.data.heads[branch]
+	end
+	local function count(map): number
+		local n = 0
+		for _ in map do
+			n += 1
+		end
+		return n
+	end
+	-- An unsigned deploy of a branch this prod server doesn't know: not recorded (forged messages can't grow the key).
+	publish("TypeTorch/deploy", { b = "newdev", a = 1003, i = "ccccccc-333333", s = 50, c = "ccccccc", ch = "dev", t = nowMs() })
+	task.wait(0.3)
+	check("heads-cap: a prod server ignores an unsigned deploy of an unknown branch (nothing stored, one line)", stored("newdev") == nil and said("deploy message for unknown branch newdev not recorded") and count(memoryStore.data.heads) == 31)
+	-- A known branch still updates.
+	publish("TypeTorch/deploy", { b = "b05", a = 1003, i = "ccccccc-333333", s = 51, c = "ccccccc", ch = "dev", t = nowMs() })
+	check("heads-cap: a known branch's deploy is still recorded", waitFor("b05", function()
+		local memory = stored("b05")
+		return memory ~= nil and memory.seq == 51
+	end))
+	-- A signed deploy of a new branch is recorded (32 branches now).
+	publish("TypeTorch/deploy", deployMessage("E1", FIELDS.E1, { "sig", "sigF" }))
+	check("heads-cap: a SIGNED deploy of an unknown branch is recorded (32 branches)", waitFor("eu", function()
+		local memory, durable = stored("eu")
+		return memory ~= nil and memory.seq == 40 and durable ~= nil and count(memoryStore.data.heads) == 32
+	end))
+	-- Full: a new branch isn't recorded even signed; the branches there keep updating.
+	publish("TypeTorch/deploy", deployMessage("E2", FIELDS.E2, { "sig", "sigF" }))
+	publish("TypeTorch/deploy", { b = "b06", a = 1003, i = "ccccccc-333333", s = 52, c = "ccccccc", ch = "dev", t = nowMs() })
+	check("heads-cap: at HEADS_MAX_BRANCHES (32) a new branch isn't stored, even signed (warned); known branches still update", waitFor("b06", function()
+		local memory = stored("b06")
+		return memory ~= nil and memory.seq == 52
+	end) and stored("eu2") == nil and select(2, stored("eu2")) == nil and count(memoryStore.data.heads) == 32 and count(dataStore.data.heads) == 32 and said("the stored heads hold 32 branches"))
+	check("heads-cap: the server's own branch is unaffected", running() == "aaaaaaa-111111" and status().appliedSeq == 10)
+	finish()
+end
+
+if ACCESS_MODE then
+	check("access: boots", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() ~= nil
+	end))
+	local member = joinPlayer(9, "Member")
+	local api = SMOKE.kernel
+	check("access: no TypeTorchAccess key: a would-be member isn't a dev", api:devInfo(member).dev == false)
+	-- `typetorch access push`, while the registry key itself can't be read: the update applies at once (no 60 s wait).
+	configThrows.TypeTorch = true
+	configValues.TypeTorchAccess = { v = 1, members = { ["9"] = "dev" }, revoked = {} }
+	SMOKE_CONFIG.UpdateAvailable:Fire()
+	check("access: a ConfigService update re-reads TypeTorchAccess at once (Registry.onUpdate -> Access.refresh)", waitFor("dev", function()
+		return api:devInfo(member).dev == true
+	end, 1) and said("dev access from ConfigService TypeTorchAccess"))
+	configValues.TypeTorchAccess = { v = 1, members = {}, revoked = { ["9"] = true } }
+	SMOKE_CONFIG.UpdateAvailable:Fire()
+	check("access: a revocation pushed the same way applies at once", waitFor("revoked", function()
+		return api:devInfo(member).dev == false
+	end, 1))
+	-- The engine's warning for a missing TypeTorchAccess key is one dim info line, like the other optional keys.
+	local before = #api:logs(nil, 500)
+	services.LogService.MessageOut:Fire('ConfigService: Config value not found for key "TypeTorchAccess".', Enum.MessageType.MessageWarning)
+	services.LogService.MessageOut:Fire('ConfigService: Config value not found for key "TypeTorchAccess".', Enum.MessageType.MessageWarning)
+	task.wait(0.1)
+	local lines = api:logs(nil, 500)
+	local infos = 0
+	for index = before + 1, #lines do
+		if lines[index].kind == "info" and string.find(lines[index].text, "no ConfigService key TypeTorchAccess (optional: run typetorch access push)", 1, true) then
+			infos += 1
+		end
+	end
+	check("access: a missing TypeTorchAccess key is one info line in the log ring", infos == 1 and #lines == before + 1)
 	finish()
 end
 

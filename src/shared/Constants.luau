@@ -162,6 +162,15 @@ return {
 	BOUNCE_MAX = 3,
 	KICK_MESSAGE = "Servers are restarting. Please rejoin in a minute.",
 	CLIENT_KICK_MESSAGE = "The game didn't load. Please rejoin.",
+	-- 0.3.6 (security audit, plans/18): the server-only ConfigService key with the dev lists (`typetorch access push`):
+	-- { v = 1, members, revoked, devBadgeId }; when it exists its lists replace the registry's. Re-read on every registry
+	-- change, on every ConfigService update (Registry.onUpdate), and at most every ACCESS_REFRESH_SECONDS from a check.
+	ACCESS_KEY = "TypeTorchAccess",
+	ACCESS_REFRESH_SECONDS = 60,
+	-- 0.3.6 (plans/18): the stored `heads` key holds at most this many branches; a deploy message for a NEW branch
+	-- beyond it isn't recorded (the CLI's durable copy still has it). Prod servers also ignore messages for branches they
+	-- don't know (not in ConfigService `channels`, not in the stored heads) unless the message is signed.
+	HEADS_MAX_BRANCHES = 32,
 	-- server -> client, tagged "*": { g } the client tree of generation g was re-sent to PlayerGui.TypeTorchResend (once,
 	-- after the client's own retry failed); the client waits at most CLIENT_RESEND_WAIT s for it.
 	CHANNEL_RESEND = "__tt/resend",

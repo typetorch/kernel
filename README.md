@@ -121,12 +121,17 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
     (`PlayerGui.TypeTorchResend`, `__tt/resend`); if that fails too, the player moves to a healthy server of the branch
     (or rejoins). `status().clients` and the fleet status `clients` count `resent` and `moved`.
   - `status().fallback` = `{hold, backup, peers, chain, recovery, moving, clients}`.
+- Security audit follow-ups (0.3.6, plans/18): the dev lists come from the server-only ConfigService key
+  `TypeTorchAccess` (`typetorch access push`) when it exists, re-read on every ConfigService update; the stored `heads`
+  key holds at most 32 branches, and prod servers record another branch's deploy only when they know the branch or the
+  message is signed; `place.project.json` sets `LoadStringEnabled` false (`kernel deploy --loadstring` turns it on for
+  a test place).
 - Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
   `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, `--durable`, 0.3.6's `--hold`, `--hold-optout`,
   `--peers`, `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
-  `--kernel-crash`, and `--boot-budget`, which runs 25 boot scenarios with simulated slow or failing dependencies and
+  `--kernel-crash`, `--heads-cap`, `--access`, and `--boot-budget`, which runs 25 boot scenarios with simulated slow or failing dependencies and
   checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.

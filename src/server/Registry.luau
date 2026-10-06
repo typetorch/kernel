@@ -133,13 +133,26 @@ local function changed()
 	end
 end
 
+-- 0.3.6 (plans/18): fn() after every ConfigService update (UpdateAvailable), whatever the registry key did; the
+-- kernel re-reads the dev lists (Access.refresh) there, so a `typetorch access push` applies at once.
+local updateListeners: { () -> () } = {}
+-- Other server-only keys of the same snapshot that were missing (Registry.readKey); a publish may have added them.
+local otherMissing: { [string]: boolean } = {}
+function Registry.onUpdate(fn: () -> ())
+	table.insert(updateListeners, fn)
+end
+
 local function watch()
 	snapshot.UpdateAvailable:Connect(function()
 		pcall(function()
 			snapshot:Refresh()
 		end)
 		keyMissing = false -- a publish may have added the key
+		table.clear(otherMissing) -- and the other keys (before the listeners read them)
 		changed()
+		for _, listener in updateListeners do
+			task.spawn(listener)
+		end
 	end)
 	-- Also covers a key added by a Refresh from the sync loop (if the engine has the per-key signal).
 	pcall(function()
@@ -222,7 +235,6 @@ end
 -- false while ConfigService is unavailable (keep what you have), value = nil when the key is missing. A missing key is
 -- read again only after a publish (UpdateAvailable or the key's own changed signal): the engine warns on every read of
 -- a missing key.
-local otherMissing: { [string]: boolean } = {}
 local otherWatched: { [string]: boolean } = {}
 function Registry.readKey(key: string): (boolean, any)
 	if not snapshot then
@@ -390,6 +402,31 @@ local function replaces(stored, head, branch: string?): boolean
 	return at > storedAt
 end
 
+-- 0.3.6 (plans/18): the stored `heads` key holds at most HEADS_MAX_BRANCHES branches. A head for a NEW branch beyond
+-- that isn't written (anything in the universe can publish deploy messages, so the key could grow without bound); the
+-- branches already there keep updating. Reads are never capped (a server must find its own branch's head).
+local warnedFull: { [string]: boolean } = {}
+local function branchCount(heads: any): number
+	local count = 0
+	if typeof(heads) == "table" then
+		for _ in heads do
+			count += 1
+		end
+	end
+	return count
+end
+local function admitsBranch(heads: any, branch: string): boolean
+	if typeof(heads) ~= "table" or heads[branch] ~= nil or branchCount(heads) < (Constants.HEADS_MAX_BRANCHES or 32) then
+		return true
+	end
+	if not warnedFull[branch] then
+		warnedFull[branch] = true
+		warn(`[TypeTorch] the stored heads hold {branchCount(heads)} branches (the most, HEADS_MAX_BRANCHES): branch {branch} isn't recorded from deploy messages (the CLI's durable copy still has it)`)
+	end
+	return false
+end
+Registry.admitsBranch = admitsBranch
+
 -- Keeps the newer head per branch (by seq) from a { [branch] = head } table.
 local function mergeHeads(into: { [string]: any }, from: any): boolean
 	if typeof(from) ~= "table" then
@@ -448,7 +485,7 @@ local function writeMemoryBack(newer: { [string]: any })
 				local heads = if typeof(existing) == "table" then existing else {}
 				local changed = false
 				for branch, head in newer do
-					if replaces(heads[branch], head, branch) then
+					if replaces(heads[branch], head, branch) and admitsBranch(heads, branch) then
 						heads[branch] = head
 						changed = true
 					end
@@ -591,6 +628,9 @@ function Registry.saveHead(branch: string, head, deployments: { any }?)
 	if current and not replaces(current, head, branch) then
 		return
 	end
+	if not admitsBranch(storedHeads, branch) then
+		return -- 0.3.6: a new branch beyond HEADS_MAX_BRANCHES
+	end
 	storedHeads[branch] = head
 	task.spawn(function()
 		local won = false
@@ -598,9 +638,9 @@ function Registry.saveHead(branch: string, head, deployments: { any }?)
 			getMemory():UpdateAsync(HEADS_KEY, function(existing)
 				local heads = if typeof(existing) == "table" then existing else {}
 				local stored = heads[branch]
-				if not replaces(stored, head, branch) then
+				if not replaces(stored, head, branch) or not admitsBranch(heads, branch) then
 					won = false
-					return nil -- another server already stored this deploy (or a newer one)
+					return nil -- another server already stored this deploy (or a newer one), or the key is full
 				end
 				heads[branch] = head
 				won = true
@@ -615,7 +655,7 @@ function Registry.saveHead(branch: string, head, deployments: { any }?)
 			getStore():UpdateAsync(HEADS_KEY, function(existing)
 				local heads = if typeof(existing) == "table" then existing else {}
 				local stored = heads[branch]
-				if not replaces(stored, head, branch) then
+				if not replaces(stored, head, branch) or not admitsBranch(heads, branch) then
 					return nil
 				end
 				heads[branch] = head
@@ -688,6 +728,30 @@ function Registry.bootCandidates(branch: string): { any }
 		return seqA > seqB
 	end)
 	return list
+end
+
+-- 0.3.6 (plans/18): whether this server knows `branch` (ConfigService `channels` or `branches`, or a stored head). Prod
+-- servers record deploy messages of unknown branches only when they are signed.
+function Registry.knowsBranch(branch: string): boolean
+	local state = Registry.state()
+	return state.channels[branch] ~= nil or state.branches[branch] ~= nil or storedHeads[branch] ~= nil
+end
+
+-- A deploy message of an unknown branch was ignored: one line per minute at most, with the count.
+local ignored = { count = 0, printedAt = -math.huge, held = 0 }
+function Registry.noteIgnoredBranch(branch: string)
+	ignored.count += 1
+	if os.clock() - ignored.printedAt < 60 then
+		ignored.held += 1
+		return
+	end
+	ignored.printedAt = os.clock()
+	local more = if ignored.held > 0 then ` ({ignored.held} more since the last line)` else ""
+	ignored.held = 0
+	print(`[TypeTorch] deploy message for unknown branch {string.sub(branch, 1, 64)} not recorded on this prod server (unsigned){more}; the CLI's durable copy has it`)
+end
+function Registry.ignoredBranches(): number
+	return ignored.count
 end
 
 -- 0.3: both candidate heads of a branch (ConfigService, stored), either may be nil.

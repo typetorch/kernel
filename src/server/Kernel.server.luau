@@ -1803,6 +1803,11 @@ local function followHead(reason: string, jitter: boolean?)
 	want(head, reason, jitter == true)
 end
 
+-- 0.3.6 (plans/18): every ConfigService update re-reads the dev lists (TypeTorchAccess), even when the registry key
+-- itself can't be read: a `typetorch access push` applies at once.
+Registry.onUpdate(function()
+	Access.refresh()
+end)
 Registry.onChange(function(state)
 	Access.setConfig(state, Registry.known())
 	-- Public servers run the default branch. ConfigService may arrive after boot (P-K5) or change it. 0.3.4: a public
@@ -1875,6 +1880,12 @@ local function onDeployMessage(message)
 	local sigF = if typeof(data.sigF) == "string" and #data.sigF <= 100 then data.sigF else nil
 	-- `r`: 1 = rollback; "resign" (0.3) = the CLI re-signed the running head after `keys rotate` (same asset, new seq).
 	local r = if data.r == 1 or data.r == "resign" then data.r else nil
+	-- 0.3.6 (plans/18): a prod server records another branch's deploy only when it knows the branch (ConfigService, the
+	-- stored heads) or the message is signed, so forged messages can't grow the stored heads and the deployment list.
+	if data.b ~= myBranch and requiresSignatures(myBranch) and not Registry.knowsBranch(data.b) and not ((sig ~= nil or sigF ~= nil) and Signing.verifyDeploy(data, sig, sigF)) then
+		Registry.noteIgnoredBranch(data.b)
+		return
+	end
 	-- Deployment history: this deploy plus the head it replaces (so heads from before 0.2.0 stay listed).
 	local previous = Registry.branchHead(data.b)
 	local entries = {

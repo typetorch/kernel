@@ -27,6 +27,8 @@ local OPTIONAL_KEYS = {
 	TypeTorch = "no ConfigService registry (optional)",
 	TypeTorchFleet = "no ConfigService key TypeTorchFleet (optional: the fleet API is off)",
 	TypeTorchAnalytics = "no ConfigService key TypeTorchAnalytics (optional: analytics settings come later or from code)",
+	-- 0.3.6 (plans/18): the dev lists; without it they come from the registry (only the creator, in practice).
+	TypeTorchAccess = "no ConfigService key TypeTorchAccess (optional: run typetorch access push)",
 }
 local noted: { [string]: boolean } = {}
 

@@ -28,8 +28,8 @@ local Constants = require(game:GetService("ReplicatedStorage"):WaitForChild("Typ
 
 local Access = {}
 
-local ACCESS_KEY = "TypeTorchAccess"
-local ACCESS_REFRESH = 60
+local ACCESS_KEY = Constants.ACCESS_KEY or "TypeTorchAccess"
+local ACCESS_REFRESH = Constants.ACCESS_REFRESH_SECONDS or 60
 
 local config = { members = {}, revoked = {} }
 local known = false -- the registry (and so `revoked`) has been read at least once on this server
