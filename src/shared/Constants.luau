@@ -7,7 +7,7 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.3.6",
+	KERNEL_VERSION = "0.3.7",
 
 	-- Interim registry (until the backend exists): a DataStore written by the CLI through Open Cloud.
 	DATASTORE = "TypeTorch",
@@ -57,8 +57,15 @@ return {
 	-- 0.3.2 (audit P-F1): the health window. A generation whose onStart failed (reported by the framework), or whose
 	-- own scripts raised HEALTH_ERRORS errors, within HEALTH_WINDOW seconds of ready is rolled back to the last known
 	-- good artifact, which is then marked failed on this server.
+	-- 0.3.7: these are the defaults. A build carries its own (typetorch.json "health", stamped by `typetorch build` on
+	-- the payload root as HealthErrors, HealthWindow and HealthRollback); a value outside the bounds below falls back to
+	-- the default (Health.luau). The CLI checks the same bounds.
 	HEALTH_WINDOW = 30,
 	HEALTH_ERRORS = 3,
+	HEALTH_ERRORS_MIN = 1,
+	HEALTH_ERRORS_MAX = 100,
+	HEALTH_WINDOW_MIN = 5,
+	HEALTH_WINDOW_MAX = 300,
 	-- 0.3.2 (audit P-K3): at most this many last-known-good candidates are tried after one failure.
 	LKG_MAX_TRIES = 5,
 	-- 0.3.2: BindToClose gives the running generation's onClose handler at most this long (Roblox allows 30 s).

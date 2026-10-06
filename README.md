@@ -52,7 +52,11 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
 - Bad deploys are safe (0.3.2):
   - **Health window:** a failed `onStart` (the framework reports it with `api:reportError`) or 3 errors from the new
     generation's own scripts within 30 s of ready roll the server back. Errors from outside the generation never
-    count.
+    count. 0.3.7 (`src/server/Health.luau`): each build carries its own thresholds, typetorch.json `"health"` stamped
+    by `typetorch build` on the payload root as `HealthErrors` (1-100), `HealthWindow` (5-300 s) and `HealthRollback`
+    (false: count errors, never roll back; the server reports `degraded`). Missing or out-of-bounds values fall back to
+    3 / 30 s / on (listed in `status().health.invalid`); `status().health` reports `limit`, `window`, `rollback` and
+    `source`. A place project without the module boots with no health window and warns.
   - **Last known good:** this server's history, then the branch's deployments (prod: only verified ones, or heads
     this server already ran), skipping artifacts that failed here. Also at boot when the head fails to start.
   - **Fleet status and deploy reports:** `api:fleetStatus()` (this server's heartbeat), `api:onDeployReport(fn)` (one
@@ -131,7 +135,7 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
   `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, `--durable`, 0.3.6's `--hold`, `--hold-optout`,
   `--peers`, `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
-  `--kernel-crash`, `--heads-cap`, `--access`, and `--boot-budget`, which runs 25 boot scenarios with simulated slow or failing dependencies and
+  `--kernel-crash`, `--heads-cap`, `--access`, 0.3.7's `--health-config` and `--health-missing`, and `--boot-budget`, which runs 25 boot scenarios with simulated slow or failing dependencies and
   checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.

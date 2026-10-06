@@ -32,6 +32,10 @@
 -- when the head and the last known good run nothing, a build other servers run fine (peers), then the backup baked into
 -- the place, then background retries, then moving players to another server. See Fallback.luau and plans/01 "Never an
 -- empty server".
+--
+-- 0.3.7 (health thresholds per build; plans/17 blocker 5): the health window lives in Health.luau and takes its limit,
+-- window and rollback switch from the payload (typetorch.json "health", stamped by `typetorch build`); missing or
+-- out-of-bounds values fall back to Constants. status().health reports them.
 
 -- 0.3.2 (boot budget): every boot wait and cap counts from here.
 local kernelStartedAt = os.clock()
@@ -61,7 +65,6 @@ local MessagingService = game:GetService("MessagingService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
-local ScriptContext = game:GetService("ScriptContext")
 local ServerScriptService = game:GetService("ServerScriptService")
 local ServerStorage = game:GetService("ServerStorage")
 local Stats = game:GetService("Stats")
@@ -112,6 +115,43 @@ do
 				return { enabled = false, missing = true }
 			end,
 		}
+	end
+end
+
+-- 0.3.7: the health window lives in Health.luau (thresholds per build). A place project that lists the kernel's files
+-- one by one and doesn't map it yet (an older template studio.project.json) still boots, with no health window
+-- (errors aren't counted, nothing rolls back), and says so.
+local Health
+do
+	local module = script.Parent:FindFirstChild("Health")
+	if module then
+		Health = require(module)
+	else
+		warn("[TypeTorch] TypeTorchKernel.Health is missing (map src/server/Health.luau in the place project): no health window on this server")
+		local running = function()
+			return nil
+		end
+		Health = setmetatable({
+			configure = function(options)
+				running = options.current
+			end,
+			forPayload = function()
+				return { errors = 0 }
+			end,
+			state = function()
+				return if running() then "ok" else "failed"
+			end,
+			info = function()
+				return { state = if running() then "ok" else "failed", errors = 0, missing = true }
+			end,
+			reportError = function()
+				return false
+			end,
+		}, {
+			__index = function()
+				return function() end
+			end,
+		})
 	end
 end
 
@@ -238,7 +278,6 @@ local failedHere: { [number]: any } = {}
 local startingGeneration = nil -- 0.3.2: the generation being started (its scripts' errors count toward its health)
 local restoring = false -- 0.3.2: restoreLastKnownGood is running (a failed candidate doesn't start another one)
 local lastErrorText, lastErrorAt = nil, nil -- 0.3.2: the newest error worth a look (fleet status `e`)
-local lastHealthRollback = nil -- 0.3.2: { from, to?, why, at } of the last health-window rollback
 local closing = false -- 0.3.2: BindToClose ran: no more swaps
 -- 0.3.6: the generation a running swap has stopped while its replacement isn't ready yet (BindToClose runs its onClose
 -- handler when no generation runs then).
@@ -791,8 +830,8 @@ local function mount(payload: Instance, head, policy)
 		serverTree = serverTree,
 		clientTree = clientTree,
 		-- 0.3.2 (P-F1): errors from this generation's own scripts, a failed onStart (reported by the framework), and
-		-- when it was ready (os.clock); the health window is HEALTH_WINDOW seconds from readyAt.
-		health = { errors = 0, startFailed = nil, lastError = nil, lastErrorAt = nil, readyAt = nil, failed = nil },
+		-- when it was ready (os.clock); 0.3.7: the window's thresholds come from its payload (Health.luau).
+		health = Health.forPayload(payload, artifactId),
 		artifact = {
 			id = artifactId,
 			assetId = head.assetId,
@@ -1097,136 +1136,38 @@ local function failedBefore(head): string?
 end
 
 -- 0.3.2 (P-F1) health window ----------------------------------------------------------------------------------------
--- A generation is unhealthy when, from its mount until HEALTH_WINDOW seconds after ready, the framework reports a
--- failed onStart, or its own scripts (inside its server tree, or its Entry clone) raise HEALTH_ERRORS errors. It is
--- then rolled back to the last known good artifact and marked failed here. Errors from anything outside the
+-- Health.luau (0.3.7): a generation is unhealthy when, from its mount until its window (HealthWindow, default
+-- HEALTH_WINDOW s) after ready, the framework reports a failed onStart, or its own scripts raise its limit
+-- (HealthErrors, default HEALTH_ERRORS) of errors. It is then rolled back to the last known good artifact and marked
+-- failed here, unless its build turned the rollback off (HealthRollback = false). Errors from anything outside the
 -- generation (the kernel, place scripts, other generations, a generation being stopped) never count.
 
 local healthRollback -- (generation, why), defined with the last-known-good chain below
--- Assets restarted after a health rollback found nothing else to run: no second window (it would loop).
-local healthExempt: { [number]: boolean } = {}
-
--- Whether `scriptInstance` belongs to `generation` (its server tree, or its Entry clone and what it holds).
-local function owns(generation, scriptInstance): boolean
-	if not generation or generation.stopping then
-		return false
-	end
-	local ok, inside = pcall(function()
-		local entry = generation.entry
-		if entry and (scriptInstance == entry or scriptInstance:IsDescendantOf(entry)) then
-			return true
-		end
-		return scriptInstance:IsDescendantOf(generation.serverTree)
-	end)
-	return ok and inside == true
-end
-
-local function generationOf(scriptInstance)
-	if typeof(scriptInstance) ~= "Instance" then
-		return nil
-	end
-	if owns(current, scriptInstance) then
+Health.configure({
+	current = function()
 		return current
-	end
-	if owns(startingGeneration, scriptInstance) then
+	end,
+	starting = function()
 		return startingGeneration
-	end
-	return nil
-end
-
--- Rolls the running generation back when its health check failed inside the window (once per generation).
-local function checkHealth(generation)
-	local health = generation.health
-	if generation ~= current or health.failed or health.readyAt == nil or closing or healthExempt[generation.artifact.assetId] then
-		return
-	end
-	if localMode then
-		return -- a Studio local payload: errors are counted, the dev's own code is never swapped for an upload
-	end
-	if os.clock() > health.readyAt + Constants.HEALTH_WINDOW then
-		return -- after the window: counted (status, fleet status "degraded"), never rolled back
-	end
-	local why = nil
-	if health.startFailed then
-		why = `onStart failed: {health.startFailed}`
-	elseif health.errors >= Constants.HEALTH_ERRORS then
-		why = `{health.errors} errors within {Constants.HEALTH_WINDOW} s of ready, last: {health.lastError}`
-	end
-	if why then
-		health.failed = why
+	end,
+	closing = function()
+		return closing
+	end,
+	localMode = function()
+		return localMode
+	end,
+	failing = function()
+		return failing ~= nil
+	end,
+	rollback = function(generation, why)
 		spawnOnKernel(healthRollback, generation, why)
-	end
-end
-
--- 0.3.2: errors of the running generation in the last 60 s (os.clock), for the fleet API's error_spike alert.
-local recentErrors: { number } = {}
-
-local function noteError(generation, message: string, startFailed: boolean?)
-	local health = generation.health
-	local text = clip(message, 200)
-	health.lastError = text
-	health.lastErrorAt = os.time()
-	noteLastError(text)
-	local now = os.clock()
-	table.insert(recentErrors, now)
-	while #recentErrors > 0 and now - recentErrors[1] > 60 do
-		table.remove(recentErrors, 1)
-	end
-	if #recentErrors >= Constants.FLEET_ERROR_SPIKE then
-		fleetAlert("warning", "error_spike", `{#recentErrors} errors in 60 s from {generation.name}, last: {text}`, generation.head)
-	end
-	if startFailed then
-		health.startFailed = health.startFailed or text
-	else
-		health.errors += 1
-	end
-	checkHealth(generation)
-end
-
-ScriptContext.Error:Connect(function(message, _trace, scriptInstance)
-	local generation = generationOf(scriptInstance)
-	if generation then
-		noteError(generation, tostring(message))
-	end
-end)
-
--- Api: the framework reports a failed lifecycle hook ({kind = "onStart" | ..., module, message}). A failed onStart is
--- a health failure; anything else counts as one error. The kernel prints it as an error line from its own thread (so
--- it doesn't count twice). Returns whether it was taken.
-local reportsLogged = 0
-local function reportError(generation, info): boolean
-	if typeof(info) ~= "table" or generation.stopping or (generation ~= current and generation ~= startingGeneration) then
-		return false
-	end
-	local kind = if typeof(info.kind) == "string" then clip(info.kind, 40) else "error"
-	local module = if typeof(info.module) == "string" then clip(info.module, 80) else "?"
-	local message = clip(if info.message ~= nil then tostring(info.message) else "?", 2000)
-	if reportsLogged < 200 then
-		reportsLogged += 1
-		logError(`[TypeTorch] {module}.{kind} failed: {message}`)
-	end
-	noteError(generation, `{module}.{kind}: {message}`, kind == "onStart")
-	return true
-end
-
--- 0.3.2: "ok" | "failed" (nothing runs) | "unverified" (boot fail-safe) | "degraded" (a deploy failed here, or the
--- running generation failed or keeps erroring). The fleet status `h`.
-local function healthState(): string
-	if not current then
-		return "failed"
-	end
-	if current.unverified then
-		return "unverified"
-	end
-	if current.backup then
-		return "backup" -- 0.3.6: the backup baked into the place runs (nothing else could)
-	end
-	local health = current.health
-	if failing ~= nil or health.failed or health.startFailed or health.errors >= Constants.HEALTH_ERRORS then
-		return "degraded" -- (a failed onStart after the window too: that module isn't running)
-	end
-	return "ok"
-end
+	end,
+	alert = fleetAlert,
+	noteLastError = noteLastError,
+	logError = logError,
+	clip = clip,
+})
+Health.start()
 
 -- 0.3.2 (P-O1): this server's fleet status (api:fleetStatus()), the heartbeat the analytics engine sends and the
 -- framework's Manage > Servers roll call answers with. Contract (plans/01 "Fleet status and deploy reports"):
@@ -1238,7 +1179,7 @@ end
 -- server isn't healthy. Cheap: no yield, no web call.
 local function fleetStatus()
 	local kind = serverType()
-	local health = healthState()
+	local health = Health.state()
 	local recentError = lastErrorText ~= nil and (health ~= "ok" or (lastErrorAt ~= nil and os.time() - lastErrorAt <= 900))
 	-- 0.3.6: clients whose generation failed after their retry: re-sent the client code, moved to another server.
 	local resent, moved = Fallback.clientCounts()
@@ -1491,7 +1432,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		-- 0.3.2: a dev ran it on purpose and it started: no longer "failed here".
 		if EXPLICIT_REASONS[reason] and typeof(head.assetId) == "number" then
 			failedHere[head.assetId] = nil
-			healthExempt[head.assetId] = nil
+			Health.exempt(head.assetId, nil)
 		end
 		-- 0.3.2 (P-O1): the server's first generation is a boot report.
 		if report.kind == "boot" then
@@ -1499,7 +1440,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		end
 		-- 0.3.2 (P-F1): a failure reported before ready (a thrown onStart, early errors) is judged now.
 		if generation then
-			checkHealth(generation)
+			Health.check(generation)
 			-- 0.3.6: the hold ends (waiting players spawn); a backup is reported (status, fleet, alert backup_build).
 			Fallback.ready(generation)
 		end
@@ -2305,15 +2246,13 @@ healthRollback = function(generation, why: string)
 	local restored = restoreLastKnownGood(artifact.assetId, `{artifact.id}: {why}`)
 	if not restored and not current and not closing then
 		-- Every candidate failed after the unhealthy generation was stopped: a degraded game beats an empty server. It
-		-- runs without a health window (healthExempt), so this can't loop.
+		-- runs without a health window (Health.exempt), so this can't loop.
 		warn(`[TypeTorch] nothing else runs: restarting {artifact.id} (degraded)`)
-		if typeof(artifact.assetId) == "number" then
-			healthExempt[artifact.assetId] = true
-		end
+		Health.exempt(artifact.assetId, true)
 		swapTo(head, "auto-rollback")
 	end
 	local to = restored and (restored.artifactId or restored.generation)
-	lastHealthRollback = { from = artifact.id, to = to, why = clip(why, 300), at = os.time() }
+	Health.rolledBack({ from = artifact.id, to = to, why = clip(why, 300), at = os.time() })
 	if generation.deploy then
 		-- The deploy's outcome here: rolled back, or failed when nothing else could run (it keeps running, degraded).
 		if restored then
@@ -2808,24 +2747,6 @@ local function branchList()
 	return list
 end
 
--- 0.3.2: the health of the running generation, for status().health.
-local function healthInfo()
-	local info = { state = healthState(), errors = 0, lastRollback = if lastHealthRollback then table.clone(lastHealthRollback) else nil }
-	if current then
-		local health = current.health
-		info.errors = health.errors
-		info.lastError = health.lastError
-		info.lastErrorAt = health.lastErrorAt
-		info.startFailed = health.startFailed
-		info.failed = health.failed
-		if health.readyAt and not health.failed then
-			local left = health.readyAt + Constants.HEALTH_WINDOW - os.clock()
-			info.windowLeft = if left > 0 then math.ceil(left) else nil
-		end
-	end
-	return info
-end
-
 -- 0.3.2: failedHere as a list, newest first.
 local function failedList()
 	local list = {}
@@ -2902,9 +2823,11 @@ local function status()
 		-- 0.3.2: the kernel's own fleet API sender ({ enabled, settings, host, queued, sent, failed, dropped, alerts,
 		-- lastOkAt?, lastError?, lastStatus? }; never the token).
 		fleet = Fleet.info(),
-		-- 0.3.2 (P-F1): { state = "ok" | "failed" | "unverified" | "degraded", errors, lastError?, lastErrorAt?,
-		-- startFailed?, windowLeft? (seconds of the health window left), lastRollback? = { from, to?, why, at } }.
-		health = healthInfo(),
+		-- 0.3.2 (P-F1): { state = "ok" | "failed" | "unverified" | "degraded" | "backup", errors, lastError?,
+		-- lastErrorAt?, startFailed?, windowLeft? (seconds of the health window left), lastRollback? = { from, to?, why,
+		-- at } }; 0.3.7: the running build's thresholds limit, window, rollback, source ("payload" | "default"), invalid?
+		-- and kept? (Health.info).
+		health = Health.info(),
 		-- 0.3.2 (P-K3): artifacts that failed on this server (never run again automatically), newest first.
 		failed = failedList(),
 		-- 0.3.2 (P-O1): deploy reports given out ({ total, kept, listeners }; api:deployReports() has them).
@@ -3090,7 +3013,7 @@ Api.init({
 	KERNEL_BUILD = KERNEL_BUILD,
 	keys = keysInfo,
 	-- 0.3.2
-	reportError = reportError,
+	reportError = Health.reportError,
 	fleetStatus = fleetStatus,
 	addReportListener = addReportListener,
 	deployReports = function()
@@ -3288,7 +3211,7 @@ task.spawn(function()
 	while not closing do
 		task.wait(Constants.FLEET_WATCH_SECONDS)
 		if Fleet.enabled() then
-			local health = healthState()
+			local health = Health.state()
 			if health ~= lastHealth then
 				Fleet.heartbeat("health")
 				if health ~= "ok" and health ~= "backup" then -- (0.3.6: the backup has its own alert, backup_build)
@@ -3617,7 +3540,7 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 				return nil
 			end
 			local artifact, head = current.artifact, current.head
-			if typeof(artifact.assetId) ~= "number" or healthState() ~= "ok" or os.time() - current.startedAt < Constants.PEER_MIN_UPTIME then
+			if typeof(artifact.assetId) ~= "number" or Health.state() ~= "ok" or os.time() - current.startedAt < Constants.PEER_MIN_UPTIME then
 				return nil
 			end
 			return {

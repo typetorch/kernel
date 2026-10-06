@@ -11,7 +11,9 @@
 -- DataStore read budget holds), and 0.3.6's never-an-empty-server modes (`--hold`, `--hold-optout`, `--peers`,
 -- `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
 -- `--kernel-crash`; and the security audit follow-ups `--heads-cap`, `--access`; described at "0.3.6 NEVER AN EMPTY SERVER" below; `--client` covers the client's holding screen and
--- re-sent code). Every mode also checks that no swap ran on a thread its own stopped generation owned.
+-- re-sent code), and 0.3.7's `--health-config` (health thresholds per build: custom ones used, bad ones fall back to
+-- the defaults, HealthRollback = false keeps a failing build) and `--health-missing` (no Health module: boots, warns).
+-- Every mode also checks that no swap ran on a thread its own stopped generation owned.
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore, ConfigService unavailable), then drives it:
 -- signed / unsigned / dev-channel / replayed deploy messages, a payload holding a Script (S-L4), a payload that fails to
@@ -954,7 +956,7 @@ end
 
 local kernelFolder = newInstance("Folder", "TypeTorchKernel")
 kernelFolder.Parent = services.ServerScriptService
-for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
+for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
 	sourceInstance(if name == "Kernel" then "Script" else "ModuleScript", name, `src/server/{file}`).Parent = kernelFolder
 end
 local entryTemplate = sourceInstance("Script", "Entry", "src/server/Entry.server.luau")
@@ -1034,10 +1036,16 @@ local HEALTH_MODE = table.find(process.args, "--health") ~= nil
 local DURABLE_MODE = table.find(process.args, "--durable") ~= nil
 local HEALTH_PROD_MODE = table.find(process.args, "--health-prod") ~= nil
 local LKG_BOOT_MODE = table.find(process.args, "--lkg-boot") ~= nil
+-- `--health-config` (0.3.7): a reserved dev server whose builds carry their own health thresholds (HealthErrors,
+-- HealthWindow, HealthRollback on the payload root): custom ones are used, bad ones fall back to the defaults, and
+-- HealthRollback = false keeps a failing build running (degraded). `--health-missing`: a place project without the
+-- Health module still boots (no window) and says so.
+local HEALTH_CONFIG_MODE = table.find(process.args, "--health-config") ~= nil
+local HEALTH_MISSING_MODE = table.find(process.args, "--health-missing") ~= nil
 if FLEET_MODE then
 	configValues.TypeTorchFleet = { url = "https://fleet.example.test/api/", token = FLEET_TOKEN }
 end
-if DEV_MODE or VIP_MODE or HEALTH_MODE or FLEET_MODE or DURABLE_MODE then
+if DEV_MODE or VIP_MODE or HEALTH_MODE or FLEET_MODE or DURABLE_MODE or HEALTH_CONFIG_MODE then
 	GAME_ROOT_PROPS.PrivateServerId = "ps-smoke"
 	GAME_ROOT_PROPS.PrivateServerOwnerId = if VIP_MODE then 777 else 0
 	dataStore.data["private/ps-smoke"] = { branch = "dev", setBy = 1, setAt = "2026-10-04T00:00:00Z", code = if HEALTH_MODE or FLEET_MODE then "smoke-access-code" else nil }
@@ -1101,7 +1109,7 @@ return {
 }
 ]]
 
-local function payload(artifactId: string, channel: string?, extraScript: boolean?, protocolHash: string?)
+local function payload(artifactId: string, channel: string?, extraScript: boolean?, protocolHash: string?, attributes: { [string]: any }?)
 	return function()
 		local model = newInstance("Model", "TypeTorchPayload")
 		model:SetAttribute("ArtifactId", artifactId)
@@ -1109,6 +1117,9 @@ local function payload(artifactId: string, channel: string?, extraScript: boolea
 		model:SetAttribute("Commit", string.sub(artifactId, 1, 7))
 		model:SetAttribute("KernelApi", 1)
 		model:SetAttribute("ProtocolHash", protocolHash) -- 0.3.2 (P-N1)
+		for name, value in attributes or {} do
+			model:SetAttribute(name, value) -- 0.3.7: HealthErrors, HealthWindow, HealthRollback (as `typetorch build` stamps them)
+		end
 		for _, part in { "Server", "Shared", "Client", "include" } do
 			local folder = newInstance("Folder", part)
 			folder.Parent = model
@@ -1135,6 +1146,11 @@ addAsset(1006, payload("fffffff-666666", "prod"), 2)
 addAsset(1007, payload("ggggggg-777777", "prod"))
 addAsset(1008, payload("hhhhhhh-888888", "prod"))
 addAsset(1009, payload("iiiiiii-999999", "prod"))
+-- 0.3.7 health thresholds per build (--health-config; the HEALTH_WINDOW bounds are scaled there to 0.5-10 s): J allows 5
+-- errors within 3 s; K's values are all bad (out of bounds, the wrong type: the defaults apply); L turns the rollback off.
+addAsset(1010, payload("jjjjjjj-aaaaaa", "prod", false, nil, { HealthErrors = 5, HealthWindow = 3 }))
+addAsset(1011, payload("kkkkkkk-bbbbbb", "prod", false, nil, { HealthErrors = 500, HealthWindow = "3", HealthRollback = "no" }))
+addAsset(1012, payload("lllllll-cccccc", "prod", false, nil, { HealthRollback = false }))
 
 -- 0.3.1: ServerStorage.TypeTorchDev.Payload, as studio.project.json syncs it (no ArtifactId or Channel attribute). Only
 -- `--studio-local` runs in Studio; in every other mode the kernel must ignore it.
@@ -1461,6 +1477,10 @@ end
 SMOKE.behave["iiiiiii-999999"] = function()
 	return "fail"
 end
+-- 0.3.7: L (HealthRollback = false) reports a failed onStart at boot too: it must keep running.
+SMOKE.behave["lllllll-cccccc"] = function(kernel)
+	kernel:reportError({ kind = "onStart", module = "NoisyService", message = "attempt to index nil with 'gui'" })
+end
 
 -- 0.3.2 boot budget scenarios ------------------------------------------------------------------------------------------
 -- Each: `setup` (fixtures and latencies), `first` = the artifact expected first, `final` = the artifact expected once
@@ -1657,9 +1677,17 @@ if HOLD_MODE or HOLD_OPTOUT_MODE or PEERS_MODE or PEERS_UNTRUSTED_MODE or BACKUP
 		Constants.READY_TIMEOUT = 1.5
 	end
 end
-if HEALTH_MODE or HEALTH_PROD_MODE or LKG_BOOT_MODE or FLEET_MODE then
+if HEALTH_MODE or HEALTH_PROD_MODE or LKG_BOOT_MODE or FLEET_MODE or HEALTH_CONFIG_MODE then
 	Constants.HEALTH_WINDOW = 1.5
 	Constants.POLL_SECONDS = 0.3
+end
+if HEALTH_CONFIG_MODE then
+	-- The real bounds (5-300 s) scaled like the default window (30 s -> 1.5 s): a build's HealthWindow may be 0.5-10 s.
+	Constants.HEALTH_WINDOW_MIN = 0.5
+	Constants.HEALTH_WINDOW_MAX = 10
+end
+if HEALTH_MISSING_MODE then
+	kernelFolder.Health.Parent = nil -- an older place project that lists the kernel's files one by one
 end
 if BLIND_MODE then
 	Constants.POLL_SECONDS = 0.3 -- the forged newer head must meet several polls
@@ -1790,7 +1818,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -2766,6 +2794,98 @@ if LKG_BOOT_MODE then
 	finish()
 end
 
+if HEALTH_CONFIG_MODE then
+	-- 0.3.7 (plans/17 blocker 5): the health window's thresholds come from each build (payload root attributes).
+	local function devDeploy(assetId: number, artifactId: string, seq: number)
+		publish("TypeTorch/deploy", { b = "dev", a = assetId, i = artifactId, s = seq, c = string.sub(artifactId, 1, 7), ch = "dev", t = nowMs() })
+	end
+	local function fire(count: number, label: string)
+		local entry = currentEntry()
+		for index = 1, count do
+			fireScriptError(`{label} {index}`, "", entry)
+		end
+	end
+	check("health-config: boots the dev head", waitFor("boot", function()
+		return running() == "ddddddd-444444"
+	end))
+	local h = status().health
+	check("health-config: a build without the attributes uses the defaults (3 errors, the default window, rollback on)", h.limit == 3 and h.window == Constants.HEALTH_WINDOW and h.rollback == true and h.source == "default" and h.invalid == nil)
+	devDeploy(1002, "bbbbbbb-222222", 20)
+	check("health-config: deploy B (the last known good below)", waitFor("B", function()
+		return running() == "bbbbbbb-222222" and reported(20, "swapped")
+	end))
+
+	-- J: 5 errors within 3 s. Errors past the DEFAULT window (1.5 s) still count, and 4 don't roll it back.
+	devDeploy(1010, "jjjjjjj-aaaaaa", 21)
+	check("health-config: J runs with its own thresholds (5 errors, 3 s, from the payload)", waitFor("J", function()
+		return running() == "jjjjjjj-aaaaaa"
+	end) and (function()
+		local health = status().health
+		return health.limit == 5 and health.window == 3 and health.rollback == true and health.source == "payload" and health.invalid == nil and (health.windowLeft or 0) >= 2
+	end)())
+	task.wait(Constants.HEALTH_WINDOW + 0.3) -- past the default window, inside J's own
+	fire(4, "J noise")
+	task.wait(0.3)
+	h = status().health
+	check("health-config: 4 errors after the default window: counted, below J's limit, no rollback", running() == "jjjjjjj-aaaaaa" and h.errors == 4 and h.state == "ok" and h.windowLeft ~= nil)
+	fire(1, "J fifth")
+	check("health-config: the 5th error inside J's window rolls it back to B", waitFor("J rollback", function()
+		return rolledBackFrom("jjjjjjj-aaaaaa", "bbbbbbb-222222") and reported(21, "rolled_back")
+	end, 4) and string.find(reportOf(21).e or "", "5 errors within 3 s", 1, true) ~= nil)
+
+	-- K: every value is bad (out of bounds or the wrong type): the defaults apply, listed in status and warned.
+	devDeploy(1011, "kkkkkkk-bbbbbb", 22)
+	check("health-config: K's bad values fall back to the defaults, listed in status().health.invalid", waitFor("K", function()
+		return running() == "kkkkkkk-bbbbbb"
+	end) and (function()
+		local health = status().health
+		return health.limit == 3 and health.window == Constants.HEALTH_WINDOW and health.rollback == true and health.source == "default" and health.invalid ~= nil and #health.invalid == 3
+	end)() and said("health settings out of bounds, defaults used for: HealthErrors 500"))
+	fire(3, "K boom")
+	check("health-config: 3 errors (the default limit) roll K back", waitFor("K rollback", function()
+		return rolledBackFrom("kkkkkkk-bbbbbb", "bbbbbbb-222222") and reported(22, "rolled_back")
+	end, 4))
+
+	-- L: HealthRollback = false. A failed onStart and 3 errors in the window: it keeps running, degraded, warned once.
+	devDeploy(1012, "lllllll-cccccc", 23)
+	check("health-config: L (rollback off) keeps running after a failed onStart", waitFor("L", function()
+		return running() == "lllllll-cccccc" and reported(23, "swapped")
+	end) and (function()
+		local health = status().health
+		return health.rollback == false and health.source == "payload" and health.startFailed ~= nil and health.kept ~= nil and health.state == "degraded"
+	end)())
+	fire(3, "L boom")
+	task.wait(0.5)
+	h = status().health
+	check("health-config: L's errors past the limit don't roll it back either (degraded, no rolled_back report)", running() == "lllllll-cccccc" and h.errors == 3 and h.state == "degraded" and fleet().h == "degraded" and not reported(23, "rolled_back") and h.lastRollback.from == "kkkkkkk-bbbbbb")
+	check("health-config: the kernel warned once that L's build turns the rollback off", said("turns the health rollback off"))
+
+	-- A build without the attributes is back on the defaults.
+	devDeploy(1004, "ddddddd-444444", 24)
+	check("health-config: the next build uses the defaults again", waitFor("D", function()
+		local health = status().health
+		return running() == "ddddddd-444444" and health.limit == 3 and health.rollback == true and health.source == "default" and health.state == "ok"
+	end))
+	finish()
+end
+
+if HEALTH_MISSING_MODE then
+	-- A place project without TypeTorchKernel.Health (an older template studio.project.json): it boots, says so, and
+	-- counts nothing (no window, no rollback).
+	check("health-missing: boots without the Health module and says so", waitFor("boot", function()
+		return running() ~= nil
+	end) and said("TypeTorchKernel.Health is missing"))
+	local first = running()
+	local entry = currentEntry()
+	for index = 1, 5 do
+		fireScriptError(`missing {index}`, "", entry)
+	end
+	task.wait(0.5)
+	local h = status().health
+	check("health-missing: status().health says missing; errors never roll back", h.missing == true and h.state == "ok" and fleet().h == "ok" and running() == first and SMOKE.kernel:reportError({ kind = "onStart", module = "X", message = "y" }) == false)
+	finish()
+end
+
 -- 0.3.6 NEVER AN EMPTY SERVER: the modes ------------------------------------------------------------------------------
 local function alertsOf(code: string): { any }
 	local list = {}
@@ -3227,7 +3347,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.6")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.7")
 
 -- 0.3.5: the engine's warning for a ConfigService key nobody published becomes ONE info line per TypeTorch key in the
 -- kernel's log ring (the registry is optional and, with API keys, never written); the game's own keys stay warnings.
