@@ -1,0 +1,23 @@
+{
+	"name": "TypeTorchLoader",
+	"tree": {
+		"$className": "DataModel",
+		"ServerScriptService": {
+			"$className": "ServerScriptService",
+			"TypeTorchLoader": {
+				"$path": "src/loader/Loader.server.luau",
+				"$attributes": {
+					"KeyAssetId": "",
+					"FallbackPublicKey": "",
+					"BootstrapHeads": "",
+					"MinKernelVersion": ""
+				},
+				"Core": { "$path": "src/loader/LoaderCore.luau" }
+			}
+		},
+		"ReplicatedFirst": {
+			"$className": "ReplicatedFirst",
+			"TypeTorchLoaderClient": { "$path": "src/loader/LoaderClient.client.luau" }
+		}
+	}
+}

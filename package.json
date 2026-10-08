@@ -14,9 +14,10 @@
 	"publishConfig": {
 		"access": "public"
 	},
-	"files": ["src", "scripts/check.luau", "place.project.json", "rokit.toml", "README.md", "LICENSE"],
+	"files": ["src", "scripts/check.luau", "place.project.json", "loader.project.json", "rokit.toml", "README.md", "LICENSE"],
 	"scripts": {
 		"check": "lune run scripts/check.luau",
+		"test:loader": "lune run scripts/test-loader.luau",
 		"prepublishOnly": "lune run scripts/check.luau"
 	},
 	"typetorch": {
