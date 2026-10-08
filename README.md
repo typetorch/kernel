@@ -7,7 +7,7 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   swaps with soft + hard stop, automatic rollback, registry (in-game DataStore heads + the signed settings), dev access,
   stable transport, logs, the fleet API sender (`Fleet`), the fallbacks (`Fallback`), `/tt` chat commands. A place
   project that maps these files one by one must map `Fleet` (0.3.2), `Fallback` (0.3.6), `Health` (0.3.7) and
-  `Messaging` (0.3.8) too; without them the kernel boots without that part and says so.
+  `Messaging` (0.3.8), `Budget` and `Errors` (0.4.0) too; without them the kernel boots without that part and says so.
 - `src/shared/` → `ReplicatedStorage.TypeTorchKernelShared`: constants, client API, ClientEntry template.
 - `src/client/` → `ReplicatedFirst.TypeTorchKernelClient`: follows `ActiveGeneration`, swaps client generations.
 - `place.project.json`: the whole place (kernel + baseplate + spawn, HTTP on). `rojo build place.project.json -o
@@ -198,7 +198,37 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   past `DETACHED_SLOW` (60 s) is logged once; errors go to the log with the generation's name and never count toward
   its health window; `status().detached` = `{ running, started, finished, failed, slow, max, oldest?, lastError? }`. A
   job keeps the old generation's closures (and what they reference) alive until it ends.
-- Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules),
+- One backend (0.4.0, plans/21 part C): the signed settings' `backend` = { url, key, analytics? } is ONE URL and ONE key:
+  heartbeats, reports, alerts and the closing notice to `<url>/v1/fleet/*`, error reports to `<url>/v1/errors` (and the
+  framework's analytics to `<url>/v1/ingest`). The old `fleet` = { url, token } is read only while `backend` is missing
+  (`status().fleet.source`); hints name `typetorch backend setup`.
+- Error reports (0.4.0, problem 19; `src/server/Errors.luau`): server errors (ScriptContext.Error and LogService error
+  lines, from every generation and the kernel; a script error and its log line count once) and client errors (the
+  kernel client forwards its own on `__tt/errors`: at most 10 distinct messages per 10 s, the server takes one batch per
+  5 s per player) are templated on the server (every current player's, and for 2 minutes every leaving player's, Name,
+  DisplayName and UserId as whole words become `<player.name>`, `<player.display_name>`, `<player.user_id>`;
+  `Generations.<artifact>#<n>` becomes `<gen>`), fingerprinted (FNV-1a + djb2 of the template and the top stack line, 16
+  hex), counted per minute per kind, realm, branch and build with the pids of the players affected (the framework's
+  analytics engine tells the kernel each pid: `api:setAnalyticsId(player, pid)`; at most 10 per item), and posted in
+  batches (<= 200 items, <= 400 KB JSON, gzip, at most 6 requests a minute, every 15 s while items wait). Bounded:
+  200 kinds, 600 waiting items, 500 errors looked at a second; drops counted. Backoff like Fleet's 0.3.9 (jittered
+  retries, 30 s doubling to 300 s, 401/403/404 hold ~5 min, 429 waits its Retry-After, 413 halves the batch, 400 drops
+  it). Studio counts without posting. `status().errors` = { enabled, host, kinds, waiting, seen, sent, requests, failed,
+  rejected, dropped, failures, retryIn, lastOkAt, lastError, top (templates only) }.
+- Budget view (0.4.0, problem 25; `src/server/Budget.luau`): every DataStore (read, write, list, remove; UpdateAsync is
+  both), MemoryStore (units: UpdateAsync 2), HTTP (per label: fleet, errors, ingest, claude) and MessagingService
+  (publish, subscribe) request TypeTorch makes, per minute (a sliding 60 s estimate) and per caller (`kernel`: counting
+  proxies of the Registry's stores and explicit counts elsewhere; `devtools`, `analytics`, `framework` and `game` through
+  `api:budgetCount(caller, kind, op, n?)`; TypeTorch.messaging publishes count as `game`), next to Roblox's documented
+  limits for the player count (sources in Budget.luau: DataStore 60 + 40 x players per category, list 5 + 2 x players;
+  MemoryStore 120 x players of the experience's 1000 + 120 x CCU units; HTTP 500; MessagingService 600 + 240 x players
+  publishes, 240 subscribes), the DataStore budget left (`GetRequestBudgetForRequestType`, shared with the game) and
+  memory (total, per developer tag, the Lua heap; the mounted generations and their modules). `api:budget()` is the
+  full view (the dev menu's Server > Budget); `status().budget` and every fleet heartbeat (`bu`) carry a compact
+  summary the backend stores per server.
+- Tests (Lune): `lune run scripts/test-errors.luau` (0.4.0: templating, fingerprints, per-minute counts, limits, batches,
+  the sender, client batches, the dedup), `lune run scripts/test-budget.luau` (0.4.0: proxies, limits, the sliding
+  minute, callers, the summary), `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules),
   `lune run scripts/test-access.luau`, `lune run scripts/test-fleet.luau` (0.3.9: the fleet sender's backoff, hold and
   log lines on a fake clock) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
@@ -207,7 +237,8 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   `--peers`, `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
   `--kernel-crash`, `--heads-cap`, `--access`, 0.3.7's `--health-config` and `--health-missing`, 0.3.8's
   `--messaging`, `--messaging-studio`, `--messaging-missing`, `--client-boot`, `--client-own`, `--settings`,
-  `--settings-missing` and `--detached`, 0.3.9's `--rollback-prev`, and `--boot-budget`, which runs 25 boot scenarios
+  `--settings-missing` and `--detached`, 0.3.9's `--rollback-prev`, 0.4.0's `--errors` (settings.backend, heartbeats with `bu`, a server error and a client
+  batch posted templated with the pid, the budget view), and `--boot-budget`, which runs 25 boot scenarios
   with simulated slow or failing dependencies and
   checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
