@@ -159,6 +159,9 @@ return {
 	-- client shows its holding screen. A Players attribute HOLD_ATTRIBUTE = false opts a game out of the character part
 	-- (games that spawn characters themselves); default on.
 	HOLD_ATTRIBUTE = "TypeTorchHoldCharacters",
+	-- 0.4.0 (plans/22): the loader held before the kernel existed (it turned CharacterAutoLoads off); the kernel's hold
+	-- takes it over and clears the attribute.
+	LOADER_HELD_ATTRIBUTE = "TypeTorchLoaderHeld",
 	-- server -> client, tagged "*": "move" (this player is being moved to another server) or "load" (client code re-sent).
 	CHANNEL_HOLD = "__tt/hold",
 	-- The backup payload `typetorch kernel deploy` bakes into the place (the prod head's payload, modules only):

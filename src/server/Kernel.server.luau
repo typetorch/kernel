@@ -50,8 +50,15 @@
 -- <url>/v1/errors) and THE BUDGET VIEW (Budget.luau: every DataStore, MemoryStore, HTTP and MessagingService request
 -- TypeTorch makes, per minute and per caller, next to Roblox's limits; a summary rides on heartbeats as `bu`).
 
--- 0.3.2 (boot budget): every boot wait and cap counts from here.
+-- 0.3.2 (boot budget): every boot wait and cap counts from here. 0.4.0 (plans/22): when the loader installed this kernel,
+-- from the loader's start (its BootStartedAt attribute on this folder), so the 15 s budget covers the loader too.
 local kernelStartedAt = os.clock()
+do
+	local loaderStart = script.Parent:GetAttribute("BootStartedAt")
+	if typeof(loaderStart) == "number" and loaderStart <= kernelStartedAt and kernelStartedAt - loaderStart < 60 then
+		kernelStartedAt = loaderStart
+	end
+end
 
 -- 0.3.9: the log ring (the dev menu's Logs, Logs > Upload) starts first, so the hold's own line ("[TypeTorch] hold
 -- start: ...") is in it. Logs.luau only connects LogService.MessageOut: nothing yields.
@@ -1332,6 +1339,10 @@ local function fleetStatus()
 		g = if current then current.number else 0,
 		h = health,
 		e = if recentError then lastErrorText else nil,
+		-- 0.4.0 (plans/22): how this kernel got here ("asset" | "baked" | nil: baked into the place directly) and, for the
+		-- baked fallback, why the loader didn't use the asset ("kernel asset <id> version <v>: moderated or unavailable ...").
+		ks = kernelFolder:GetAttribute("KernelSource"),
+		ke = kernelFolder:GetAttribute("KernelLoadError"),
 		sv = 2,
 	}
 end
@@ -3082,6 +3093,18 @@ local function status()
 		maxPlayers = Players.MaxPlayers,
 		kernelVersion = Constants.KERNEL_VERSION,
 		kernelApi = Constants.KERNEL_API,
+		-- 0.4.0 (plans/22): { source = "asset" | "baked", asset?, versionId?, channel?, error?, class? } when the loader
+		-- installed this kernel; nil for a kernel baked into the place directly.
+		loader = if kernelFolder:GetAttribute("KernelSource") ~= nil
+			then {
+				source = kernelFolder:GetAttribute("KernelSource"),
+				asset = kernelFolder:GetAttribute("KernelAssetId"),
+				versionId = kernelFolder:GetAttribute("KernelAssetVersionId"),
+				channel = kernelFolder:GetAttribute("KernelChannel"),
+				error = kernelFolder:GetAttribute("KernelLoadError"),
+				class = kernelFolder:GetAttribute("KernelLoadClass"),
+			}
+			else nil,
 		-- 0.3.8: the last failed settings read (nil once a read works again).
 		registryError = if Registry.configSettled() and not Registry.connected() then Registry.readError() else nil,
 		-- 0.3.8 (plans/20): the signed settings record: { state, seq?, at?, age?, verifiedBy?, fields, reads, error?,
@@ -3547,6 +3570,13 @@ end
 -- 0.3.2: the kernel's own fleet API sender (off without TypeTorchFleet) and its watch: a health change sends a heartbeat,
 -- and failed / unverified / degraded (or no trusted head on a signed-only server) an alert.
 Fleet.start()
+-- 0.4.0 (plans/22): the loader ran the baked fallback kernel because the kernel asset couldn't be used. Said once per
+-- server; the fleet API groups them. "unavailable" (moderated, archived, deleted) is critical: kernel updates can't
+-- reach new servers until `typetorch kernel deploy --reupload` (or a rollback to a version that loads).
+if kernelFolder:GetAttribute("KernelSource") == "baked" and typeof(kernelFolder:GetAttribute("KernelLoadError")) == "string" then
+	local class = kernelFolder:GetAttribute("KernelLoadClass")
+	fleetAlert(if class == "unavailable" then "critical" else "warning", "kernel_asset_unavailable", `{kernelFolder:GetAttribute("KernelLoadError")} (the baked fallback kernel {Constants.KERNEL_VERSION} runs)`, nil, true)
+end
 task.spawn(function()
 	local lastHealth = "ok" -- a server that boots unhealthy alerts too
 	local lastNoTrusted = false
