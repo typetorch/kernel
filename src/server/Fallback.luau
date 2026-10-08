@@ -29,6 +29,15 @@
 --      boot_failed_teleport (critical).
 -- CLIENTS: a client whose generation failed after its own retry gets the client tree re-sent once (a fresh copy in its
 -- PlayerGui, CHANNEL_RESEND); if that fails too, the player moves to a server where the build runs (or rejoins).
+--
+-- 0.3.9 ("Starting..." stayed up on a server whose game ran fine): ReplicatedFirst is replicated ONCE, when a player
+-- joins; later server changes there never reach that client. The kernel client read the hold from its own script first,
+-- so a player who joined while the boot held kept seeing "Starting..." after the release. The live hold is
+-- ReplicatedStorage.TypeTorch's `Hold` + `HoldReason` (set before that folder replicates; the client follows it once it
+-- has it); the script's copy is only the join snapshot. Every hold change prints one line with its reason
+-- ("[TypeTorch] hold start: ...", "[TypeTorch] hold released: generation X running"), which lands in the kernel's log
+-- ring (the dev menu's Logs, Logs > Upload). The watchdog releases a "start" hold it still finds on while a generation
+-- runs (HOLD_STUCK_RELEASE s; warned), and the deadman's moves stop once the kernel's own watchdog runs.
 
 local HttpService = game:GetService("HttpService")
 local MessagingService = game:GetService("MessagingService")
@@ -152,41 +161,57 @@ local hold = {
 	releasedAt = nil,
 	spawned = 0, -- LoadCharacter calls on release
 	holds = 0,
+	reason = nil, -- 0.3.9: why the hold is on (the `HoldReason` attribute, the log line, status().fallback.hold)
+	lastReleased = nil, -- 0.3.9: why the last hold ended
+	stuckSince = nil, -- 0.3.9: os.clock() the watchdog first saw a "start" hold while a generation runs
+	stuckReleases = 0, -- 0.3.9: holds the watchdog had to release (a bookkeeping bug each time)
 }
 
 local clientScript = nil -- ReplicatedFirst.TypeTorchKernelClient
 
--- The `Hold` attribute ("start" | "move" | nil) on the kernel client script (it replicates before the rest of the game,
--- so a joining client knows at once) and on ReplicatedStorage.TypeTorch. `current`: re-apply the hold's own mode.
+-- The `Hold` attribute ("start" | "move" | nil) and (0.3.9) `HoldReason` on ReplicatedStorage.TypeTorch (the LIVE
+-- value clients follow) and on the kernel client script in ReplicatedFirst (the snapshot a joining client gets before
+-- anything else: ReplicatedFirst is replicated once, at join, so a later change there never reaches that client).
+-- `current`: re-apply the hold's own mode.
 setClientHold = function(mode: string?, current: boolean?)
 	if current then
 		mode = if hold.active then hold.mode else nil
 	end
+	local reason = if mode then hold.reason else nil
 	if clientScript == nil or clientScript.Parent == nil then
 		local ok, first = pcall(game.GetService, game, "ReplicatedFirst")
 		clientScript = if ok and first then first:FindFirstChild("TypeTorchKernelClient") else nil
 	end
 	if clientScript then
 		pcall(clientScript.SetAttribute, clientScript, "Hold", mode)
+		pcall(clientScript.SetAttribute, clientScript, "HoldReason", reason)
 	end
 	local root = deps.replicatedRoot
 	if root then
 		pcall(root.SetAttribute, root, "Hold", mode)
+		pcall(root.SetAttribute, root, "HoldReason", reason)
 	end
 end
 
-local function engage(mode: string)
+-- 0.3.9: one line per hold change, with its reason ("[TypeTorch] hold start: boot: no generation runs yet").
+local function engage(mode: string, reason: string)
+	local before = if hold.active then `{hold.mode}|{hold.reason}` else nil
 	if not hold.active then
 		hold.active = true
 		hold.startedAt = os.clock()
 		hold.holds += 1
 	end
 	hold.mode = mode
+	hold.reason = reason
+	hold.stuckSince = nil
 	if not hold.optOut and Players.CharacterAutoLoads == true then
 		Players.CharacterAutoLoads = false
 		hold.controls = true
 	end
 	setClientHold(mode)
+	if before ~= `{mode}|{reason}` then
+		deps.print(`[TypeTorch] hold {mode}: {reason}`)
+	end
 end
 
 local deadman -- () -> (), below: the kernel errored before its boot finished
@@ -230,7 +255,7 @@ end
 function Fallback.hold(startedAt: number?)
 	local ok, value = pcall(Players.GetAttribute, Players, Constants.HOLD_ATTRIBUTE)
 	hold.optOut = ok and value == false
-	engage("start")
+	engage("start", "boot: no generation runs yet")
 	pcall(stampScreens) -- (engage found the client script)
 	hold.startedAt = startedAt or hold.startedAt
 	hold.heldMs = math.floor((os.clock() - (startedAt or os.clock())) * 1000 + 0.5)
@@ -249,8 +274,12 @@ local function release(why: string)
 	end
 	hold.active = false
 	hold.mode = nil
+	hold.reason = nil
+	hold.stuckSince = nil
 	hold.releasedAt = os.clock()
+	hold.lastReleased = why
 	setClientHold(nil)
+	deps.print(`[TypeTorch] hold released: {why}`) -- 0.3.9
 	if not hold.controls then
 		return
 	end
@@ -741,8 +770,8 @@ local function enterMove(why: string)
 	move.active = true
 	move.since = os.clock()
 	move.why = why
-	engage("move") -- new joiners are held too; everyone sees "Reconnecting..."
 	local text = `nothing runs on this server (head, last known good, peers and backup failed): moving players to another server of {deps.branch() or "?"}`
+	engage("move", text) -- new joiners are held too; everyone sees "Reconnecting..."
 	deps.warn(`[TypeTorch] {text}`)
 	deps.alert("critical", "boot_failed_teleport", text)
 	deps.logEvent({ action = "boot_failed_teleport", branch = deps.branch(), players = #Players:GetPlayers() })
@@ -866,7 +895,7 @@ function Fallback.ready(generation)
 	if move.active then
 		leaveMove()
 	end
-	release(if generation.backup then "backup" else "ready")
+	release(`generation {generation.name} running{if generation.backup then " (the backup build)" else ""}`)
 	if generation.backup then
 		backup.runs += 1
 		backup.since = os.time()
@@ -888,7 +917,7 @@ end
 -- Players keep the characters they have.
 function Fallback.lost(why: string)
 	deps.warn(`[TypeTorch] nothing runs after a failed swap ({why}): holding players while the last known good, peers and the backup are tried`)
-	engage("start")
+	engage("start", `a failed swap: {why}`)
 end
 
 -- A swap failed (not queued). Boot LOAD failures are remembered (peers skip a build that just failed to load here); the
@@ -988,13 +1017,23 @@ function Fallback.start()
 		local idleSince = nil
 		while not deps.closing() do
 			local now = os.clock()
-			if deps.current() then
+			local running = deps.current()
+			if running then
 				lastRunningAt = now
 				idleSince = nil
 				chain.done = false -- the next time nothing runs is a new episode (mid-swap failure): the chain runs again
 				if move.active then
 					leaveMove()
-					release("recovered")
+					release(`generation {running.name} running (recovered)`)
+				elseif hold.active and hold.mode == "start" then
+					-- 0.3.9: a generation runs and the "start" hold is still on. swapTo releases it the moment a generation is
+					-- ready, so this is a bookkeeping bug: players must never stay behind the holding screen because of it.
+					hold.stuckSince = hold.stuckSince or now
+					if now - hold.stuckSince >= (Constants.HOLD_STUCK_RELEASE or 3) then
+						hold.stuckReleases += 1
+						deps.warn(`[TypeTorch] the hold was still "start" ({hold.reason or "?"}) {Constants.HOLD_STUCK_RELEASE or 3} s after {running.name} started running: released by the watchdog (a kernel bookkeeping bug; please report this line)`)
+						release(`generation {running.name} running (released by the watchdog)`)
+					end
 				end
 			else
 				local sinceStart = now - deps.startedAt
@@ -1014,7 +1053,7 @@ function Fallback.start()
 						if not studioWarned then
 							studioWarned = true
 							deps.warn("[TypeTorch] Studio: nothing runs after the boot budget; releasing the hold so you can look around (live servers move players to another server)")
-							release("studio")
+							release("Studio: nothing runs after the boot budget (live servers move players instead)")
 						end
 					else
 						enterMove(if lastRunningAt == nil then "boot" else "crash")
@@ -1046,21 +1085,25 @@ deadman = function()
 	end
 	deps.warn(`[TypeTorch] the kernel didn't finish its boot (see the error above): {if isStudio() then "releasing the held players (Studio)" else "moving players to another server"}`)
 	if isStudio() then
-		release("kernel error")
+		release("the kernel didn't finish its boot (Studio: released)")
 		return
 	end
 	move.active = true
 	move.since = os.clock()
 	move.why = "kernel"
-	engage("move")
+	engage("move", "the kernel didn't finish its boot: moving players to another server")
+	-- 0.3.9: only until the kernel's own watchdog runs (Fallback.start: a boot that was merely slow). From then on it
+	-- handles the move (it leaves it once a generation runs), so players are never moved off a server that works.
 	Players.PlayerAdded:Connect(function(player)
-		task.spawn(movePlayers, { player }, "kernel")
+		if not started then
+			task.spawn(movePlayers, { player }, "kernel")
+		end
 	end)
 	Players.PlayerRemoving:Connect(function(player)
 		moving[player] = nil
 	end)
 	task.spawn(function()
-		while true do
+		while not started do
 			movePlayers(Players:GetPlayers(), "kernel")
 			task.wait(1)
 		end
@@ -1131,6 +1174,9 @@ function Fallback.status()
 		hold = {
 			active = hold.active,
 			mode = hold.mode,
+			reason = hold.reason, -- 0.3.9
+			lastReleased = hold.lastReleased,
+			stuckReleases = if hold.stuckReleases > 0 then hold.stuckReleases else nil,
 			optOut = hold.optOut or nil,
 			characters = hold.controls or nil,
 			heldMs = hold.heldMs,

@@ -19,7 +19,10 @@
 -- game's loading screen and the ClientReady signal; `--client` and `--hold` check the new attributes too), and
 -- `--settings` / `--settings-missing` (plans/20: the signed settings record replacing ConfigService; `--fleet`,
 -- `--switch`, `--access` and `--fallback` read their settings from it too), and `--detached` (api:runDetached: a job
--- outlives its generation's hard stop; errors, the cap and the slow-job warning).
+-- outlives its generation's hard stop; errors, the cap and the slow-job warning), and 0.3.9's `--rollback-prev`
+-- (/tt rollback on a server with no earlier generation: the branch's previous heads, only verified ones on a signed
+-- server; the kernel's durable writes keep `prev`); `--hold`, `--client` and `--switch` check the 0.3.9 hold fixes and
+-- the channel / rules split too.
 -- Every mode also checks that no swap ran on a thread its own stopped generation owned.
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore; 0.3.8: no ConfigService at all), then drives it:
@@ -453,6 +456,9 @@ local function hook(kind: string)
 		if VERBOSE then
 			print(`  [{kind}] {line}`)
 		end
+		if SMOKE.logOut then
+			SMOKE.logOut(line, kind) -- 0.3.9: LogService.MessageOut, so the kernel's log rings fill as on Roblox
+		end
 	end
 end
 
@@ -724,7 +730,7 @@ local services = {
 	ServerStorage = newInstance("ServerStorage"),
 	TextChatService = newInstance("TextChatService"),
 	ReplicatedFirst = newInstance("ReplicatedFirst"),
-	LogService = { MessageOut = signal() },
+	LogService = { MessageOut = signal(true) },
 	RunService = {
 		IsStudio = function()
 			return table.find(process.args, "--studio-local") ~= nil or table.find(process.args, "--messaging-studio") ~= nil
@@ -1057,6 +1063,10 @@ local MODES38 = {
 	-- `--detached` (api:runDetached): a job outlives its generation's hard stop and finishes; its callback is dropped
 	-- for a stopped generation; errors are logged with the generation and counted; the cap and the slow-job warning.
 	detached = table.find(process.args, "--detached") ~= nil,
+	-- 0.3.9 `--rollback-prev`: a public prod server that booted straight into the branch head B (#11): /tt rollback
+	-- finds no earlier generation here and uses the branch's previous heads (`prev` on the durable head): an unsigned one
+	-- is refused (signed server), the signed H1 runs; the kernel's own durable write keeps `prev`, MemoryStore never.
+	rollbackPrev = table.find(process.args, "--rollback-prev") ~= nil,
 }
 -- 0.3.8 loading screens (plans/19 item 13), client side: `--client-boot` (the game's BootScreen replaces the kernel's
 -- "Starting..." until the first client generation runs and the server's hold ends), `--client-own` (KernelScreen =
@@ -1345,6 +1355,13 @@ if HEADS_CAP_MODE then
 end
 if ACCESS_MODE then
 	dataStore.data.settings = deepCopy(SMOKE.settings.access1) -- 0.3.8: was the ConfigService TypeTorch registry key
+end
+if MODES38.rollbackPrev then
+	-- The branch head is B (M2, #11, signed), in both copies; no `prev` yet (as kernels before 0.3.9 wrote it).
+	local m2 = FIELDS.M2
+	dataStore.data.heads = { prod = { assetId = m2.a, artifactId = m2.i, seq = m2.s, commit = m2.c, channel = m2.ch, t = m2.t, sig = SIGS.M2.sig, sigF = SIGS.M2.sigF, deployedAt = "2026-10-04T00:00:00Z" } }
+	memoryStore.data.heads = { prod = deepCopy(dataStore.data.heads.prod) }
+	dataStore.data.deployments = nil
 end
 -- `--kernel-crash`: the kernel errors right after the hold (a kernel bug): the held players are still moved.
 local KERNEL_CRASH_MODE = table.find(process.args, "--kernel-crash") ~= nil
@@ -1680,6 +1697,11 @@ if FLEET_MODE then
 	Constants.FLEET_ALERT_GAP = 0.3
 	Constants.FLEET_SPIKE_GAP = 0.3
 	Constants.FLEET_RATE_PER_MINUTE = 6000
+	-- 0.3.9: the backoff after a failed cycle and the hold after a 401, scaled down like the rest (test-fleet.luau checks
+	-- the real values); every outage line shows.
+	Constants.FLEET_BACKOFF_MAX = 0.5
+	Constants.FLEET_AUTH_HOLD = 0.3
+	Constants.FLEET_LOG_GAP = 0
 end
 if HOLD_MODE or HOLD_OPTOUT_MODE or PEERS_MODE or PEERS_UNTRUSTED_MODE or BACKUP_MODE or RECOVER_MODE or TELEPORT_MODE or BOUNCE_MODE or MIDSWAP_MODE or CLIENT_FAIL_MODE or KERNEL_CRASH_MODE then
 	Constants.PEER_COLLECT = 0.4
@@ -1794,6 +1816,25 @@ if table.find(process.args, "--boot-budget") then
 	process.exit(if bad == 0 then 0 else 1)
 end
 
+SMOKE.logOut = function(line: string, kind: string)
+	services.LogService.MessageOut:Fire(line, if kind == "warn" then 3 else 1)
+end
+-- 0.3.9: the lines in a kernel log ring (the server's api:logs or the client's), as text.
+SMOKE.ringHas = function(kernel, text: string): boolean
+	local ok, entries = pcall(function()
+		return kernel:logs(0)
+	end)
+	if not ok then
+		return false
+	end
+	for _, entry in entries do
+		if string.find(entry.text, text, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
 local kernelStartClock = os.clock()
 local kernelErrors = {}
 if not CLIENT_MODE then
@@ -1871,7 +1912,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if MODES38.detached then "--detached" elseif MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if MODES38.rollbackPrev then "--rollback-prev" elseif MODES38.detached then "--detached" elseif MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -1999,7 +2040,10 @@ if CLIENT_MODE then
 		else
 			clientScript:SetAttribute("KernelScreen", false)
 		end
+		-- 0.3.9: the join snapshot on the script, and the live hold on ReplicatedStorage.TypeTorch (later changes go
+		-- there only: ReplicatedFirst replicates once).
 		clientScript:SetAttribute("Hold", "start")
+		root:SetAttribute("Hold", "start")
 		Constants.CLIENT_RETRY_SECONDS = 0.1
 		runScript(clientScript, function(err)
 			table.insert(kernelErrors, err)
@@ -2007,11 +2051,11 @@ if CLIENT_MODE then
 		task.wait(0.3)
 		check(`{label}: the server holds: the kernel's "Starting..." stays off ({if boot then "the boot screen is cloned into PlayerGui" else "the game draws its own"}); Holding = start, no ClientReady yet`, kernelScreen() == nil and clientScript:GetAttribute("Holding") == "start" and clientScript:GetAttribute("ClientReady") == nil and (if boot then bootScreen() ~= nil and bootScreen().ResetOnSpawn == false and bootScreen():FindFirstChild("Splash") ~= nil else bootScreen() == nil))
 		if not boot then
-			clientScript:SetAttribute("Hold", "move")
+			root:SetAttribute("Hold", "move")
 			check("client-own: a move always shows the kernel's screen (Reconnecting...)", waitFor("move", function()
 				return kernelScreen() ~= nil and kernelScreen().Backdrop.Card.Label.Text == "Reconnecting..."
 			end))
-			clientScript:SetAttribute("Hold", "start")
+			root:SetAttribute("Hold", "start")
 			check("client-own: back to the start hold: the kernel's screen goes again", waitFor("start", function()
 				return kernelScreen() == nil and clientScript:GetAttribute("Holding") == "start"
 			end, 2))
@@ -2022,20 +2066,25 @@ if CLIENT_MODE then
 			return clientScript:GetAttribute("ClientReady") == true and clientScript:GetAttribute("ClientGeneration") == "aaaaaaa-111111#1"
 		end))
 		check(`{label}: the server still holds: the game's screen stays, the kernel's stays off`, kernelScreen() == nil and (not boot or bootScreen() ~= nil))
-		clientScript:SetAttribute("Hold", nil)
+		root:SetAttribute("Hold", nil) -- (the script keeps its join snapshot, "start")
 		check(`{label}: the hold ends: {if boot then "the boot screen goes, " else ""}the kernel's never showed, Holding cleared`, waitFor("hand-over", function()
 			return bootScreen() == nil and clientScript:GetAttribute("Holding") == nil
 		end) and kernelScreen() == nil)
 		-- Later holds (a failed swap clears ActiveGeneration and the server holds again) are the kernel's, as in 0.3.6.
 		root:SetAttribute("ActiveGeneration", nil)
-		clientScript:SetAttribute("Hold", "start")
+		root:SetAttribute("Hold", "start")
 		check(`{label}: a later hold shows the kernel's "Starting..."; ClientGeneration cleared, ClientReady stays`, waitFor("re-hold", function()
 			return kernelScreen() ~= nil and kernelScreen().Backdrop.Card.Label.Text == "Starting..." and clientScript:GetAttribute("ClientGeneration") == nil
 		end) and clientScript:GetAttribute("ClientReady") == true)
 		finish()
 	end
-	-- 0.3.6: the server holds players (nothing runs yet): the client covers the place from its first line.
+	-- 0.3.6: the server holds players (nothing runs yet): the client covers the place from its first line. 0.3.9: the
+	-- server marks the script (the JOIN snapshot: ReplicatedFirst replicates once, so this client never sees a later
+	-- change there) and ReplicatedStorage.TypeTorch (live: every later change goes only there below).
 	clientScript:SetAttribute("Hold", "start")
+	clientScript:SetAttribute("HoldReason", "boot: no generation runs yet")
+	root:SetAttribute("Hold", "start")
+	root:SetAttribute("HoldReason", "boot: no generation runs yet")
 	runScript(clientScript, function(err)
 		table.insert(kernelErrors, err)
 	end)
@@ -2052,6 +2101,7 @@ if CLIENT_MODE then
 	local shownMs = if screen() then screen():GetAttribute("ShownMs") else nil
 	check(string.format("hold: the holding screen is up from the client's first line (time-to-held %s ms after the client script started; target < 1000)", tostring(shownMs)), shownMs ~= nil and shownMs < 1000 and screenText() == "Starting..." and screen().IgnoreGuiInset == true and screen().Backdrop.BackgroundTransparency == nil)
 	check("hold: Holding = start on the kernel client script (0.3.8), no ClientReady yet", clientScript:GetAttribute("Holding") == "start" and clientScript:GetAttribute("ClientReady") == nil)
+	check("0.3.9: HoldReason next to Holding says why (the server's reason)", clientScript:GetAttribute("HoldReason") == "server hold start: boot: no generation runs yet")
 	check("hold: no emojis, a few words, a UIScale pop and a progress bar", (function()
 		local card = screen().Backdrop.Card
 		local text = screenText() or ""
@@ -2076,9 +2126,17 @@ if CLIENT_MODE then
 	end) and SMOKE.clientKernel ~= nil and localPlayer.PlayerScripts:FindFirstChild("TypeTorchRetry") ~= nil)
 	check("hold: the screen stays while the server still holds", screen() ~= nil and screenText() == "Starting...")
 	check("client: ClientReady = true and ClientGeneration once the first client generation runs (0.3.8)", clientScript:GetAttribute("ClientReady") == true and clientScript:GetAttribute("ClientGeneration") == "aaaaaaa-111111#1")
-	clientScript:SetAttribute("Hold", nil)
+	-- 0.3.9 THE BUG: the server released, but this client joined during the hold and its ReplicatedFirst script still says
+	-- "start" (never replicated again). Only ReplicatedStorage.TypeTorch changes.
+	root:SetAttribute("Hold", nil)
+	root:SetAttribute("HoldReason", nil)
 	check("hold: the server's hold ends and this client's generation runs: the screen pops out", waitFor("screen gone", function()
 		return screen() == nil
+	end, 2))
+	check("0.3.9: ... although the script's join snapshot still says Hold = start (ReplicatedFirst replicates once); Holding and HoldReason cleared", clientScript:GetAttribute("Hold") == "start" and clientScript:GetAttribute("Holding") == nil and clientScript:GetAttribute("HoldReason") == nil)
+	check("0.3.9: one line per screen change in the client's log ring (Logs, Logs > Upload): up with the server's reason, down with the generation", waitFor("ring", function()
+		return SMOKE.ringHas(SMOKE.clientKernel, "[TypeTorch] screen up (Starting...): server hold start: boot: no generation runs yet")
+			and SMOKE.ringHas(SMOKE.clientKernel, "[TypeTorch] screen down: generation aaaaaaa-111111#1 running")
 	end, 2))
 	-- P-N1: a resync naming this generation's artifact reaches it (the framework fails its pending calls); one naming
 	-- another artifact doesn't.
@@ -2142,10 +2200,39 @@ if CLIENT_MODE then
 	end)
 	local stopsBefore = SMOKE.clientKernel
 	root:SetAttribute("ActiveGeneration", nil)
-	clientScript:SetAttribute("Hold", "start")
+	root:SetAttribute("Hold", "start")
+	root:SetAttribute("HoldReason", "a failed swap: smoke")
 	check("hold: ActiveGeneration cleared (nothing runs on the server): the dead client generation stops, the screen covers", waitFor("stopped", function()
 		return #localPlayer.PlayerScripts:GetChildren() <= 1 and screenText() == "Starting..."
 	end) and stopsBefore ~= nil)
+	-- 0.3.9 FAIL-SAFE: a generation runs again (on the server and here) but the server's hold stays "start" (a server
+	-- bookkeeping bug): the screen comes down by itself after 5 s, with a loud warning of what it saw.
+	SMOKE.clientFailures["aaaaaaa-111111#1"] = 0
+	root:SetAttribute("ActiveGeneration", "aaaaaaa-111111#1")
+	check("0.3.9 fail-safe: the client's generation runs while the hold says start: the screen stays for now", waitFor("A runs", function()
+		return clientScript:GetAttribute("ClientGeneration") == "aaaaaaa-111111#1"
+	end) and screenText() == "Starting...")
+	local failSafeAt = os.clock()
+	local function failSafeWarned(): boolean
+		for _, line in output do
+			if line.kind == "warn" and string.find(line.text, "FAIL-SAFE: the holding screen came down by itself", 1, true) and string.find(line.text, "a failed swap: smoke", 1, true) then
+				return true
+			end
+		end
+		return false
+	end
+	check("0.3.9 fail-safe: about 5 s later the screen comes down, warned with the state it saw", waitFor("fail-safe", function()
+		return screen() == nil and failSafeWarned()
+	end, 8) and os.clock() - failSafeAt >= 4.5 and clientScript:GetAttribute("Holding") == nil)
+	-- A new hold from the server (another reason) is honoured again; a "move" hold is real and never dropped.
+	root:SetAttribute("Hold", "move")
+	root:SetAttribute("HoldReason", "nothing runs: moving players")
+	check("0.3.9 fail-safe: a later move hold shows (Reconnecting...) and stays past the fail-safe time", waitFor("move", function()
+		return screenText() == "Reconnecting..."
+	end) and (function()
+		task.wait(5.6)
+		return screenText() == "Reconnecting..." and clientScript:GetAttribute("Holding") == "move"
+	end)())
 	finish()
 end
 
@@ -2195,6 +2282,8 @@ if DEV_MODE then
 		end
 		return true
 	end)())
+	-- 0.3.9: channel = what the branch is (dev); the rules stay prod while a prod-channel build (B) runs here, as before.
+	check("0.3.9 dev: channel dev (heartbeat c dev); rules prod while a prod-channel build runs", status().channel == "dev" and status().rules == "prod" and SMOKE.kernel:fleetStatus().c == "dev" and SMOKE.kernel.channel == "prod")
 	finish()
 end
 if DURABLE_MODE then
@@ -2377,6 +2466,34 @@ end
 local function fleet()
 	return SMOKE.kernel:fleetStatus()
 end
+
+if MODES38.rollbackPrev then
+	check("rollback-prev: a fresh public server boots the signed head B (#11) straight away", waitFor("boot", function()
+		return running() == "bbbbbbb-222222"
+	end) and #status().history == 1 and status().signedOnly == true)
+	local first = SMOKE.kernel:rollback(nil)
+	check("rollback-prev: no earlier build anywhere: the error says what to do (typetorch rollback <branch>)", first.ok == false and string.find(first.error or "", "typetorch rollback prod", 1, true) ~= nil and running() == "bbbbbbb-222222")
+	-- The CLI (0.9) keeps the branch's last heads as `prev` on the durable head: a forged unsigned one (#10, D: game code
+	-- can write the store) and the signed H1 (#10, A).
+	local h1Fields = FIELDS.H1
+	dataStore.data.heads.prod.prev = {
+		{ assetId = 1004, artifactId = "ddddddd-444444", seq = 10, commit = "ddddddd", channel = "prod", t = 1759580110000, deployedAt = "2026-10-04T00:00:00Z" },
+		{ assetId = h1Fields.a, artifactId = h1Fields.i, seq = h1Fields.s, commit = h1Fields.c, channel = h1Fields.ch, t = h1Fields.t, sig = SIGS.H1.sig, sigF = SIGS.H1.sigF, deployedAt = "2026-10-04T00:00:00Z" },
+	}
+	local second = SMOKE.kernel:rollback(nil)
+	check("rollback-prev: the branch's previous heads: the forged unsigned one is refused (signed server), the signed H1 (#10) runs", second.ok == true and running() == "aaaaaaa-111111" and (assets[1004].loads or 0) == 0)
+	check("rollback-prev: a server-local swap (reason server_rollback, logged with source branch, appliedSeq stays 11)", status().appliedSeq == 11 and hasEvent("server_rollback", "source", "branch") and said("nothing earlier ran on this server; the branch's previous head aaaaaaa-111111 #10") and SMOKE.kernel.start.reason == "server_rollback")
+	task.wait(0.4)
+	check("rollback-prev: it holds (the poll doesn't move it back to the head)", running() == "aaaaaaa-111111")
+	-- The kernel's durable write keeps `prev` (the head it replaces first, newest first, at most 3); MemoryStore never.
+	publish("TypeTorch/deploy", deployMessage("M9", FIELDS.M9, { "sig" }))
+	check("rollback-prev: a newer signed deploy of the running build: the durable head's prev = B #11, then its own prev (3 kept, newest first)", waitFor("durable prev", function()
+		local head = dataStore.data.heads.prod
+		local prev = head and head.prev
+		return head.seq == 18 and prev ~= nil and #prev == 3 and prev[1].seq == 11 and prev[1].sig ~= nil and prev[2].seq == 10 and prev[3].seq == 10 and prev[1].prev == nil
+	end) and memoryStore.data.heads.prod.seq == 18 and memoryStore.data.heads.prod.prev == nil and status().appliedSeq == 18)
+	finish()
+end
 local function heard(name: string, seq: number, result: string): boolean
 	for _, report in SMOKE.heard[name] or {} do
 		if report.s == seq and report.r == result then
@@ -2471,6 +2588,19 @@ if SWITCH_MODE then
 	local s1 = status()
 	check("switch: the owner switches the public prod server to dev", switched.ok == true and running() == "ddddddd-444444" and s1.branch == "dev" and s1.serverType == "public" and s1.generation.number > generationBefore)
 	check("switch: players stay (no kick, no teleport)", #kicked == 0 and fleet().n == 4)
+	-- 0.3.9: the channel is what the branch is (dev); the rules this public server applies stay prod.
+	local root = services.ReplicatedStorage.TypeTorch
+	check("0.3.9 channel: a dev branch on a public server reports channel dev, rules prod (status, heartbeat c, root BranchChannel)", s1.channel == "dev" and s1.rules == "prod" and fleet().c == "dev" and root:GetAttribute("BranchChannel") == "dev")
+	check("0.3.9 channel: the payload API keeps channel = the rules (older frameworks gate on it), adds rules and branchChannel; root Channel = rules", SMOKE.kernel.channel == "prod" and SMOKE.kernel.rules == "prod" and SMOKE.kernel.branchChannel == "dev" and root:GetAttribute("Channel") == "prod")
+	services.TextChatService.TypeTorchCommand.Triggered:Fire({ UserId = 1 }, "/tt status")
+	check("0.3.9 channel: /tt status says the branch's channel and the stricter rules", waitFor("tt status", function()
+		for _, call in firedToClient do
+			if call[1] == owner and call[3] == "__tt/notice" and string.find(tostring(call[4]), "branch dev (dev, prod rules)", 1, true) then
+				return true
+			end
+		end
+		return false
+	end))
 	check("switch: status().switched = {by, name, at, branch}; the heartbeat's b is the branch; no ov", s1.switched ~= nil and s1.switched.by == 1 and s1.switched.name == "Owner" and s1.switched.branch == "dev" and typeof(s1.switched.at) == "number" and s1.ov == nil and fleet().b == "dev" and fleet().ov == nil)
 	check("switch: a branch_switch alert (info) is posted and the server logs it", waitFor("alert", function()
 		local list = alerts("branch_switch")
@@ -2544,6 +2674,7 @@ if SWITCH_MODE then
 	check("switch: /tt branch prod by the owner", waitFor("tt branch", function()
 		return status().branch == "prod" and running() == "bbbbbbb-222222"
 	end))
+	check("0.3.9 channel: back on prod: channel prod, rules prod", status().channel == "prod" and status().rules == "prod" and fleet().c == "prod")
 	check("switch: no /tt back, no override field anywhere", status().ov == nil and fleet().ov == nil and not said("OWNER OVERRIDE"))
 	finish()
 end
@@ -2650,8 +2781,8 @@ if FLEET_MODE then
 		return statuses[1] == 0 and statuses[2] == 503 and statuses[3] == 200 and httpRequests[mark + 1].url == httpRequests[mark + 3].url
 	end, 4))
 	httpScript = { 401 }
-	check("fleet: 401 is dropped with a warning that names the setting", waitFor("401", function()
-		return said("answered 401") and said("settings.fleet.token")
+	check("fleet: 401 is dropped with a warning that names the setting (0.3.9: and holds the sender off)", waitFor("401", function()
+		return said("HTTP 401") and said("settings.fleet.token") and said("refused")
 	end, 4))
 
 	-- A player count change sends a heartbeat at once (at most once per FLEET_PLAYERS_GAP).
@@ -3058,6 +3189,13 @@ if HOLD_MODE or HOLD_OPTOUT_MODE then
 			return services.Players.CharacterAutoLoads == true and table.find(loadedCharacters, "Early") ~= nil and first == nil and root == nil
 		end) and hold.heldMs ~= nil and hold.heldMs < 50 and hold.active == false and hold.spawned == 1)
 	end
+	if not optOut then
+		-- 0.3.9: one line per hold change with its reason, in the server's log ring (the dev menu's Logs, Logs > Upload).
+		check("0.3.9 hold: 'hold start' (with its reason) and 'hold released: generation ... running' are in the kernel's log ring", waitFor("ring", function()
+			return SMOKE.ringHas(SMOKE.kernel, "[TypeTorch] hold start: boot: no generation runs yet")
+				and SMOKE.ringHas(SMOKE.kernel, "[TypeTorch] hold released: generation aaaaaaa-111111#1 running")
+		end) and status().fallback.hold.lastReleased == "generation aaaaaaa-111111#1 running" and services.ReplicatedStorage.TypeTorch:GetAttribute("HoldReason") == nil)
+	end
 	-- A swap of the running generation never holds anybody.
 	SMOKE.behave["bbbbbbb-222222"] = function()
 		local first = holdAttribute()
@@ -3071,6 +3209,17 @@ if HOLD_MODE or HOLD_OPTOUT_MODE then
 	local late = joinPlayer(12, "Late")
 	task.wait(0.2)
 	check("hold: a player who joins while a generation runs isn't held (Roblox spawns them as usual)", services.Players.CharacterAutoLoads == true and late.Character == nil and #loadedCharacters == spawnedBefore)
+	if not optOut then
+		-- 0.3.9 safety net: a "start" hold while a generation runs (a bookkeeping bug, forced here) is released by the
+		-- watchdog after HOLD_STUCK_RELEASE s, warned.
+		requireInstance(kernelFolder.Fallback).lost("smoke: a forced bookkeeping bug")
+		check("0.3.9 hold: a forced 'start' hold while B runs is marked with its reason", select(2, holdAttribute()) == "start" and services.ReplicatedStorage.TypeTorch:GetAttribute("HoldReason") == "a failed swap: smoke: a forced bookkeeping bug")
+		local forcedAt = os.clock()
+		check("0.3.9 hold: the watchdog releases it after about 3 s, warned (a kernel bookkeeping bug)", waitFor("watchdog release", function()
+			local first, root = holdAttribute()
+			return first == nil and root == nil
+		end, 6) and os.clock() - forcedAt >= 2.5 and said("released by the watchdog (a kernel bookkeeping bug") and status().fallback.hold.stuckReleases == 1 and services.Players.CharacterAutoLoads == true)
+	end
 	finish()
 end
 
@@ -3848,7 +3997,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.8")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.9")
 
 -- 0.3.8: no settings record here (a game that never ran `typetorch settings push`): the defaults, reported as missing.
 do

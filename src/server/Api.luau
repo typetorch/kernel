@@ -105,7 +105,11 @@ function Api.forEntry(entry: Script)
 		artifact = table.clone(generation.artifact),
 		generation = generation.number,
 		branch = generation.branch,
-		channel = generation.channel,
+		-- 0.3.9: `channel` keeps the RULES this server applies (older frameworks gate their devtools on it); `rules` says so
+		-- by name, and `branchChannel` is what the branch is (prod: the default branch or one configured prod; else dev).
+		channel = generation.rules or generation.channel,
+		rules = generation.rules or generation.channel,
+		branchChannel = generation.branchChannel,
 		serverType = services.serverType(),
 		-- 0.2.2: { kind, reason, requestedBy?, previous?, branchChanged, startedAt, loadSeconds, stopSeconds?,
 		-- swapSeconds? }. The kernel's own table: it adds swapSeconds once the swap finished.

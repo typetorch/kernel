@@ -20,6 +20,16 @@
 -- PlayerGui at once, removed when the first client generation runs or after 60 s) and `KernelScreen` = false (the game
 -- shows its own loading screen). Either way the kernel's "Starting..." / "Loading..." screen stays off until the first
 -- client generation ran (one screen at a time; "Reconnecting..." for a move always shows).
+--
+-- 0.3.9 ("Starting..." stayed up while the game ran): ReplicatedFirst is replicated ONCE, when the player joins, so the
+-- `Hold` attribute on this script is the hold AT JOIN and never changes here afterwards; this script read it first and
+-- kept "Starting..." for good when the player joined during the boot hold. Now it is used only until
+-- ReplicatedStorage.TypeTorch arrives; from then on that folder's `Hold` / `HoldReason` (live) decide. Every screen
+-- change prints one line with its reason ("[TypeTorch] screen up (Starting...): server hold start: ...", "screen down:
+-- generation X running"), in this client's log ring (the dev menu's Logs, Logs > Upload), and `HoldReason` sits next to
+-- `Holding` on this script. FAIL-SAFE: when this client's own generation runs, the server has an ActiveGeneration and
+-- the hold still says "start" after CLIENT_HOLD_FAILSAFE (5) s, the screen comes down anyway with a loud warning of the
+-- state it saw (a server-side bookkeeping bug must never keep players behind it). A "move" hold is real: never dropped.
 
 local scriptStartedAt = os.clock()
 local LogService = game:GetService("LogService")
@@ -29,13 +39,55 @@ local TextChatService = game:GetService("TextChatService")
 
 local player = Players.LocalPlayer
 
+-- Logs (0.3.9: first, so the holding screen's own lines are in the ring) ------------------------------------------
+local CAPACITY = 300
+local logEntries = {}
+local nextLog = 1
+local KINDS = {
+	[Enum.MessageType.MessageOutput] = "output",
+	[Enum.MessageType.MessageInfo] = "info",
+	[Enum.MessageType.MessageWarning] = "warning",
+	[Enum.MessageType.MessageError] = "error",
+}
+LogService.MessageOut:Connect(function(message, messageType)
+	logEntries[(nextLog - 1) % CAPACITY + 1] = { i = nextLog, t = os.time(), kind = KINDS[messageType] or "output", text = string.sub(message, 1, 2000) }
+	nextLog += 1
+end)
+local logs = {}
+function logs.since(since, limit)
+	local from = math.max((since or 0) + 1, nextLog - CAPACITY)
+	local to = nextLog - 1
+	if limit then
+		from = math.max(from, to - limit + 1)
+	end
+	local result = {}
+	for index = from, to do
+		local entry = logEntries[(index - 1) % CAPACITY + 1]
+		if entry and entry.i == index then
+			table.insert(result, entry)
+		end
+	end
+	return result
+end
+
 local holdScreen
 do
 	local TEXT = { start = "Starting...", load = "Loading...", move = "Reconnecting..." }
 	local state = {
-		server = script:GetAttribute("Hold"), -- "start" | "move" | nil, from the server
+		-- "start" | "move" | nil, from the server. 0.3.9: the script's attribute is the hold at JOIN (ReplicatedFirst is
+		-- replicated once); ReplicatedStorage.TypeTorch's, once known (`root`), is the live one.
+		server = script:GetAttribute("Hold"),
+		serverReason = script:GetAttribute("HoldReason"), -- 0.3.9: why the server holds
+		-- 0.3.9: the server's reason in the join snapshot, read once: from here on this script's `HoldReason` is THIS
+		-- client's (why its screen is up, next to `Holding`); the server's live reason is on ReplicatedStorage.TypeTorch.
+		joinReason = script:GetAttribute("HoldReason"),
 		mine = nil, -- "load" (this client's generation failed) | "move" (the server is moving this player) | nil
 		running = false, -- this client's generation runs
+		generation = nil, -- 0.3.9: the running client generation's name
+		logged = nil, -- 0.3.9: the last screen state printed ("<mode>|<reason>")
+		wasUp = false, -- 0.3.9: a screen state other than "down" was printed
+		stuckSince = nil, -- 0.3.9 fail-safe: os.clock() a "start" hold was first seen while this client's generation runs
+		overridden = false, -- 0.3.9 fail-safe: the server's current "start" hold is ignored (until the server's hold changes)
 		releasedAt = nil, -- os.clock() the server's hold ended
 		ui = nil, -- { gui, backdrop, scale, label, fill, mode }
 		failed = false, -- building the UI failed once: don't try again
@@ -52,6 +104,8 @@ do
 	holdScreen = state
 	-- Constants.BOOT_SCREEN_WAIT / BOOT_SCREEN_TIMEOUT (this runs before Constants can be required).
 	local BOOT_WAIT, BOOT_TIMEOUT = 5, 60
+	-- Constants.CLIENT_HOLD_FAILSAFE and HOLD_DISPLAY_ORDER (the framework's dev menu sits at HOLD_DISPLAY_ORDER + 100).
+	local FAILSAFE, DISPLAY_ORDER = 5, 2147483000
 
 	local function mark(name: string, value: any)
 		pcall(script.SetAttribute, script, name, value)
@@ -70,7 +124,7 @@ do
 		gui.Name = "TypeTorchHold"
 		gui.IgnoreGuiInset = true
 		gui.ResetOnSpawn = false
-		gui.DisplayOrder = 2147483000
+		gui.DisplayOrder = DISPLAY_ORDER -- above every game UI; the dev menu (DISPLAY_ORDER + 100) stays above it
 		gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 		local backdrop = Instance.new("Frame") -- opaque: the bare place never shows through
 		backdrop.Name = "Backdrop"
@@ -125,22 +179,28 @@ do
 		return { gui = gui, backdrop = backdrop, scale = scale, label = label, fill = fill, mode = mode, shownAt = os.clock() }
 	end
 
-	-- The mode to show, or nil. After the server's hold ends the screen stays until this client's generation runs (at
-	-- most 10 s), so the half-loaded game never flashes.
-	local function wanted(): string?
-		if state.mine == "move" or state.server == "move" then
-			return "move"
+	-- The mode to show, or nil, and (0.3.9) why. After the server's hold ends the screen stays until this client's
+	-- generation runs (at most 10 s), so the half-loaded game never flashes.
+	local function wanted(): (string?, string)
+		if state.mine == "move" then
+			return "move", "this client is being moved to another server (its generation failed)"
+		end
+		if state.server == "move" then
+			return "move", `server hold move: {state.serverReason or "no reason given"}`
 		end
 		if state.mine then
-			return state.mine
+			return state.mine, "this client's generation failed after its retry (the server re-sends it)"
 		end
-		if state.server then
-			return state.server
+		if state.server and not state.overridden then
+			return state.server, `server hold {state.server}: {state.serverReason or "no reason given"}`
 		end
 		if state.ui and not state.running and state.releasedAt and os.clock() - state.releasedAt < 10 then
-			return state.ui.mode
+			return state.ui.mode, "server hold released; waiting for this client's generation (10 s at most)"
 		end
-		return nil
+		if state.running and state.generation then
+			return nil, `generation {state.generation} running`
+		end
+		return nil, if state.overridden then "the fail-safe dropped the server's stuck hold" else "no hold"
 	end
 
 	local refresh
@@ -172,9 +232,55 @@ do
 		return state.boot ~= nil or state.bootPending or not state.kernelScreen
 	end
 
+	-- 0.3.9 FAIL-SAFE: this client's generation runs, the server has an ActiveGeneration, and the hold has said "start"
+	-- for FAILSAFE s: a server-side bookkeeping bug; the screen comes down (until the server's hold changes), loudly.
+	local function checkStuck()
+		local root = state.root
+		local active = if root then root:GetAttribute("ActiveGeneration") else nil
+		if not (state.server == "start" and not state.overridden and state.mine == nil and state.running and state.generation and active ~= nil) then
+			state.stuckSince = nil
+			return
+		end
+		local now = os.clock()
+		if not state.stuckSince then
+			state.stuckSince = now
+			task.delay(FAILSAFE + 0.1, function()
+				refresh()
+			end)
+			return
+		end
+		if now - state.stuckSince < FAILSAFE then
+			return
+		end
+		state.overridden = true
+		warn(
+			`[TypeTorch] FAIL-SAFE: the holding screen came down by itself. This client runs {state.generation} and the server's ActiveGeneration is {active}, but the server's hold has said "start" for {FAILSAFE}+ s (HoldReason: {tostring(state.serverReason)}; ReplicatedStorage.TypeTorch Hold = {tostring(root:GetAttribute("Hold"))}; this script's Hold (join snapshot) = {tostring(script:GetAttribute("Hold"))}; released {if state.releasedAt then `{math.floor(os.clock() - state.releasedAt)} s ago` else "never"}). The server didn't end its hold: a TypeTorch kernel bug, please report this line with the server's logs.`
+		)
+		task.defer(function()
+			if state.handOver then
+				state.handOver() -- the game's loading screen goes too (ClientReady already ran)
+			end
+		end)
+	end
+
 	refresh = function()
-		local raw = wanted()
+		checkStuck()
+		local raw, reason = wanted()
 		mark("Holding", raw)
+		mark("HoldReason", if raw then reason else nil) -- 0.3.9
+		-- 0.3.9: one line per change of the screen's state, with its reason.
+		local key = `{raw or "down"}|{reason}`
+		if key ~= state.logged then
+			state.logged = key
+			local shown = if raw and suppressed(raw) then " (the game's own loading screen shows instead)" else ""
+			if raw then
+				state.wasUp = true
+				print(`[TypeTorch] screen up ({TEXT[raw] or raw}): {reason}{shown}`)
+			elseif state.wasUp then
+				state.wasUp = false
+				print(`[TypeTorch] screen down: {reason}`)
+			end
+		end
 		if state.failed then
 			return
 		end
@@ -209,24 +315,33 @@ do
 	end
 	state.refresh = refresh
 
-	local function onServerHold(value)
+	local function onServerHold(value, reason)
 		local mode = if value == "start" or value == "move" then value else nil
+		reason = if typeof(reason) == "string" then reason else nil
 		if state.server and not mode then
 			state.releasedAt = os.clock()
 		end
+		if mode ~= state.server or reason ~= state.serverReason then
+			-- 0.3.9: a new hold (or none): the fail-safe starts over.
+			state.overridden = false
+			state.stuckSince = nil
+		end
 		state.server = mode
+		state.serverReason = reason
 		if state.handOver then
 			state.handOver()
 		end
 		refresh()
 	end
-	-- The server marks the hold on this script (first) and on ReplicatedStorage.TypeTorch (`state.root`, once known).
+	-- 0.3.9: the server marks the hold on this script (ReplicatedFirst: the JOIN snapshot, never updated on this client)
+	-- and on ReplicatedStorage.TypeTorch (`state.root`: live). Once the root is known it alone decides.
 	local function serverHold()
-		local value = script:GetAttribute("Hold")
-		if value == nil and state.root then
-			value = state.root:GetAttribute("Hold")
+		local root = state.root
+		if root then
+			onServerHold(root:GetAttribute("Hold"), root:GetAttribute("HoldReason"))
+		else
+			onServerHold(script:GetAttribute("Hold"), state.joinReason)
 		end
-		onServerHold(value)
 	end
 	state.serverHold = serverHold
 	script:GetAttributeChangedSignal("Hold"):Connect(serverHold)
@@ -244,7 +359,7 @@ do
 	-- 0.3.8: the first client generation runs and the server's first hold is over (characters spawn): the game's loading
 	-- screen goes, and the kernel's holding screen works as in 0.3.6 for later holds.
 	function state.handOver()
-		if state.handedOver or not state.everReady or state.server ~= nil then
+		if state.handedOver or not state.everReady or (state.server ~= nil and not state.overridden) then
 			return
 		end
 		state.handedOver = true
@@ -252,6 +367,7 @@ do
 	end
 	-- 0.3.8: this player's client generation `name` runs (nil: none runs now). The first one sets ClientReady.
 	function state.ran(name: string?)
+		state.generation = name -- 0.3.9
 		mark("ClientGeneration", name)
 		if name and not state.everReady then
 			state.everReady = true
@@ -297,7 +413,7 @@ do
 			refresh()
 		end)
 	end
-	onServerHold(state.server)
+	onServerHold(state.server, state.joinReason)
 end
 
 local kernelShared = ReplicatedStorage:WaitForChild("TypeTorchKernelShared")
@@ -305,44 +421,14 @@ local Constants = require(kernelShared:WaitForChild("Constants"))
 local ClientApi = require(kernelShared:WaitForChild("ClientApi"))
 local template = kernelShared:WaitForChild("ClientEntry")
 local root = ReplicatedStorage:WaitForChild("TypeTorch")
--- 0.3.6: the hold is marked here too (a place whose kernel client isn't ReplicatedFirst.TypeTorchKernelClient).
+-- 0.3.9: the LIVE hold (this script's own attribute is only the join snapshot: ReplicatedFirst replicates once).
 holdScreen.root = root
 root:GetAttributeChangedSignal("Hold"):Connect(holdScreen.serverHold)
+root:GetAttributeChangedSignal("HoldReason"):Connect(holdScreen.serverHold)
 holdScreen.serverHold()
 local generations = root:WaitForChild("Generations")
 local net: RemoteEvent = root:WaitForChild("Net")
 local netU: UnreliableRemoteEvent = root:WaitForChild("NetU")
-
--- Logs ------------------------------------------------------------------------------------------------------------
-local CAPACITY = 300
-local logEntries = {}
-local nextLog = 1
-local KINDS = {
-	[Enum.MessageType.MessageOutput] = "output",
-	[Enum.MessageType.MessageInfo] = "info",
-	[Enum.MessageType.MessageWarning] = "warning",
-	[Enum.MessageType.MessageError] = "error",
-}
-LogService.MessageOut:Connect(function(message, messageType)
-	logEntries[(nextLog - 1) % CAPACITY + 1] = { i = nextLog, t = os.time(), kind = KINDS[messageType] or "output", text = string.sub(message, 1, 2000) }
-	nextLog += 1
-end)
-local logs = {}
-function logs.since(since, limit)
-	local from = math.max((since or 0) + 1, nextLog - CAPACITY)
-	local to = nextLog - 1
-	if limit then
-		from = math.max(from, to - limit + 1)
-	end
-	local result = {}
-	for index = from, to do
-		local entry = logEntries[(index - 1) % CAPACITY + 1]
-		if entry and entry.i == index then
-			table.insert(result, entry)
-		end
-	end
-	return result
-end
 
 -- Transport ---------------------------------------------------------------------------------------------------------
 local acceptArtifact = nil
@@ -573,7 +659,9 @@ local function start(name: string, fresh: boolean?, source: Instance?): (boolean
 			seq = tree:GetAttribute("Seq"),
 		},
 		branch = branch,
+		-- 0.3.9: `Channel` holds the server's RULES (older frameworks gate on it); `BranchChannel` what the branch is.
 		channel = root:GetAttribute("Channel"),
+		branchChannel = root:GetAttribute("BranchChannel"),
 		serverType = root:GetAttribute("ServerType"),
 		number = generationCount,
 		copy = copy,

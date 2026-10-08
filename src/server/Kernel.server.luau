@@ -36,9 +36,22 @@
 -- 0.3.7 (health thresholds per build; plans/17 blocker 5): the health window lives in Health.luau and takes its limit,
 -- window and rollback switch from the payload (typetorch.json "health", stamped by `typetorch build`); missing or
 -- out-of-bounds values fall back to Constants. status().health reports them.
+--
+-- 0.3.9: CHANNEL vs RULES. There are two channels: prod (the signed settings' default branch, or a branch the settings
+-- configure prod) and dev (every other branch). That is what a server REPORTS as its channel (status().channel, /tt
+-- status, the fleet heartbeat `c`, game message tags, the dev menu). What it ENFORCES is separate and unchanged, the
+-- "rules" (rulesFor: "prod" on every public server, and on a server whose branch or artifact is prod-channel by
+-- trusted sources): signatures on public servers, read-only devtools for non-owners, owner-only rollbacks. The
+-- payload API keeps `channel` = the rules (older frameworks gate their devtools on it) and adds `rules` and
+-- `branchChannel`.
 
 -- 0.3.2 (boot budget): every boot wait and cap counts from here.
 local kernelStartedAt = os.clock()
+
+-- 0.3.9: the log ring (the dev menu's Logs, Logs > Upload) starts first, so the hold's own line ("[TypeTorch] hold
+-- start: ...") is in it. Logs.luau only connects LogService.MessageOut: nothing yields.
+local Logs = require(script.Parent.Logs)
+Logs.start()
 
 -- 0.3.6: the hold comes FIRST, before anything that yields, so no player who joins can spawn on a bare place. A place
 -- project that lists the kernel's files one by one and doesn't map Fallback yet (an older template studio.project.json)
@@ -87,7 +100,6 @@ KERNEL_HASH = if typeof(KERNEL_HASH) == "string" and KERNEL_HASH ~= "" then KERN
 
 local Access = require(script.Parent.Access)
 local Api = require(script.Parent.Api)
-local Logs = require(script.Parent.Logs)
 local Registry = require(script.Parent.Registry)
 local Transport = require(script.Parent.Transport)
 
@@ -173,8 +185,6 @@ do
 		})
 	end
 end
-
-Logs.start()
 
 -- 0.3.2 (busy-flag hazard, plans/12): work that game code starts (reload, rollback, switchBranch, pins) runs on a
 -- thread the KERNEL owns. Run on the caller's thread, a swap dies in the caller's own generation's hard stop (its Entry
@@ -272,7 +282,16 @@ local function folder(parent: Instance, name: string): Folder
 end
 
 local serverGenerations = folder(folder(ServerStorage, "TypeTorch"), "Generations")
-local replicatedRoot = folder(ReplicatedStorage, "TypeTorch")
+-- 0.3.9: ReplicatedStorage.TypeTorch's `Hold` / `HoldReason` are the live hold clients follow (ReplicatedFirst, where the
+-- kernel client script lives, is replicated only once, at join). Marked before the folder is parented, so no client
+-- ever sees it without the hold.
+local replicatedRoot = ReplicatedStorage:FindFirstChild("TypeTorch")
+if not replicatedRoot then
+	replicatedRoot = Instance.new("Folder")
+	replicatedRoot.Name = "TypeTorch"
+end
+Fallback.configure({ replicatedRoot = replicatedRoot })
+replicatedRoot.Parent = ReplicatedStorage
 local clientGenerations = folder(replicatedRoot, "Generations")
 local entries = folder(ServerScriptService, "TypeTorchEntries")
 Transport.start(replicatedRoot)
@@ -444,9 +463,11 @@ local function requiresSignatures(branch: string?): boolean
 	return trustedChannelOf(branch) == "prod"
 end
 
--- Strictest of the branch channel, the artifact channel and "prod" for public servers (plans/10). 0.3: the branch
--- channel comes from trusted sources only (an unsigned stored head can't make a prod branch look dev).
-local function effectiveChannel(branch: string, artifactChannel: string?): string
+-- The RULES this server applies ("prod" = read-only devtools for non-owners, owner-only rollbacks; plans/10): the
+-- strictest of the branch channel, the artifact channel and "prod" for public servers. 0.3: the branch channel comes
+-- from trusted sources only (an unsigned stored head can't make a prod branch look dev). Before 0.3.9 this was reported
+-- as the server's channel ("effective channel"), so a dev branch on a public server said "prod".
+local function rulesFor(branch: string, artifactChannel: string?): string
 	if serverType() == "public" then
 		return "prod"
 	end
@@ -454,6 +475,21 @@ local function effectiveChannel(branch: string, artifactChannel: string?): strin
 		return "prod"
 	end
 	return "dev"
+end
+
+-- 0.3.9: what a branch IS (user spec: two channels): "prod" for the signed settings' default branch or a branch the
+-- settings' `channels` configure prod, "dev" for every other branch. Reported everywhere; it never decides a security
+-- check (rulesFor and requiresSignatures do).
+local function branchChannelOf(branch: string?): string
+	if typeof(branch) ~= "string" then
+		return "dev"
+	end
+	local state = Registry.state()
+	local configured = state.channels[branch]
+	if configured == "prod" or configured == "dev" then
+		return configured
+	end
+	return if branch == state.defaultBranch then "prod" else "dev"
 end
 
 -- Heads a prod server may swap to, by table identity (fields can't fake it): "signed" (a verified deploy message or
@@ -704,14 +740,21 @@ local lastDev: { [Player]: string } = {}
 
 local function sendDevStatus(player: Player)
 	local dev, reason, role = Access.check(player)
-	Transport.kernelSend(player, Constants.CHANNEL_DEV, {
+	if player.Parent == nil then
+		return -- left while Access.check yielded
+	end
+	-- 0.3.9: pcall'd: it runs in swapTo's tail and in the settings listener, which must never stop halfway.
+	local sent, sendError = pcall(Transport.kernelSend, player, Constants.CHANNEL_DEV, {
 		dev = dev,
 		reason = reason,
 		role = role,
-		channel = if current then current.channel else nil,
+		-- 0.3.9: `channel` keeps the RULES this server applies (the name older frameworks read for their read-only
+		-- checks); `branchChannel` is what the branch is (channel and rules are separate since 0.3.9).
+		channel = if current then current.rules else nil,
+		branchChannel = if current then current.branchChannel else nil,
 	})
-	if player.Parent == nil then
-		return -- left while Access.check yielded
+	if not sent then
+		warn(`[TypeTorch] dev status for {player.Name} failed: {sendError}`)
 	end
 	-- A change after the first decision (revoked, new member, badge granted) goes to api:onDevChanged.
 	local key = `{dev}/{role or ""}`
@@ -839,11 +882,16 @@ local function mount(payload: Instance, head, policy)
 	local protocolHash = payload:GetAttribute("ProtocolHash")
 	protocolHash = if typeof(protocolHash) == "string" and protocolHash ~= "" and #protocolHash <= 128 then protocolHash else nil
 	local branch = myBranch
+	local rules = rulesFor(branch, artifactChannel)
 	local generation = {
 		name = name,
 		number = generationCount,
 		branch = branch,
-		channel = effectiveChannel(branch, artifactChannel),
+		-- 0.3.9: `rules` = what this server enforces; `branchChannel` = what the branch is (reported). `channel` keeps the
+		-- rules: the payload API's name for them (older frameworks gate their devtools on it).
+		channel = rules,
+		rules = rules,
+		branchChannel = branchChannelOf(branch),
 		head = head,
 		pinned = head.pinned == true,
 		startedAt = os.time(),
@@ -966,7 +1014,10 @@ local function publishActive(generation)
 	replicatedRoot:SetAttribute("ServerType", serverType())
 	replicatedRoot:SetAttribute("ArtifactId", generation.artifact.id)
 	replicatedRoot:SetAttribute("Branch", generation.branch)
-	replicatedRoot:SetAttribute("Channel", generation.channel)
+	-- 0.3.9: `Channel` keeps the rules (the client API's `channel`, which older frameworks gate on); `BranchChannel` is
+	-- what the branch is.
+	replicatedRoot:SetAttribute("Channel", generation.rules)
+	replicatedRoot:SetAttribute("BranchChannel", generation.branchChannel)
 	-- 0.3: this generation came from the boot fail-safe (an unverified prod head), or nil.
 	replicatedRoot:SetAttribute("Unverified", if generation.unverified then true else nil)
 	replicatedRoot:SetAttribute("ActiveGeneration", generation.name)
@@ -1192,7 +1243,8 @@ Health.start()
 
 -- 0.3.2 (P-O1): this server's fleet status (api:fleetStatus()), the heartbeat the analytics engine sends and the
 -- framework's Manage > Servers roll call answers with. Contract (plans/01 "Fleet status and deploy reports"):
---   { t = server type, b = branch, c = effective channel?, a = artifact id?, n = players, m = max players,
+--   { t = server type, b = branch, c = channel? (0.3.9: the branch's channel; before, the rules), a = artifact id?,
+--     n = players, m = max players,
 --     s = server start (unix s), u = now (unix s), p = place id, k = reserved access code (server-only data)?,
 --     x = 1 during an A/B experiment?, v = kernel version, q = applied seq, g = generation number (0 = none),
 --     h = "ok" | "failed" | "unverified" | "degraded", e = last error (<= 200 bytes)?, sv = 2 }
@@ -1210,7 +1262,7 @@ local function fleetStatus()
 		clients = if (resent or 0) + (moved or 0) > 0 then { resent = resent, moved = moved } else nil,
 		t = kind,
 		b = myBranch,
-		c = if current then current.channel else nil,
+		c = if current then branchChannelOf(myBranch) else nil, -- 0.3.9: what the branch is, not the rules
 		a = if current then current.artifact.id else nil,
 		n = #Players:GetPlayers(),
 		m = Players.MaxPlayers,
@@ -1421,6 +1473,11 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 	busy = false
 	startingGeneration = nil
 	stoppedInSwap = nil
+	-- 0.3.9: the hold ends the moment a generation runs (waiting players spawn), before anything below: the dev status
+	-- loop yields on web calls (rank and badge checks) for every player, and nothing there may keep players held.
+	if ok and report.ok and current then
+		Fallback.ready(current)
+	end
 	if not ok then
 		if typeof(err) == "table" then
 			report.transient = err.transient == true or nil -- 0.3.2: a boot-capped LoadAsset
@@ -1459,11 +1516,10 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		if report.kind == "boot" then
 			reportOutcome(head, "booted", { d = (report.loadSeconds or 0) + (report.swapSeconds or 0) })
 		end
-		-- 0.3.2 (P-F1): a failure reported before ready (a thrown onStart, early errors) is judged now.
+		-- 0.3.2 (P-F1): a failure reported before ready (a thrown onStart, early errors) is judged now. (0.3.6's
+		-- Fallback.ready, which ends the hold and reports a backup, runs right after the swap since 0.3.9.)
 		if generation then
 			Health.check(generation)
-			-- 0.3.6: the hold ends (waiting players spawn); a backup is reported (status, fleet, alert backup_build).
-			Fallback.ready(generation)
 		end
 	end
 	if pendingHead then
@@ -1769,6 +1825,11 @@ end
 -- branch; a `typetorch access push` applies within seconds (the CLI pings servers).
 Registry.onChange(function(state)
 	Access.setConfig(state, Registry.known())
+	-- 0.3.9: the settings decide what a branch is (defaultBranch, channels): the running generation's reported channel.
+	if current then
+		current.branchChannel = branchChannelOf(myBranch)
+		replicatedRoot:SetAttribute("BranchChannel", current.branchChannel)
+	end
 	Fleet.refreshSettings() -- 0.3.8: the fleet API settings ride the same record
 	-- 0.3.8: the running generation hears it (api:onSettingsChanged; the framework's analytics and liveConfig).
 	local handler = current and current.settingsHandler
@@ -2320,12 +2381,61 @@ local function reload(player: Player?)
 	return report
 end
 
+-- 0.3.9: the branch's previous head for a server-local rollback when this server has no earlier generation (it booted
+-- straight into the build being rolled back): the branch's heads (the durable head and its `prev` list, kept by the CLI
+-- and by the kernel's durable writes), then its deployment history (records written before 0.3.9 have no `prev`),
+-- newest first, older than what runs. On a server that requires signatures a head counts only when it verifies like a
+-- current head does (signed for prod, or the exact BootstrapHeads match; the payload's Channel must still be "prod" at
+-- mount). Yields (one DataStore read). Returns (head?, why?).
+local function previousBranchHead()
+	if not myBranch then
+		return nil, "no branch"
+	end
+	local list, readError = Registry.previousHeads(myBranch)
+	local entriesOk, entries = pcall(deploymentEntries)
+	if entriesOk then
+		for _, entry in entries do
+			if entry.branch == myBranch and typeof(entry.assetId) == "number" then
+				local head = pinHead(entry)
+				head.pinned = nil
+				table.insert(list, head)
+			end
+		end
+	end
+	local runningSeq = if current and typeof(current.artifact.seq) == "number" then current.artifact.seq else nil
+	local signedOnly = requiresSignatures(myBranch)
+	local refused, seen = 0, {}
+	for _, candidate in list do
+		local key = `{tostring(candidate.assetId)}#{tostring(candidate.seq)}`
+		local older = runningSeq == nil or typeof(candidate.seq) ~= "number" or candidate.seq < runningSeq
+		if not seen[key] and typeof(candidate.assetId) == "number" and older and not (current and candidate.assetId == current.artifact.assetId) then
+			seen[key] = true
+			local head = table.clone(candidate)
+			head.prev = nil
+			head.branch = myBranch
+			if not signedOnly then
+				return head, nil
+			end
+			if trustedProd(myBranch, head) then
+				return admit(head, if signedProd(myBranch, head) then "signed" else "bootstrap"), nil
+			end
+			refused += 1
+		end
+	end
+	if refused > 0 then
+		return nil, `{refused} earlier head(s) of {myBranch} don't verify (this server takes only signed builds)`
+	end
+	return nil, if readError then `the stored heads are unreadable: {readError}` else nil
+end
+
 local function rollback(player: Player?)
 	local allowed, why = requireDev(player)
 	if not allowed then
 		return { ok = false, error = why }
 	end
-	if player and current and current.channel == "prod" and not Access.isOwner(player) then
+	-- 0.3.9: by the RULES (as before 0.3.9's channel split): every public server, and servers on a prod-channel branch or
+	-- artifact, roll back only for the owner.
+	if player and current and current.rules == "prod" and not Access.isOwner(player) then
 		return { ok = false, error = "only the owner can roll back a prod-channel server" }
 	end
 	for index = #history - 1, 1, -1 do
@@ -2335,7 +2445,18 @@ local function rollback(player: Player?)
 			return swapTo(entry.head, "server-rollback", if player then player.UserId else nil)
 		end
 	end
-	return { ok = false, error = "no earlier artifact on this server" }
+	-- 0.3.9: nothing earlier ran on this server (a fresh server that booted straight into the build): the branch's
+	-- previous head, still a server-local swap (appliedSeq stays, so it holds until the branch's next deploy).
+	local head, missing = previousBranchHead()
+	if head then
+		print(`[TypeTorch] rollback: nothing earlier ran on this server; the branch's previous head {head.artifactId or `asset-{head.assetId}`}{if typeof(head.seq) == "number" then ` #{head.seq}` else ""}`)
+		Registry.logEvent({ action = "server_rollback", from = current and current.artifact.id, to = head.artifactId, seq = head.seq, source = "branch", by = player and player.UserId, job = game.JobId })
+		return swapTo(head, "server-rollback", if player then player.UserId else nil)
+	end
+	return {
+		ok = false,
+		error = `no earlier build on this server or in {myBranch or "this branch"}'s previous heads{if missing then ` ({missing})` else ""}. To roll the whole branch back: typetorch rollback {myBranch or "<branch>"}`,
+	}
 end
 
 -- Swaps THIS server to a known artifact and holds it there until a newer deploy seq for this server's branch arrives.
@@ -2810,7 +2931,11 @@ local function status()
 		placeVersion = game.PlaceVersion,
 		serverType = serverType(),
 		branch = myBranch,
-		channel = current and current.channel,
+		-- 0.3.9: `channel` = what the branch is ("prod" only for the default branch or one the settings configure prod);
+		-- `rules` = what this server enforces ("prod" on every public server: read-only devtools for non-owners, signed
+		-- deploys, owner-only rollbacks). Before 0.3.9 `channel` held the rules.
+		channel = if myBranch then branchChannelOf(myBranch) else nil,
+		rules = if current then current.rules elseif myBranch then rulesFor(myBranch, nil) else nil,
 		pinned = current ~= nil and current.pinned == true,
 		startedAt = startedAt,
 		uptime = os.time() - startedAt,
@@ -3037,7 +3162,7 @@ Messaging.configure({
 	self = function()
 		return {
 			b = myBranch,
-			c = if current then current.channel else effectiveChannel(myBranch or "", nil),
+			c = branchChannelOf(myBranch), -- 0.3.9: what the branch is (before: the rules, "prod" on every public server)
 			s = serverType(),
 		}
 	end,
@@ -3142,7 +3267,9 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 			if s.switched then
 				pinned ..= `, switched by {s.switched.name}`
 			end
-			notice(player, `{s.serverType} server, branch {s.branch} ({s.channel or "?"}), {if s.generation then s.generation.name else "no generation"}{pinned}, up {s.uptime}s, kernel {s.kernelVersion}{if s.kernelBuild then `@{s.kernelBuild}` else ""}{signing}`)
+			-- 0.3.9: the branch's channel, and the rules when they are stricter (a dev branch on a public server).
+			local rules = if s.rules and s.rules ~= s.channel then `, {s.rules} rules` else ""
+			notice(player, `{s.serverType} server, branch {s.branch} ({s.channel or "?"}{rules}), {if s.generation then s.generation.name else "no generation"}{pinned}, up {s.uptime}s, kernel {s.kernelVersion}{if s.kernelBuild then `@{s.kernelBuild}` else ""}{signing}`)
 		elseif command == "branch" and argument then
 			-- 0.3.4: the owner switches a public server for its lifetime; elsewhere the stored switch (ownerSwitch routes).
 			notice(player, describe(ownerSwitch(player, { branch = argument })))

@@ -64,7 +64,12 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
     MemoryStore for them. With the signed settings' `fleet` = `{url, token}` (0.3.8; the ConfigService key
     `TypeTorchFleet` before) the kernel also
     posts heartbeats (every 30 s and on changes), reports, alerts and a closing notice to that fleet API itself, live
-    and also while the generation is broken (`src/server/Fleet.luau`; the token is never logged).
+    and also while the generation is broken (`src/server/Fleet.luau`; the token is never logged). 0.3.9: when the API
+    can't be reached (a restarting or dead quick tunnel: `NetFail`; a stale trycloudflare URL: `DnsResolve` / 530)
+    every retry is jittered (+-25%), and after a request's retries all failed the sender backs off (30 s doubling to
+    300 s); a 401/403/404 holds it off about 5 minutes; one success resets it. One warning line a minute at most, with
+    the reason, and one "heartbeats work again" line after an outage; `status().fleet` adds `failures` (failed
+    requests in a row) and `retryIn`.
   - **Boot budget:** a new server runs a playable generation within 15 s of start in every path (about 2 s
     normally): the boot reads run in parallel behind one 3 s gate, the key asset gets 3 s, and boot attempts get short
     load and ready caps; a head that runs out of boot time is retried in the background and swapped to when it works.
@@ -75,7 +80,8 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
     generation (`onResync`).
 - Owners and owner switches (0.3.4; replaces the 0.3.3 owner override): two roles, owner (the experience creator, the
   owning group's owner, members with role "owner") and dev; a member with the old role "admin" is a dev, with a warning
-  once per server. Owner-only: A/B pins, pins and unpins on public servers, prod-channel rollbacks, `requestReload`.
+  once per server. Owner-only: A/B pins, pins and unpins on public servers, rollbacks on servers with prod rules (see
+  "Channel and rules" below), `requestReload`.
   The dev menu's Switch and Load here are ordinary switches and pins on every server: an owner switches a public server
   to any branch for its lifetime (never stored, so new servers still boot the signed prod head; a dev branch follows dev
   rules there; back to prod = Switch on the prod row, its verified head) and pins any known build on public and prod
@@ -84,6 +90,24 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   `/tt pin`; the server API has no owner path. Private and reserved servers keep the stored switch for devs. Reload and
   Rollback always work. `status().switched = {by, name, at, branch, artifact?}`, the fleet heartbeat's `b` is the
   branch, and each switch or load posts an info alert (`branch_switch`, `build_load`) and is printed and logged.
+- Channel and rules (0.3.9): two separate things. The CHANNEL is what the branch is: `prod` for the signed settings'
+  `defaultBranch` or a branch the settings' `channels` configure prod, `dev` for every other branch. It is what a server
+  reports: `status().channel`, `/tt status`, the fleet heartbeat `c`, game message tags, the dev menu. The RULES are
+  what it enforces, exactly as before 0.3.9 (where they were reported as the "effective channel"): `prod` on every public
+  server and on a server whose branch or running build is prod-channel by trusted sources: read-only devtools for
+  non-owners, owner-only rollbacks (signatures stay `requiresSignatures`: public servers and trusted-prod branches).
+  `status().rules`; `/tt status` says `branch dev (dev, prod rules)` for a dev branch on a public server. The payload
+  API keeps `channel` = the rules (older frameworks gate their devtools on it, and games split data store names by
+  `TypeTorch.channel`) and adds `rules` and `branchChannel`; `ReplicatedStorage.TypeTorch` has `Channel` (the rules) and
+  `BranchChannel`.
+- `/tt rollback` (0.3.9) on a server with no earlier generation (a fresh server that booted straight into a bad build)
+  takes the branch's previous head: `heads.<branch>.prev` in the DataStore copy (the last 3 heads, newest first, kept by
+  the CLI 0.8.1+ and by the kernel's own durable writes; MemoryStore never carries it), then the branch's deployment
+  history (records written before 0.3.9 have no `prev`). A server that requires signatures takes only one that verifies
+  like a current head (signed for prod, or the exact BootstrapHeads match; Channel "prod" at mount). Still a
+  server-local swap (`server_rollback`, logged with `source = "branch"`, appliedSeq stays: it holds until the branch's
+  next deploy). Nothing found: "no earlier build on this server or in prod's previous heads ... To roll the whole branch
+  back: typetorch rollback prod".
 - Durable heads (0.3.5): the CLI writes the DataStore `TypeTorch` key `heads` (and `deployments`) after every deploy
   message, so a deploy made while no server of that branch ran is no longer lost. The boot waits for the DataStore copy
   as well as MemoryStore (inside the 3 s boot gate) and boots the newer head; running servers read that copy about once
@@ -101,6 +125,19 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
     0 ms after its script starts. A swap of a running generation never holds. Games that spawn characters themselves
     set the `Players` attribute `TypeTorchHoldCharacters = false` (or keep `CharacterAutoLoads` off in the place): the
     kernel then never touches characters (the screen still shows while nothing runs).
+  - **0.3.9, "Starting..." stayed up while the game ran:** ReplicatedFirst is replicated once, when a player joins, so
+    the script's `Hold` is only the join snapshot; the 0.3.6-0.3.8 client read it first and kept "Starting..." for good
+    when the player joined during the boot hold (on a test place the first player always does: their join starts the
+    server). The client now follows `ReplicatedStorage.TypeTorch`'s `Hold` / `HoldReason` (live; set before that folder
+    is parented) once it has it. The hold ends the moment a generation runs (before the dev checks, which yield on web
+    calls); the watchdog releases a "start" hold it still finds on while a generation runs (3 s, warned); the dead man's
+    moves stop once the kernel's own watchdog runs. Diagnostics: one line per hold change in the kernel's log ring (the
+    dev menu's Logs, Logs > Upload), `[TypeTorch] hold start: <reason>` / `hold released: generation X running`, and on
+    the client `[TypeTorch] screen up (Starting...): server hold start: <reason>` / `screen down: generation X running`;
+    `HoldReason` next to `Hold` (server) and next to `Holding` (client). Fail-safe: when the client's own generation
+    runs, the server has an `ActiveGeneration` and the hold still says "start" after 5 s, the client drops the screen
+    and warns with the state it saw ("move" holds are never dropped). The screen's DisplayOrder is 2147483000
+    (`HOLD_DISPLAY_ORDER`): above every game UI, under the framework's dev menu (+100).
   - **Fallbacks** when the head and the last-known-good chain ran nothing, in this order: (4) a build the branch's
     other servers run healthy for 30 s+ (a kernel roll call: an ask `{rc = 1}` on `TypeTorch/deploy`, so no extra
     permanent subscription; replies on `TypeTorch/peers/<JobId>`; the most common build wins; prod servers take it only
@@ -142,7 +179,8 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   {to})` (checks topic, JSON data and the 1 KiB limit counted on the JSON-escaped envelope at once, then queues: a
   per-server bucket of 150 + 60 x players a minute, the universe's rate on the topic (every server sees every message;
   at 60 a minute publishes wait), retries after 1, 3, 9 s), `api:messagingStatus()`, `status().messaging`. Envelopes
-  carry the sender's JobId, branch, effective channel, server type and place version; `to = "prod" | "branch"` is
+  carry the sender's JobId, branch, channel (0.3.9: what its branch is; before, the rules), server type and place
+  version; `to = "prod" | "branch"` is
   filtered by the receivers. A message that arrives mid-swap is replayed to the next generation's first listener of its
   topic. Studio loops back and never touches MessagingService. `api:onRollCall(fn)` holds the framework's roll call ask
   topic `TypeTorch/rollcall` for the running generation (same protocol as before). Subscriptions: deploy, pin, rekey,
@@ -160,14 +198,17 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   past `DETACHED_SLOW` (60 s) is logged once; errors go to the log with the generation's name and never count toward
   its health window; `status().detached` = `{ running, started, finished, failed, slow, max, oldest?, lastError? }`. A
   job keeps the old generation's closures (and what they reference) alive until it ends.
-- Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules) and
+- Tests (Lune): `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules),
+  `lune run scripts/test-access.luau`, `lune run scripts/test-fleet.luau` (0.3.9: the fleet sender's backoff, hold and
+  log lines on a fake clock) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
   `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, `--durable`, 0.3.6's `--hold`, `--hold-optout`,
   `--peers`, `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
   `--kernel-crash`, `--heads-cap`, `--access`, 0.3.7's `--health-config` and `--health-missing`, 0.3.8's
   `--messaging`, `--messaging-studio`, `--messaging-missing`, `--client-boot`, `--client-own`, `--settings`,
-  `--settings-missing` and `--detached`, and `--boot-budget`, which runs 25 boot scenarios with simulated slow or failing dependencies and
+  `--settings-missing` and `--detached`, 0.3.9's `--rollback-prev`, and `--boot-budget`, which runs 25 boot scenarios
+  with simulated slow or failing dependencies and
   checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
   [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.

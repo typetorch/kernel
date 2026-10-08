@@ -14,6 +14,13 @@
 -- Nothing here ever blocks a swap: one sender thread, a bounded queue (reports, alerts), one coalesced heartbeat slot
 -- (its body is built when it is sent, so it is always current), retries after FLEET_RETRY_DELAYS for no answer, 429 and
 -- 5xx, and a FLEET_RATE_PER_MINUTE token bucket.
+--
+-- 0.3.9 (problem 23, "NetFail errors"): an unreachable API (a restarting or dead quick tunnel) no longer gets ~4 POSTs
+-- per 30 s from every server in lockstep. Every wait is jittered (FLEET_JITTER); after a request's retries all failed
+-- the sender backs off exponentially (FLEET_HEARTBEAT_SECONDS doubling up to FLEET_BACKOFF_MAX); a 401/403/404 holds it
+-- off FLEET_AUTH_HOLD s; one success resets it. One warning line a minute at most, with the reason (NetFail: the
+-- connection broke mid-request; DnsResolve / 530: a stale trycloudflare URL; 401/403: the wrong token), and one line
+-- when it works again. Fleet.info() has `failures` (failed requests in a row) and `retryIn` (seconds, while waiting).
 
 local Constants = require(game:GetService("ReplicatedStorage"):WaitForChild("TypeTorchKernelShared"):WaitForChild("Constants"))
 
@@ -49,6 +56,8 @@ local tokens, tokensAt = 10, os.clock()
 local stats = { sent = 0, failed = 0, dropped = 0, lastOkAt = nil, lastError = nil, lastErrorAt = nil, lastStatus = nil, alerts = 0 }
 local alertAt: { [string]: number } = {}
 local warnedAt: { [string]: number } = {}
+-- 0.3.9: the current outage: failed requests and failed cycles in a row, when the sender may try again, since when.
+local outage = { failures = 0, cycles = 0, untilAt = 0, since = nil, reason = nil, loggedAt = -math.huge }
 
 function Fleet.configure(overrides)
 	for key, value in overrides do
@@ -163,8 +172,78 @@ local function takeToken(): (boolean, number)
 	return false, (1 - tokens) / rate
 end
 
--- One POST (yields). Returns (ok, retry): retry = worth trying again (no answer, 429, 5xx).
-local function post(path: string, body): (boolean, boolean)
+-- 0.3.9: `seconds` +-FLEET_JITTER, so servers that failed together don't retry together.
+local function jittered(seconds: number): number
+	local spread = Constants.FLEET_JITTER or 0.25
+	return seconds * (1 - spread + 2 * spread * math.random())
+end
+
+-- 0.3.9: what a failure means, in words a person can act on.
+local function hintFor(code: number?, errorText: string?): string
+	local text = errorText or ""
+	if code == 401 or code == 403 then
+		return "the fleet token is wrong (settings.fleet.token: run typetorch fleet setup)"
+	elseif code == 404 then
+		return "no fleet API at this URL (check settings.fleet.url: typetorch fleet setup)"
+	elseif code == 530 or string.find(text, "DnsResolve", 1, true) then
+		return "the host doesn't resolve: a stale trycloudflare URL? (restart the fleet API, then typetorch fleet setup)"
+	elseif string.find(text, "NetFail", 1, true) then
+		return "the connection broke mid-request (a restarting quick tunnel?)"
+	elseif code == 429 then
+		return "the fleet API rate-limits this server"
+	elseif typeof(code) == "number" and code >= 500 then
+		return "the fleet API failed"
+	elseif typeof(code) == "number" then
+		return "the fleet API refused the request"
+	end
+	return "no answer"
+end
+
+-- 0.3.9: one warning line per FLEET_LOG_GAP s at most.
+local function outageLine(text: string)
+	local now = os.clock()
+	if now - outage.loggedAt < (Constants.FLEET_LOG_GAP or 60) then
+		return
+	end
+	outage.loggedAt = now
+	deps.warn(text)
+end
+
+-- 0.3.9: a request answered: an outage (if any) is over.
+local function noteSuccess()
+	if outage.failures > 0 then
+		local seconds = if outage.since then math.floor(os.clock() - outage.since + 0.5) else 0
+		deps.print(`[TypeTorch] fleet API: heartbeats work again (after {outage.failures} failed request(s) in {seconds} s)`)
+	end
+	outage.failures, outage.cycles, outage.untilAt, outage.since, outage.reason = 0, 0, 0, nil, nil
+end
+
+-- 0.3.9: a request failed (each try counts).
+local function noteFailure(reason: string)
+	outage.failures += 1
+	outage.since = outage.since or os.clock()
+	outage.reason = reason
+end
+
+-- 0.3.9: a request and all its retries failed (or a 401/403/404, `hold`): nothing is sent until the backoff ends.
+local function noteFailedCycle(code: number?, errorText: string?)
+	local hold = code == 401 or code == 403 or code == 404
+	local host = if settings then settings.host else "?"
+	if typeof(code) == "number" and code >= 400 and code < 500 and not hold and code ~= 429 then
+		-- Another 4xx (a body the API refused): the API is up, so no backoff; the request was dropped.
+		outageLine(`[TypeTorch] fleet API {host} answered {code}: {hintFor(code, errorText)}; that request was dropped`)
+		return
+	end
+	outage.cycles += 1
+	local wait = if hold
+		then jittered(Constants.FLEET_AUTH_HOLD or 300)
+		else jittered(math.min(Constants.FLEET_BACKOFF_MAX or 300, Constants.FLEET_HEARTBEAT_SECONDS * 2 ^ (outage.cycles - 1)))
+	outage.untilAt = os.clock() + wait
+	outageLine(`[TypeTorch] fleet API {host} {if hold then "refused" else "unreachable"} ({outage.reason or "?"}): {hintFor(code, errorText)}; {outage.failures} failed request(s) in a row, next try in {math.ceil(wait)} s`)
+end
+
+-- One POST (yields). Returns (ok, retry, code?, errorText?): retry = worth trying again (no answer, 429, 5xx).
+local function post(path: string, body): (boolean, boolean, number?, string?)
 	local current = settings
 	if not current then
 		return false, false
@@ -185,6 +264,7 @@ local function post(path: string, body): (boolean, boolean)
 		stats.sent += 1
 		stats.lastOkAt = os.time()
 		stats.lastStatus = response.StatusCode
+		noteSuccess()
 		return true, false
 	end
 	stats.failed += 1
@@ -192,17 +272,15 @@ local function post(path: string, body): (boolean, boolean)
 	if not ok then
 		stats.lastError = scrub(response, 200)
 		stats.lastStatus = nil
-		warnOnce("network", `[TypeTorch] fleet {path}: {stats.lastError}`)
-		return false, true
+		noteFailure(stats.lastError)
+		return false, true, nil, stats.lastError
 	end
 	local code = if typeof(response) == "table" then response.StatusCode else nil
 	stats.lastStatus = code
 	stats.lastError = `HTTP {tostring(code)}`
+	noteFailure(`{path}: HTTP {tostring(code)}`)
 	local retry = code == 429 or (typeof(code) == "number" and code >= 500)
-	if not retry then
-		warnOnce(`http{tostring(code)}`, `[TypeTorch] fleet API answered {tostring(code)} to {path}{if code == 401 or code == 403 then ` (check settings.fleet.token: typetorch fleet setup)` else ""}; dropped`)
-	end
-	return false, retry
+	return false, retry, if typeof(code) == "number" then code else nil, stats.lastError
 end
 
 -- The heartbeat body: the fleet status without `k` (a reserved server's access code stays in the universe), plus j.
@@ -232,6 +310,9 @@ local function step(): boolean
 		return false
 	end
 	local now = os.clock()
+	if now < outage.untilAt then
+		return false -- 0.3.9: backing off (an outage) or held off (a 401/403/404)
+	end
 	local index = nil
 	for position, item in queue do
 		if item.nextAt <= now then
@@ -250,7 +331,7 @@ local function step(): boolean
 	end
 	if index then
 		local item = queue[index]
-		local ok, retry = post(item.path, item.body)
+		local ok, retry, code, errorText = post(item.path, item.body)
 		local still = table.find(queue, item)
 		if ok or not retry or item.attempts >= #Constants.FLEET_RETRY_DELAYS then
 			if still then
@@ -258,21 +339,25 @@ local function step(): boolean
 			end
 			if not ok then
 				stats.dropped += 1
+				noteFailedCycle(code, errorText) -- 0.3.9
 			end
 		else
 			item.attempts += 1
-			item.nextAt = os.clock() + Constants.FLEET_RETRY_DELAYS[item.attempts]
+			item.nextAt = os.clock() + jittered(Constants.FLEET_RETRY_DELAYS[item.attempts])
 		end
 		return true
 	end
 	heartbeat.due = false
 	heartbeat.lastAt = now
-	local ok, retry = post("/v1/fleet/heartbeat", heartbeatBody())
+	local ok, retry, code, errorText = post("/v1/fleet/heartbeat", heartbeatBody())
 	if ok or not retry or heartbeat.attempts >= #Constants.FLEET_RETRY_DELAYS then
 		heartbeat.attempts, heartbeat.nextAt = 0, 0
+		if not ok then
+			noteFailedCycle(code, errorText) -- 0.3.9: back off (or hold off) before the next one
+		end
 	else
 		heartbeat.attempts += 1
-		heartbeat.nextAt = os.clock() + Constants.FLEET_RETRY_DELAYS[heartbeat.attempts]
+		heartbeat.nextAt = os.clock() + jittered(Constants.FLEET_RETRY_DELAYS[heartbeat.attempts])
 		heartbeat.due = true
 	end
 	return true
@@ -381,6 +466,9 @@ function Fleet.info()
 		lastError = stats.lastError,
 		lastErrorAt = stats.lastErrorAt,
 		lastStatus = stats.lastStatus,
+		-- 0.3.9: failed requests in a row (0 once one works), and the seconds until the next try while backing off.
+		failures = outage.failures,
+		retryIn = if outage.untilAt > os.clock() then math.ceil(outage.untilAt - os.clock()) else nil,
 	}
 end
 

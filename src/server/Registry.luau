@@ -9,11 +9,14 @@
 --     (`branches` and `deployments` stay empty since 0.3.8: heads and history come from the stores below).
 --   * In-game DataStore "TypeTorch" for what game servers write themselves (no Open Cloud scope needed):
 --       heads                      { [branch] = { assetId, artifactId, seq, commit, channel, deployedAt, rollout?, t?,
---                                  rollback?, sig?, sigF? } } (from deploy messages, and since 0.3.5 the CLI's durable
---                                  copy; higher seq wins, but a signed prod head (0.3) is never replaced by an unsigned
---                                  one; mirrored in MemoryStore HashMap "TypeTorch" for polling; see "Branch heads"
---                                  below). Game code can write these stores, so prod servers (0.3) only follow heads
---                                  whose signatures check out (Signing.luau).
+--                                  rollback?, sig?, sigF?, prev? } } (from deploy messages, and since 0.3.5 the CLI's
+--                                  durable copy; higher seq wins, but a signed prod head (0.3) is never replaced by an
+--                                  unsigned one; mirrored in MemoryStore HashMap "TypeTorch" for polling; see "Branch
+--                                  heads" below). Game code can write these stores, so prod servers (0.3) only follow
+--                                  heads whose signatures check out (Signing.luau). 0.3.9: `prev` = the branch's last
+--                                  PREV_HEADS_KEPT heads before this one, newest first, same shape without `prev`, kept
+--                                  by the CLI and by the kernel's durable writes, in the DataStore copy only (/tt
+--                                  rollback on a server with no earlier generation; Registry.previousHeads).
 --       private/<PrivateServerId>  { branch, setBy, setAt, pin?, code? } (private and reserved servers' branch; `pin` =
 --                                  { assetId, artifactId, seq, commit, channel, branch, headSeq } boots that artifact
 --                                  until the branch gets a deploy newer than headSeq; `code` (0.3.2) = a reserved
@@ -301,6 +304,74 @@ local function admitsBranch(heads: any, branch: string): boolean
 end
 Registry.admitsBranch = admitsBranch
 
+-- 0.3.9: one entry of a head's `prev` list: the head's own fields, type-checked, never a `prev` of its own.
+local function prevEntry(head): any?
+	if not isHead(head) then
+		return nil
+	end
+	local function text(value, max: number): string?
+		return if typeof(value) == "string" and #value <= max then value else nil
+	end
+	return {
+		assetId = head.assetId,
+		artifactId = text(head.artifactId, 100),
+		seq = if typeof(head.seq) == "number" then head.seq else nil,
+		commit = text(head.commit, 64),
+		channel = if head.channel == "prod" or head.channel == "dev" then head.channel else nil,
+		deployedAt = text(head.deployedAt, 40),
+		rollback = if head.rollback == true then true else nil,
+		r = if head.r == 1 or head.r == "resign" then head.r else nil,
+		t = if typeof(head.t) == "number" then head.t else nil,
+		sig = text(head.sig, 100),
+		sigF = text(head.sigF, 100),
+	}
+end
+
+-- 0.3.9: `head` as the durable copy stores it over `stored` (the branch's head there before): a copy whose `prev` is
+-- `stored` and its own `prev`, newest first, at most PREV_HEADS_KEPT, never `head` itself. The same deploy written again
+-- (another rollout %) keeps the list it had.
+local function withPrev(head, stored): any
+	local copy = table.clone(head)
+	copy.prev = nil
+	local list, seen = {}, {}
+	local function add(entry)
+		local clean = prevEntry(entry)
+		if not clean or #list >= (Constants.PREV_HEADS_KEPT or 3) then
+			return
+		end
+		if clean.assetId == copy.assetId and clean.seq == copy.seq then
+			return
+		end
+		local key = `{clean.assetId}#{tostring(clean.seq)}`
+		if not seen[key] then
+			seen[key] = true
+			table.insert(list, clean)
+		end
+	end
+	if isHead(stored) then
+		if not (stored.assetId == head.assetId and stored.seq == head.seq) then
+			add(stored)
+		end
+		if typeof(stored.prev) == "table" then
+			for _, entry in stored.prev do
+				add(entry)
+			end
+		end
+	end
+	copy.prev = if #list > 0 then list else nil
+	return copy
+end
+
+-- 0.3.9: MemoryStore copies never carry `prev` (a hash map item is at most 32 KB; the fast copy is for polling).
+local function withoutPrev(head): any
+	if typeof(head) ~= "table" or head.prev == nil then
+		return head
+	end
+	local copy = table.clone(head)
+	copy.prev = nil
+	return copy
+end
+
 -- Keeps the newer head per branch (by seq) from a { [branch] = head } table.
 local function mergeHeads(into: { [string]: any }, from: any): boolean
 	if typeof(from) ~= "table" then
@@ -360,7 +431,7 @@ local function writeMemoryBack(newer: { [string]: any })
 				local changed = false
 				for branch, head in newer do
 					if replaces(heads[branch], head, branch) and admitsBranch(heads, branch) then
-						heads[branch] = head
+						heads[branch] = withoutPrev(head)
 						changed = true
 					end
 				end
@@ -516,7 +587,7 @@ function Registry.saveHead(branch: string, head, deployments: { any }?)
 					won = false
 					return nil -- another server already stored this deploy (or a newer one), or the key is full
 				end
-				heads[branch] = head
+				heads[branch] = withoutPrev(head)
 				won = true
 				return heads
 			end, HEADS_TTL)
@@ -532,7 +603,7 @@ function Registry.saveHead(branch: string, head, deployments: { any }?)
 				if not replaces(stored, head, branch) or not admitsBranch(heads, branch) then
 					return nil
 				end
-				heads[branch] = head
+				heads[branch] = withPrev(head, stored) -- 0.3.9: the head it replaces goes into `prev`
 				return heads
 			end)
 		end)
@@ -550,6 +621,47 @@ function Registry.storedBranches(): { string }
 		table.insert(names, name)
 	end
 	return names
+end
+
+-- 0.3.9: the branch's heads, newest first by seq: its head in the durable copy and that head's `prev` list (read now:
+-- one DataStore GetAsync, so callers are rare dev actions like /tt rollback), plus what this server holds. Entries are
+-- type-checked copies (prevEntry) and UNTRUSTED: game code can write the store, so the kernel checks each one like a
+-- current head. Returns (list, readError?). Records written before 0.3.9 have no `prev` (just the head).
+function Registry.previousHeads(branch: string): ({ any }, string?)
+	local list, seen = {}, {}
+	local function add(head)
+		local clean = prevEntry(head)
+		if clean then
+			local key = `{clean.assetId}#{tostring(clean.seq)}`
+			if not seen[key] then
+				seen[key] = true
+				table.insert(list, clean)
+			end
+		end
+	end
+	local function addWithPrev(head)
+		if isHead(head) then
+			add(head)
+			if typeof(head.prev) == "table" then
+				for index, entry in head.prev do
+					if typeof(index) == "number" and index <= 10 then
+						add(entry)
+					end
+				end
+			end
+		end
+	end
+	local ok, value = pcall(function()
+		return getStore():GetAsync(HEADS_KEY)
+	end)
+	if ok and typeof(value) == "table" then
+		addWithPrev(value[branch])
+	end
+	addWithPrev(storedHeads[branch])
+	table.sort(list, function(a, b)
+		return (a.seq or -1) > (b.seq or -1)
+	end)
+	return list, if ok then nil else tostring(value)
 end
 
 -- The branch's stored head (0.3.8: the only source; the ConfigService head is gone). 0.3: with `accept`, only a head it

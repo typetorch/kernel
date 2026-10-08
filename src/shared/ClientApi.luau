@@ -31,7 +31,11 @@ function ClientApi.forEntry(entry: LocalScript)
 		artifact = if generation.artifact then table.clone(generation.artifact) else { id = generation.artifactId },
 		generation = generation.number,
 		branch = generation.branch,
+		-- 0.3.9: `channel` keeps the server's RULES (older frameworks gate on it); `rules` by name; `branchChannel` = what
+		-- the branch is (nil on a 0.3.8 server).
 		channel = generation.channel,
+		rules = generation.channel,
+		branchChannel = generation.branchChannel,
 		-- 0.2.2: the server type and how this client generation started ({ kind, reason, previous?, branchChanged,
 		-- startedAt }; a client's first generation is kind "boot", reason "boot").
 		serverType = generation.serverType,

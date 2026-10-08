@@ -7,7 +7,7 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.3.8",
+	KERNEL_VERSION = "0.3.9",
 
 	-- The kernel's DataStore: durable heads, deployments, private records, events, and (0.3.8) the signed settings.
 	DATASTORE = "TypeTorch",
@@ -112,6 +112,15 @@ return {
 	FLEET_WATCH_SECONDS = 5,
 	-- A failed request (no answer, HTTP 429 or 5xx) is retried after these delays, then dropped; other 4xx: dropped.
 	FLEET_RETRY_DELAYS = { 1, 3, 9 },
+	-- 0.3.9 (NetFail errors from a dead quick tunnel, every server in lockstep): every wait gets +-FLEET_JITTER. A request
+	-- whose retries all failed is a failed cycle: the sender then waits FLEET_HEARTBEAT_SECONDS x 2^(n-1) for the n-th
+	-- failed cycle in a row, at most FLEET_BACKOFF_MAX s; a 401, 403 or 404 holds it off FLEET_AUTH_HOLD s (a wrong
+	-- token or URL won't fix itself). One success resets both. At most one "unreachable" line (with the reason) per
+	-- FLEET_LOG_GAP s, and one "work again" line after an outage.
+	FLEET_JITTER = 0.25,
+	FLEET_BACKOFF_MAX = 300,
+	FLEET_AUTH_HOLD = 300,
+	FLEET_LOG_GAP = 60,
 	-- Reports, alerts and closing requests waiting at most (the oldest go first when it is full).
 	FLEET_QUEUE_MAX = 100,
 	-- At most this many requests per minute (burst 10), whatever happens: HttpService's 500/min is the game's too.
@@ -247,4 +256,22 @@ return {
 	KERNEL_SCREEN_ATTRIBUTE = "TypeTorchKernelScreen",
 	BOOT_SCREEN_WAIT = 5,
 	BOOT_SCREEN_TIMEOUT = 60,
+
+	-- 0.3.9 THE HOLD, AFTER "Starting..." STAYED UP ON A RUNNING SERVER. ReplicatedFirst is replicated once, when a player
+	-- joins (later server changes there don't reach that client), so the `Hold` attribute on the kernel client script is
+	-- only the join snapshot; ReplicatedStorage.TypeTorch's `Hold` (with `HoldReason`) is the live value clients follow.
+	-- The server releases a "start" hold the watchdog still finds on while a generation runs, after HOLD_STUCK_RELEASE s
+	-- (a bookkeeping bug: warned). The client drops its "Starting..." screen by itself when its own generation runs, the
+	-- server has an ActiveGeneration, and the hold still says "start" after CLIENT_HOLD_FAILSAFE s (warned with the state
+	-- it saw; "move" holds are real and never dropped). KernelClient hard-codes the client value (it runs before this
+	-- module can be required).
+	HOLD_STUCK_RELEASE = 3,
+	CLIENT_HOLD_FAILSAFE = 5,
+	-- ScreenGui DisplayOrders: the holding screen covers every game UI; the framework's dev menu (and its button) sits
+	-- above it (HOLD_DISPLAY_ORDER + 100), so a dev can open it while the screen is up.
+	HOLD_DISPLAY_ORDER = 2147483000,
+	-- 0.3.9 /tt rollback on a server with no earlier generation: the branch's previous heads. The CLI (and the kernel's own
+	-- durable writes) keep the last PREV_HEADS_KEPT heads of a branch as `prev` (newest first) on heads.<branch> in the
+	-- DataStore copy only (MemoryStore copies never carry it: a hash map item is at most 32 KB).
+	PREV_HEADS_KEPT = 3,
 }
