@@ -53,6 +53,8 @@ local Fallback = {}
 
 -- Set by the kernel (Fallback.configure); see the kernel's "Never an empty server" block for each one.
 local deps = {
+	-- 0.4.0: (kind, op) counts a kernel request for the budget view (Budget.count).
+	count = function(_kind, _op) end,
 	startedAt = os.clock(),
 	jobId = "",
 	placeId = 0,
@@ -425,6 +427,7 @@ local function rollCall(fresh: boolean?): any
 	local rows, count = {}, 0
 	local state = { subscribed = false, failure = nil, abandoned = false, connection = nil }
 	task.spawn(function()
+		deps.count("messaging", "subscribe")
 		local ok, connection = pcall(MessagingService.SubscribeAsync, MessagingService, `{Constants.PEER_TOPIC}/{jobId}`, function(message)
 			local reply = decode(message and message.Data)
 			if typeof(reply) ~= "table" or reply.q ~= q or not validJob(reply.j) or reply.j == jobId then
@@ -446,6 +449,7 @@ local function rollCall(fresh: boolean?): any
 			return
 		end
 		state.connection = connection
+		deps.count("messaging", "publish")
 		local published, err = pcall(MessagingService.PublishAsync, MessagingService, Constants.DEPLOY_TOPIC, encode({ rc = 1, q = q, j = jobId, b = branch, t = nowMs() }))
 		if published then
 			peers.asks += 1
@@ -1156,6 +1160,7 @@ do
 			if #body > 950 then
 				return
 			end
+			deps.count("messaging", "publish")
 			local ok, err = pcall(MessagingService.PublishAsync, MessagingService, `{Constants.PEER_TOPIC}/{data.j}`, body)
 			if ok then
 				peers.answered += 1

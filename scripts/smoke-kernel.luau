@@ -958,7 +958,7 @@ end
 
 local kernelFolder = newInstance("Folder", "TypeTorchKernel")
 kernelFolder.Parent = services.ServerScriptService
-for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Messaging = "Messaging.luau", Settings = "Settings.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
+for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Messaging = "Messaging.luau", Budget = "Budget.luau", Errors = "Errors.luau", Settings = "Settings.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
 	sourceInstance(if name == "Kernel" then "Script" else "ModuleScript", name, `src/server/{file}`).Parent = kernelFolder
 end
 local entryTemplate = sourceInstance("Script", "Entry", "src/server/Entry.server.luau")
@@ -1067,6 +1067,11 @@ local MODES38 = {
 	-- finds no earlier generation here and uses the branch's previous heads (`prev` on the durable head): an unsigned one
 	-- is refused (signed server), the signed H1 runs; the kernel's own durable write keeps `prev`, MemoryStore never.
 	rollbackPrev = table.find(process.args, "--rollback-prev") ~= nil,
+	-- 0.4.0 `--errors` (plans/21 C): a public prod server whose signed settings hold `backend` (and an old `fleet` that
+	-- must be ignored): heartbeats with the budget summary `bu` to <url>/v1/fleet/heartbeat, a server error and a client
+	-- batch templated and posted to <url>/v1/errors with the player's pid, status().errors / status().budget,
+	-- api:budget() and api:budgetCount.
+	errors = table.find(process.args, "--errors") ~= nil,
 }
 -- 0.3.8 loading screens (plans/19 item 13), client side: `--client-boot` (the game's BootScreen replaces the kernel's
 -- "Starting..." until the first client generation runs and the server's hold ends), `--client-own` (KernelScreen =
@@ -1746,6 +1751,15 @@ end
 if MODES38.settingsMissing then
 	kernelFolder.Settings.Parent = nil
 end
+if MODES38.errors then
+	dataStore.data.settings = deepCopy(SMOKE.settings.backend)
+	Constants.FLEET_HEARTBEAT_SECONDS = 0.5
+	Constants.FLEET_RATE_PER_MINUTE = 6000
+	Constants.FLEET_SETTINGS_SECONDS = 0.5
+	Constants.ERRORS_FLUSH_SECONDS = 0.3
+	Constants.ERRORS_RATE_PER_MINUTE = 6000
+	Constants.ERRORS_CLIENT_SERVER_GAP = 0
+end
 if FALLBACK_MODE then
 	dataStore.data.settings = deepCopy(SMOKE.settings.s1) -- the key asset never loads: the record verifies by sigF
 end
@@ -1886,7 +1900,7 @@ local function finish()
 	check(`no unexpected errors on kernel threads{if #unexpected > 0 then ": " .. unexpected[1] else ""}`, #unexpected == 0)
 	check(`no swap ran on a thread its own stopped generation owned (busy-flag hazard){if #hazards > 0 then ": " .. hazards[1] else ""}`, #hazards == 0)
 	check("the kernel never used a MemoryStore sorted map (0.3.2: fleet status and reports are API only)", #sortedMapRequests == 0)
-	if not FLEET_MODE and not SWITCH_MODE and not FALLBACK_FLEET and not ACCESS_MODE then
+	if not FLEET_MODE and not SWITCH_MODE and not FALLBACK_FLEET and not ACCESS_MODE and not MODES38.errors then
 		check("no HTTP request without settings.fleet", #httpRequests == 0)
 	end
 	local leaked = false
@@ -1912,7 +1926,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if MODES38.rollbackPrev then "--rollback-prev" elseif MODES38.detached then "--detached" elseif MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if MODES38.errors then "--errors" elseif MODES38.rollbackPrev then "--rollback-prev" elseif MODES38.detached then "--detached" elseif MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -3874,6 +3888,100 @@ if MODES38.detached then
 	finish()
 end
 
+if MODES38.errors then
+	local BASE = "https://backend.example.test/api"
+	local function posts(path: string)
+		local list = {}
+		for _, request in httpRequests do
+			if request.url == BASE .. path then
+				table.insert(list, request)
+			end
+		end
+		return list
+	end
+	local function postedItem(match: (any) -> boolean)
+		for _, request in posts("/v1/errors") do
+			for _, item in request.body.errors do
+				if match(item) then
+					return item, request
+				end
+			end
+		end
+		return nil, nil
+	end
+	check("errors: boots", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() == "aaaaaaa-111111"
+	end))
+	check("errors: settings.backend wins over settings.fleet: heartbeats go to <url>/v1/fleet/heartbeat with its key", waitFor("heartbeat", function()
+		local list = posts("/v1/fleet/heartbeat")
+		return #list > 0 and list[1].headers.Authorization == "Bearer " .. FLEET_TOKEN
+	end) and status().fleet.source == "backend" and status().fleet.host == "backend.example.test")
+	check("errors: heartbeats carry the budget summary bu (limits for the player count)", waitFor("bu", function()
+		local list = posts("/v1/fleet/heartbeat")
+		local body = list[#list].body
+		return body.bu ~= nil and body.bu.ds.lr == 60 + 40 * #fakePlayers and body.bu.h.l == 500 and body.bu.by.k ~= nil
+	end))
+	local rider = joinPlayer(424242424, "Rider", nil, false)
+	rider.DisplayName = "Speedy"
+	services.Players.PlayerAdded:Fire(rider)
+	check("errors: api:setAnalyticsId takes a pid (refuses junk)", SMOKE.kernel:setAnalyticsId(rider, "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f") == true and SMOKE.kernel:setAnalyticsId(rider, "not a pid") == false)
+	services.ScriptContext.Error:Fire("ServerStorage.TypeTorch.Generations.aaaaaaa-111111#1.Server.round:12: Rider (424242424) fell", "ServerStorage.TypeTorch.Generations.aaaaaaa-111111#1.Server.round:12 function fall", nil)
+	local item, request = nil, nil
+	check("errors: a server error is posted to <url>/v1/errors", waitFor("errors post", function()
+		item, request = postedItem(function(entry)
+			return entry.realm == "server" and string.find(entry.template, "fell", 1, true) ~= nil
+		end)
+		return item ~= nil
+	end, 4))
+	check("errors: { v = 1, j = JobId } with the key", request ~= nil and request.body.v == 1 and request.body.j == JOB and request.headers.Authorization == "Bearer " .. FLEET_TOKEN)
+	check("errors: templated (name, UserId, the generation), no name left", item ~= nil and item.template == "ServerStorage.TypeTorch.Generations.<gen>.Server.round:12: <player.name> (<player.user_id>) fell")
+	check("errors: fingerprint, count, branch, build, stack, the named player's pid", item ~= nil and #item.fp == 16 and item.count == 1 and item.branch == "prod" and item.build == "aaaaaaa-111111" and item.stack == "ServerStorage.TypeTorch.Generations.<gen>.Server.round:12 function fall" and item.pids ~= nil and item.pids[1] == "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f")
+	local net = services.ReplicatedStorage.TypeTorch.Net
+	net.OnServerEvent:Fire(rider, "*", "__tt/errors", { e = { { m = "Players.Rider.PlayerScripts.ui:3: Speedy's bar is nil", s = "Players.Rider.PlayerScripts.ui:3", n = 4, g = "aaaaaaa-111111#1" } }, d = 2 })
+	local clientItem = nil
+	check("errors: a client batch (kernel channel __tt/errors) is templated on the server and posted", waitFor("client post", function()
+		clientItem = postedItem(function(entry)
+			return entry.realm == "client"
+		end)
+		return clientItem ~= nil
+	end, 4) and clientItem.template == "Players.<player.name>.PlayerScripts.ui:3: <player.display_name>'s bar is nil" and clientItem.count == 4 and clientItem.pids[1] == "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f" and clientItem.build == "aaaaaaa-111111")
+	local info = status().errors
+	check("errors: status().errors counts (seen, sent, the client's drops) and shows templates only", info.enabled and info.seen.server >= 1 and info.seen.client == 4 and info.sent >= 2 and info.dropped.client == 2 and info.host == "backend.example.test" and #info.top >= 2)
+	local leaked = false
+	for _, entry in httpRequests do
+		local text = serde.encode("json", entry.body)
+		leaked = leaked or string.find(text, "Rider", 1, true) ~= nil or string.find(text, "Speedy", 1, true) ~= nil or string.find(text, "424242424", 1, true) ~= nil
+	end
+	check("errors: no player name or UserId in any request body", not leaked)
+	local old = false
+	for _, entry in httpRequests do
+		old = old or string.find(entry.url, "old-fleet", 1, true) ~= nil
+	end
+	check("errors: nothing goes to the old settings.fleet URL", not old)
+	local snapshot = SMOKE.kernel:budget()
+	local function used(kind: string, name: string): number
+		for _, row in snapshot.kinds[kind].rows do
+			if row.name == name then
+				return row.used
+			end
+		end
+		return -1
+	end
+	local labels = {}
+	for _, row in snapshot.detail do
+		labels[`{row.caller}/{row.kind}/{row.op}`] = row.total
+	end
+	check("budget: the kernel's DataStore reads (settings, heads) and MemoryStore units are counted", used("datastore", "read") > 0 and (snapshot.kinds.datastore.callers.kernel or 0) > 0 and used("memorystore", "units") > 0)
+	check("budget: HTTP per label (fleet heartbeats, error reports)", (labels["kernel/http/fleet"] or 0) > 0 and (labels["kernel/http/errors"] or 0) >= 2)
+	check("budget: the kernel's subscriptions (deploy, pin, rekey)", used("messaging", "subscribe") >= 3)
+	SMOKE.kernel:budgetCount("analytics", "datastore", "read", 2)
+	SMOKE.kernel:budgetCount("kernel", "http", "sneaky", 1)
+	snapshot = SMOKE.kernel:budget()
+	check("budget: api:budgetCount counts for its caller (never as the kernel)", snapshot.kinds.datastore.callers.analytics == 2 and snapshot.kinds.http.callers.game == 1)
+	check("budget: status().budget is the heartbeat summary; the snapshot lists the running generation", status().budget ~= nil and status().budget.h.l == 500 and snapshot.generations[1] ~= nil and snapshot.generations[1].running == true)
+	finish()
+end
+
 if ACCESS_MODE then
 	check("access: boots", waitFor("boot", function()
 		return SMOKE.kernel ~= nil and running() ~= nil
@@ -3997,7 +4105,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.3.9")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.4.0")
 
 -- 0.3.8: no settings record here (a game that never ran `typetorch settings push`): the defaults, reported as missing.
 do

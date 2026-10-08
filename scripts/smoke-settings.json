@@ -86,5 +86,13 @@
 		"body": "{\"access\":{\"devBadgeId\":null,\"members\":{\"5\":\"owner\"},\"revoked\":{}},\"analytics\":{\"backend\":\"duckdb\",\"events\":\"https://analytics.example.test/v1/ingest\",\"token\":\"analytics-ingest-token-0123456789\"},\"channels\":{\"dev\":\"dev\",\"prod\":\"prod\"},\"defaultBranch\":\"prod\",\"game\":{\"shop.price\":999}}",
 		"sig": "ZlvEq2jKRgOug6IjRTbWu1980/NBrmwU8CneEBau77YBigWA03l+Gds11JwAspDG0CmLCTCrZEZS4oJAc8imDg==",
 		"sigF": "0s6WEHZqO9zy91MBi7Jiv6OuoiusvTDyiE+c00jJ0Bamo+y0KlhHOLT/Rjo2zyvhX1OoFopSHUmLiADpcuiABQ=="
+	},
+	"backend": {
+		"v": 1,
+		"seq": 1,
+		"at": "2026-10-09T12:00:00.000Z",
+		"body": "{\"backend\":{\"key\":\"smoke-fleet-token-0123456789abcdef\",\"url\":\"https://backend.example.test/api\"},\"fleet\":{\"token\":\"smoke-old-fleet-token-0123456789\",\"url\":\"https://old-fleet.example.test\"}}",
+		"sig": "4tBNAcCF9RMTJTv1gUhHI4V2HrcxOiqXGJWBpc3e/M3CUyhKFEIXeNvThGZS5HlAGCHg/DPEnUeXDeQqC5tSAA==",
+		"sigF": "QntfRhLQEgkdomNQdlfndLdRL0QaqOMSS32G6Fr0E1N/jwWyGOg5v/JgrX/Bj2rMMSOlaWilsePvZYUNh8EKAQ=="
 	}
 }

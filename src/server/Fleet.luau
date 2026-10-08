@@ -21,6 +21,10 @@
 -- off FLEET_AUTH_HOLD s; one success resets it. One warning line a minute at most, with the reason (NetFail: the
 -- connection broke mid-request; DnsResolve / 530: a stale trycloudflare URL; 401/403: the wrong token), and one line
 -- when it works again. Fleet.info() has `failures` (failed requests in a row) and `retryIn` (seconds, while waiting).
+--
+-- 0.4.0 (plans/21 C, one backend): the settings' `backend` = { url, key, analytics? } is read first (`fleet` = { url,
+-- token } only while `backend` is missing; Fleet.info().source says which). The same URL and key serve the error
+-- reports (Errors.luau, through Fleet.target()). Heartbeats carry the budget summary under `bu` (deps.heartbeatExtra).
 
 local Constants = require(game:GetService("ReplicatedStorage"):WaitForChild("TypeTorchKernelShared"):WaitForChild("Constants"))
 
@@ -30,11 +34,17 @@ local deps = {
 	http = nil, -- HttpService
 	jobId = "",
 	active = false, -- a live server (JobId, not Studio)
+	-- () -> (ok, value, source): ok = false until the settings were read; value = { url, key } or { url, token } (or
+	-- JSON); source = "backend" | "fleet".
 	readSettings = function()
-		return false, nil
+		return false, nil, nil
 	end,
 	status = function()
 		return {}
+	end,
+	-- 0.4.0: () -> table?: extra heartbeat fields (the kernel adds the budget summary `bu`).
+	heartbeatExtra = function()
+		return nil
 	end,
 	encode = nil, -- (table) -> string
 	decode = nil, -- (string) -> any
@@ -46,6 +56,7 @@ local deps = {
 local settingsState = "unknown"
 local settings = nil -- { url, token, host }
 local settingsError = nil
+local settingsSource = nil -- 0.4.0: "backend" | "fleet" (the settings field the URL and key came from)
 local settingsReadAt = -math.huge
 
 local queue = {} -- { path, body, attempts, nextAt }, oldest first
@@ -103,39 +114,43 @@ local function scrub(text: any, max: number): string
 	return string.sub(value, 1, max)
 end
 
--- { url, token } as a table or a JSON string. The url must be https (no trailing slash kept).
+-- { url, key } (0.4.0: settings.backend) or { url, token } (settings.fleet), as a table or a JSON string. The url must
+-- be https (no trailing slash kept). The key is kept as `token` here.
 local function parseSettings(value): (any?, string?)
 	if typeof(value) == "string" and deps.decode then
 		local ok, decoded = pcall(deps.decode, value)
 		value = if ok then decoded else nil
 	end
 	if typeof(value) ~= "table" then
-		return nil, "not a { url, token } table"
+		return nil, "not a { url, key } table"
 	end
-	local url, token = value.url, value.token
+	local url = value.url
+	local token = if value.key ~= nil then value.key else value.token
 	if typeof(url) ~= "string" or #url > 300 or not string.match(url, "^https://[%w%.%-]+[%w:%-%./_]*$") then
 		return nil, "url must be https://host[/path]"
 	end
 	if typeof(token) ~= "string" or #token < 8 or #token > 1000 or string.find(token, "[%c%s]") then
-		return nil, "token must be 8-1000 visible characters"
+		return nil, "the key must be 8-1000 visible characters"
 	end
 	url = string.gsub(url, "/+$", "")
 	return { url = url, token = token, host = string.match(url, "^https://([^/]+)") }, nil
 end
 
--- Takes the settings' `fleet` (the kernel's copy in memory, no web call). Not read yet: keep the last good ones.
+-- Takes the settings' `backend` (0.4.0; else `fleet`) from the kernel's copy in memory (no web call). Not read yet:
+-- keep the last good ones.
 function Fleet.refreshSettings()
 	if not deps.active then
 		return
 	end
 	settingsReadAt = os.clock()
-	local ok, value = deps.readSettings()
+	local ok, value, source = deps.readSettings()
+	source = if source == "fleet" then "fleet" else "backend"
 	if not ok then
 		return
 	end
 	if value == nil then
 		if settingsState ~= "absent" then
-			settingsState, settings, settingsError = "absent", nil, nil
+			settingsState, settings, settingsError, settingsSource = "absent", nil, nil, nil
 			table.clear(queue)
 			heartbeat.due = false
 		end
@@ -144,17 +159,17 @@ function Fleet.refreshSettings()
 	local parsed, why = parseSettings(value)
 	if not parsed then
 		if settingsState ~= "invalid" then
-			warnOnce("settings", `[TypeTorch] fleet settings (settings.fleet) ignored: {why}`)
+			warnOnce("settings", `[TypeTorch] backend settings (settings.{source}) ignored: {why}`)
 		end
-		settingsState, settings, settingsError = "invalid", nil, why
+		settingsState, settings, settingsError, settingsSource = "invalid", nil, why, source
 		table.clear(queue)
 		heartbeat.due = false
 		return
 	end
-	local first = settingsState ~= "ok"
-	settingsState, settings, settingsError = "ok", parsed, nil
+	local first = settingsState ~= "ok" or settingsSource ~= source or (settings and settings.host) ~= parsed.host
+	settingsState, settings, settingsError, settingsSource = "ok", parsed, nil, source
 	if first then
-		deps.print(`[TypeTorch] fleet API: {parsed.host}`)
+		deps.print(`[TypeTorch] backend: {parsed.host} (settings.{source})`)
 		heartbeat.due = true
 	end
 end
@@ -182,11 +197,11 @@ end
 local function hintFor(code: number?, errorText: string?): string
 	local text = errorText or ""
 	if code == 401 or code == 403 then
-		return "the fleet token is wrong (settings.fleet.token: run typetorch fleet setup)"
+		return if settingsSource == "fleet" then "the fleet token is wrong (settings.fleet.token: run typetorch backend setup)" else "the backend key is wrong (settings.backend.key: run typetorch backend setup)"
 	elseif code == 404 then
-		return "no fleet API at this URL (check settings.fleet.url: typetorch fleet setup)"
+		return `no fleet API at this URL (check settings.{settingsSource or "backend"}.url: typetorch backend setup)`
 	elseif code == 530 or string.find(text, "DnsResolve", 1, true) then
-		return "the host doesn't resolve: a stale trycloudflare URL? (restart the fleet API, then typetorch fleet setup)"
+		return "the host doesn't resolve: a stale trycloudflare URL? (restart the backend, then typetorch backend setup)"
 	elseif string.find(text, "NetFail", 1, true) then
 		return "the connection broke mid-request (a restarting quick tunnel?)"
 	elseif code == 429 then
@@ -289,6 +304,16 @@ local function heartbeatBody()
 	local body = if ok and typeof(status) == "table" then table.clone(status) else { sv = 2 }
 	body.k = nil
 	body.j = deps.jobId
+	-- 0.4.0: the budget summary (`bu`) and anything else the kernel adds; only on what goes to the backend (the roll
+	-- call and the analytics engine use api:fleetStatus() without it).
+	local extraOk, extra = pcall(deps.heartbeatExtra)
+	if extraOk and typeof(extra) == "table" then
+		for key, value in extra do
+			if body[key] == nil then
+				body[key] = value
+			end
+		end
+	end
 	return body
 end
 
@@ -469,7 +494,18 @@ function Fleet.info()
 		-- 0.3.9: failed requests in a row (0 once one works), and the seconds until the next try while backing off.
 		failures = outage.failures,
 		retryIn = if outage.untilAt > os.clock() then math.ceil(outage.untilAt - os.clock()) else nil,
+		-- 0.4.0: "backend" | "fleet": the settings field the URL and key came from (nil without settings).
+		source = settingsSource,
 	}
+end
+
+-- 0.4.0: the backend's { url, token (the key), host } for the other senders (Errors.luau), or nil (no usable settings,
+-- or not a live server). Never logged.
+function Fleet.target()
+	if not Fleet.enabled() or not settings then
+		return nil
+	end
+	return settings
 end
 
 return Fleet

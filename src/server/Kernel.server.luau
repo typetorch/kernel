@@ -44,6 +44,11 @@
 -- trusted sources): signatures on public servers, read-only devtools for non-owners, owner-only rollbacks. The
 -- payload API keeps `channel` = the rules (older frameworks gate their devtools on it) and adds `rules` and
 -- `branchChannel`.
+--
+-- 0.4.0 (plans/21 C): ONE BACKEND (the settings' `backend` = { url, key } replaces `fleet`; both are read), ERROR
+-- REPORTS (Errors.luau: server and client errors templated, fingerprinted, counted per minute and posted to
+-- <url>/v1/errors) and THE BUDGET VIEW (Budget.luau: every DataStore, MemoryStore, HTTP and MessagingService request
+-- TypeTorch makes, per minute and per caller, next to Roblox's limits; a summary rides on heartbeats as `bu`).
 
 -- 0.3.2 (boot budget): every boot wait and cap counts from here.
 local kernelStartedAt = os.clock()
@@ -184,6 +189,57 @@ do
 			end,
 		})
 	end
+end
+
+-- 0.4.0 (plans/21 C): the budget view (Budget.luau: every DataStore, MemoryStore, HTTP and MessagingService request
+-- TypeTorch makes, per minute and per caller) and the error reports (Errors.luau: templated, fingerprinted, counted,
+-- posted to the backend's /v1/errors). A place project that lists the kernel's files one by one and doesn't map them yet
+-- still boots, without them, and says so.
+local Budget, Errors
+do
+	local function optional(name: string, what: string)
+		local module = script.Parent:FindFirstChild(name)
+		if module then
+			return require(module)
+		end
+		warn(`[TypeTorch] TypeTorchKernel.{name} is missing (map src/server/{name}.luau in the place project): no {what} on this server`)
+		return nil
+	end
+	local function noop() end
+	Budget = optional("Budget", "budget view")
+		or {
+			missing = true,
+			configure = noop,
+			count = noop,
+			countFromApi = noop,
+			wrap = function(object)
+				return object
+			end,
+			summary = noop,
+			snapshot = function()
+				return { missing = true }
+			end,
+		}
+	Errors = optional("Errors", "error reports")
+		or setmetatable({
+			missing = true,
+			info = function()
+				return { enabled = false, missing = true }
+			end,
+			setPid = function()
+				return false
+			end,
+		}, {
+			__index = function()
+				return noop
+			end,
+		})
+	-- The kernel's DataStore and MemoryStore requests (Registry, Settings) count for "kernel".
+	Registry.useBudget(function(object, kind)
+		return Budget.wrap(object, "kernel", kind)
+	end, function(kind, op)
+		Budget.count("kernel", kind, op)
+	end)
 end
 
 -- 0.3.2 (busy-flag hazard, plans/12): work that game code starts (reload, rollback, switchBranch, pins) runs on a
@@ -1282,13 +1338,27 @@ end
 
 
 Fleet.configure({
-	http = HttpService,
+	http = Budget.wrap(HttpService, "kernel", "http", "fleet"), -- 0.4.0: counted for the budget view
 	jobId = game.JobId,
 	active = game.JobId ~= "" and serverType() ~= "studio",
+	-- 0.4.0 (plans/21 C): the settings' `backend` = { url, key } first; `fleet` = { url, token } (0.3.8; before, the
+	-- ConfigService key TypeTorchFleet) only while `backend` is missing.
 	readSettings = function()
-		return Registry.settingsField("fleet") -- 0.3.8: the signed settings (was the ConfigService key TypeTorchFleet)
+		local ok, backend = Registry.settingsField("backend")
+		if not ok then
+			return false, nil, nil
+		end
+		if backend ~= nil then
+			return true, backend, "backend"
+		end
+		local fleetOk, fleet = Registry.settingsField("fleet")
+		return fleetOk, fleet, "fleet"
 	end,
 	status = fleetStatus,
+	-- 0.4.0: heartbeats carry the budget summary (`bu`; the backend stores it per server).
+	heartbeatExtra = function()
+		return { bu = Budget.summary() }
+	end,
 	encode = function(value)
 		return HttpService:JSONEncode(value)
 	end,
@@ -1298,6 +1368,66 @@ Fleet.configure({
 	warn = warn,
 	print = print,
 })
+
+-- 0.4.0 (plans/21 C): the budget view and the error reports (see the requires at the top). Errors go to the same
+-- backend as the heartbeats (Fleet.target(): settings.backend, else settings.fleet); clients forward theirs on
+-- CHANNEL_ERRORS. Both start now, so the boot's own errors are counted too.
+do -- (scoped: the main chunk is near Luau's 200-local limit)
+	local DataStoreService = game:GetService("DataStoreService")
+	Budget.configure({
+		players = function()
+			return #Players:GetPlayers()
+		end,
+		dataStores = DataStoreService,
+		stats = Stats,
+		-- The mounted server generations (old ones stay a moment after a swap) and their module counts.
+		generations = function()
+			local list = {}
+			for _, mount in serverGenerations:GetChildren() do
+				local modules = 0
+				for _, descendant in mount:GetDescendants() do
+					if descendant:IsA("ModuleScript") then
+						modules += 1
+					end
+				end
+				table.insert(list, { name = mount.Name, modules = modules, running = current ~= nil and current.name == mount.Name })
+			end
+			return list
+		end,
+	})
+	local gzipOk, gzip = pcall(function()
+		return Enum.HttpCompression.Gzip
+	end)
+	Errors.configure({
+		active = game.JobId ~= "" and serverType() ~= "studio",
+		jobId = game.JobId,
+		http = Budget.wrap(HttpService, "kernel", "http", "errors"),
+		encode = function(value)
+			return HttpService:JSONEncode(value)
+		end,
+		decode = function(text)
+			return HttpService:JSONDecode(text)
+		end,
+		gzip = if gzipOk then gzip else nil,
+		target = Fleet.target or function()
+			return nil
+		end,
+		-- The generation a script belongs to (Health.generationOf), else the running one.
+		context = function(scriptInstance)
+			local generation = (scriptInstance and Health.generationOf and Health.generationOf(scriptInstance)) or current
+			if generation then
+				return { branch = generation.branch or myBranch, build = generation.artifact and generation.artifact.id }
+			end
+			return { branch = myBranch }
+		end,
+		warn = warn,
+		print = print,
+	})
+	Errors.start({ scriptContext = game:GetService("ScriptContext"), logService = game:GetService("LogService"), players = Players })
+	Transport.onKernel(Constants.CHANNEL_ERRORS, function(player: Player, payload)
+		Errors.fromClient(player, payload)
+	end)
+end
 
 -- Swap to a registry head { assetId, artifactId?, seq?, ... }. Returns a report table. `by` is the user id that asked
 -- (dev menu, /tt, game code); `announced` means notifyPending already ran for this swap.
@@ -3003,6 +3133,11 @@ local function status()
 		fallback = Fallback.status(),
 		-- 0.3.8: game messaging on the held topic and the roll call (Messaging.status); nil without the module.
 		messaging = if Messaging.missing then nil else Messaging.status(),
+		-- 0.4.0 (problem 19): error reports ({ enabled, host?, kinds, waiting, seen, sent, requests, failed, rejected,
+		-- dropped, failures, retryIn?, lastOkAt?, lastError?, top }; templates only, never a raw message or the key).
+		errors = Errors.info(),
+		-- 0.4.0 (problem 25): the budget summary the heartbeat carries (`bu`); the full view is api:budget().
+		budget = Budget.summary(),
 	}
 end
 
@@ -3175,9 +3310,13 @@ Messaging.configure({
 	onKernel = spawnOnKernel,
 	warn = warn,
 	print = print,
+	count = Budget.count, -- 0.4.0: the budget view (subscriptions: kernel; game publishes: game)
 })
 
 Api.init({
+	-- 0.4.0: error reports (api:setAnalyticsId) and the budget view (api:budgetCount, api:budget).
+	Errors = Errors,
+	Budget = Budget,
 	KERNEL_API = Constants.KERNEL_API,
 	KERNEL_VERSION = Constants.KERNEL_VERSION,
 	-- 0.3.8: nil when the place doesn't map Messaging.luau (the API then has no messaging methods).
@@ -3356,6 +3495,7 @@ local function subscribe(topic: string, handler, label: string)
 	task.spawn(function()
 		local attempt = 0
 		while not closing do
+			Budget.count("kernel", "messaging", "subscribe") -- 0.4.0
 			local ok, subscribeError = pcall(function()
 				MessagingService:SubscribeAsync(topic, handler)
 			end)
@@ -3438,6 +3578,8 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 		closing = true
 		-- The fleet API hears a clean close (not a lost server), in parallel with the generation's handler.
 		task.spawn(Fleet.closing, 3)
+		-- 0.4.0: the last error reports go out too.
+		task.spawn(Errors.closing)
 		-- 0.3.6 (plans/17): closing in the middle of a swap (the old generation stopped, the next not ready yet): the
 		-- starting generation's handler if it installed one, else the stopped generation's (its last flush).
 		local generation = current
@@ -3623,6 +3765,10 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 	end
 
 	Fallback.configure({
+		-- 0.4.0: the roll call's MessagingService requests count for the budget view.
+		count = function(kind: string, op: string)
+			Budget.count("kernel", kind, op)
+		end,
 		startedAt = kernelStartedAt,
 		jobId = game.JobId,
 		placeId = game.PlaceId,

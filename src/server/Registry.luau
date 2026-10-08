@@ -220,16 +220,30 @@ local HEADS_TTL = 45 * 24 * 3600 -- MemoryStore maximum
 
 local memoryHeads: MemoryStoreHashMap? = nil
 
+-- 0.4.0 (problem 25): the budget view counts every DataStore and MemoryStore request made here: the kernel hands in
+-- Budget.wrap (a counting proxy) through Registry.useBudget before the first request.
+local wrapStore = function(object, _kind)
+	return object
+end
+
+-- `wrap(object, kind)` -> a counting proxy; `count(kind, op)` for Settings.luau's one read.
+function Registry.useBudget(wrap, count)
+	wrapStore = wrap
+	if Settings.configure then
+		Settings.configure({ count = count })
+	end
+end
+
 local function getStore(): DataStore
 	if not store then
-		store = DataStoreService:GetDataStore(Constants.DATASTORE)
+		store = wrapStore(DataStoreService:GetDataStore(Constants.DATASTORE), "datastore")
 	end
 	return store :: DataStore
 end
 
 local function getMemory(): MemoryStoreHashMap
 	if not memoryHeads then
-		memoryHeads = game:GetService("MemoryStoreService"):GetHashMap(Constants.DATASTORE)
+		memoryHeads = wrapStore(game:GetService("MemoryStoreService"):GetHashMap(Constants.DATASTORE), "memorystore")
 	end
 	return memoryHeads :: MemoryStoreHashMap
 end

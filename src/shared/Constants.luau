@@ -7,7 +7,7 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.3.9",
+	KERNEL_VERSION = "0.4.0",
 
 	-- The kernel's DataStore: durable heads, deployments, private records, events, and (0.3.8) the signed settings.
 	DATASTORE = "TypeTorch",
@@ -274,4 +274,51 @@ return {
 	-- durable writes) keep the last PREV_HEADS_KEPT heads of a branch as `prev` (newest first) on heads.<branch> in the
 	-- DataStore copy only (MemoryStore copies never carry it: a hash map item is at most 32 KB).
 	PREV_HEADS_KEPT = 3,
+
+	-- 0.4.0 (plans/21 C): ONE BACKEND. The signed settings' `backend` = { url, key, analytics? } replaces `fleet` (and
+	-- the framework's `analytics`); both old fields are still read when `backend` is missing. One URL and one key:
+	-- heartbeats to <url>/v1/fleet/*, events to <url>/v1/ingest (the framework), error reports to <url>/v1/errors.
+	ERRORS_PATH = "/v1/errors",
+
+	-- 0.4.0 ERROR REPORTS (problem 19; src/server/Errors.luau). Server errors (ScriptContext.Error, LogService error lines)
+	-- and client errors (the kernel client forwards its own on CHANNEL_ERRORS) are templated (players' names, display
+	-- names and UserIds become <player.name>, <player.display_name>, <player.user_id>), fingerprinted (template + top
+	-- stack line), counted per minute with the analytics ids (pids) of the players affected, and posted to the backend
+	-- in batches. The backend's limits (POST /v1/errors): <= 200 items, 512 KB (2 MB inflated), 30 requests a minute per
+	-- JobId; template <= 1000 characters, stack <= 4000, count 1..1e6, pids <= 50 (10 on the hardened backend: the cap here), lastAt - firstAt <= 10 minutes (items are per minute), times within the last 7 days.
+	-- client -> server, tagged "*": { e = { { m = message, s = stack?, n = count, g = generation? }, ... }, d = dropped }.
+	CHANNEL_ERRORS = "__tt/errors",
+	-- A batch goes out at most this often while errors wait (jittered), and at most ERRORS_RATE_PER_MINUTE requests a
+	-- minute (burst 2) whatever happens.
+	ERRORS_FLUSH_SECONDS = 15,
+	ERRORS_RATE_PER_MINUTE = 6,
+	-- Bounded memory: error kinds held (template + one stack each), per-minute items waiting, items per request, the raw
+	-- JSON per request (gzip makes it far smaller than the backend's 512 KB).
+	ERRORS_KINDS_MAX = 200,
+	ERRORS_ITEMS_MAX = 600,
+	ERRORS_BATCH_MAX = 200,
+	ERRORS_BATCH_BYTES = 400000,
+	ERRORS_TEMPLATE_MAX = 1000,
+	ERRORS_STACK_MAX = 4000,
+	ERRORS_PIDS_MAX = 10,
+	ERRORS_COUNT_MAX = 1000000,
+	-- Items older than this (seconds) are dropped unsent (the backend refuses anything older than 7 days).
+	ERRORS_MAX_AGE = 6 * 86400,
+	-- At most this many errors are looked at per second (templated or counted); the rest are only counted as dropped.
+	ERRORS_RECORD_PER_SECOND = 500,
+	-- A player who left is still templated (and their pid kept) this many seconds.
+	ERRORS_LEFT_SECONDS = 120,
+	-- Clients: one batch per ERRORS_CLIENT_GAP s at most, ERRORS_CLIENT_BATCH entries each (the server takes one per
+	-- ERRORS_CLIENT_SERVER_GAP s per player and drops the rest, counted); a client's count per entry is capped.
+	ERRORS_CLIENT_GAP = 10,
+	ERRORS_CLIENT_SERVER_GAP = 5,
+	ERRORS_CLIENT_BATCH = 10,
+	ERRORS_CLIENT_COUNT_MAX = 1000,
+	ERRORS_CLIENT_MESSAGE_MAX = 1000,
+	ERRORS_CLIENT_STACK_MAX = 2000,
+
+	-- 0.4.0 THE BUDGET VIEW (problem 25; src/server/Budget.luau): every DataStore, MemoryStore, HTTP and MessagingService
+	-- request TypeTorch makes, per minute and per caller, next to Roblox's limits for the current player count (the
+	-- formulas and their sources are in Budget.luau). At most BUDGET_KEYS_MAX (caller, kind, op) counters.
+	BUDGET_KEYS_MAX = 96,
 }

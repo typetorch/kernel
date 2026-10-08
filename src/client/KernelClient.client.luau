@@ -70,6 +70,44 @@ function logs.since(since, limit)
 	return result
 end
 
+-- 0.4.0 (problem 19): ERROR REPORTS. This client's errors (ScriptContext.Error, LogService error lines) are counted
+-- here from the first line on and forwarded to the server (kernel channel CHANNEL_ERRORS, tagged "*") at most every
+-- ERRORS_CLIENT_GAP s, ERRORS_CLIENT_BATCH distinct messages a time; the server templates them (names never leave the
+-- server), fingerprints, counts and posts them with its own (Errors.luau). At most 20 distinct messages wait; the rest
+-- are counted as dropped and the count rides along.
+local clientErrors = { pending = {}, order = {}, dropped = 0, logQueue = {}, scriptSeen = {}, generationOf = nil }
+do
+	local ScriptContext = game:GetService("ScriptContext")
+	local MAX_PENDING = 20
+	function clientErrors.add(message: string, stack: string?, generation: string?)
+		local key = message .. "\0" .. (stack or "")
+		local entry = clientErrors.pending[key]
+		if entry then
+			entry.n += 1
+			return
+		end
+		if #clientErrors.order >= MAX_PENDING then
+			clientErrors.dropped += 1
+			return
+		end
+		clientErrors.pending[key] = { m = string.sub(message, 1, 1000), s = if stack then string.sub(stack, 1, 2000) else nil, n = 1, g = generation }
+		table.insert(clientErrors.order, key)
+	end
+	ScriptContext.Error:Connect(function(message, stack, scriptInstance)
+		pcall(function()
+			local text = tostring(message)
+			clientErrors.scriptSeen[text] = os.clock()
+			local generation = if clientErrors.generationOf then clientErrors.generationOf(scriptInstance) else nil
+			clientErrors.add(text, if typeof(stack) == "string" and stack ~= "" then stack else nil, generation)
+		end)
+	end)
+	LogService.MessageOut:Connect(function(message, messageType)
+		if messageType == Enum.MessageType.MessageError and #clientErrors.logQueue < 50 then
+			table.insert(clientErrors.logQueue, { text = message, at = os.clock() })
+		end
+	end)
+end
+
 local holdScreen
 do
 	local TEXT = { start = "Starting...", load = "Loading...", move = "Reconnecting..." }
@@ -811,3 +849,54 @@ end
 
 root:GetAttributeChangedSignal("ActiveGeneration"):Connect(follow)
 task.spawn(follow)
+
+-- 0.4.0 (problem 19): the error reports' sender (the collector is at the top). A script error names its generation
+-- from where the script lives (Generations.<name>, or the retry / re-sent copies); anything else is the running one's.
+clientErrors.generationOf = function(scriptInstance)
+	local node = scriptInstance
+	for _ = 1, 40 do
+		if typeof(node) ~= "Instance" then
+			break
+		end
+		local parent = node.Parent
+		if parent and (parent.Name == "Generations" or parent.Name == "TypeTorchRetry" or parent.Name == "TypeTorchResend") and string.match(node.Name, "#%d+$") then
+			return node.Name
+		end
+		node = parent
+	end
+	return current and current.name
+end
+task.spawn(function()
+	local gap = Constants.ERRORS_CLIENT_GAP or 10
+	local batch = Constants.ERRORS_CLIENT_BATCH or 10
+	while true do
+		task.wait(gap * (0.8 + math.random() * 0.4))
+		-- LogService error lines a script error already reported (either order) are dropped.
+		local now = os.clock()
+		while #clientErrors.logQueue > 0 and now - clientErrors.logQueue[1].at >= 0.5 do
+			local entry = table.remove(clientErrors.logQueue, 1)
+			local seen = clientErrors.scriptSeen[entry.text]
+			if not (seen and math.abs(seen - entry.at) <= 2) then
+				clientErrors.add(entry.text, nil, current and current.name)
+			end
+		end
+		for text, at in clientErrors.scriptSeen do
+			if now - at > 5 then
+				clientErrors.scriptSeen[text] = nil
+			end
+		end
+		if #clientErrors.order > 0 or clientErrors.dropped > 0 then
+			local list = {}
+			while #list < batch and #clientErrors.order > 0 do
+				local key = table.remove(clientErrors.order, 1)
+				table.insert(list, clientErrors.pending[key])
+				clientErrors.pending[key] = nil
+			end
+			local dropped = clientErrors.dropped
+			clientErrors.dropped = 0
+			pcall(function()
+				net:FireServer("*", Constants.CHANNEL_ERRORS or "__tt/errors", { e = list, d = if dropped > 0 then dropped else nil })
+			end)
+		end
+	end
+end)

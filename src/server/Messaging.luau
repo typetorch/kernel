@@ -59,6 +59,9 @@ local deps = {
 	end,
 	warn = warn,
 	print = print,
+	-- 0.4.0: (caller, kind, op) counts a request for the budget view (Budget.count): subscriptions are the kernel's,
+	-- game publishes the game's (TypeTorch.messaging goes through this kernel API).
+	count = function(_caller, _kind, _op) end,
 }
 
 function Messaging.configure(overrides)
@@ -321,6 +324,7 @@ end
 -- Holds `topic` for the server's life (retried like the kernel's own topics). Runs on a kernel thread.
 local function holdTopic(state, topic: string, handler, label: string)
 	while not deps.closing() do
+		deps.count("kernel", "messaging", "subscribe")
 		local ok, err = pcall(function()
 			MessagingService:SubscribeAsync(topic, handler)
 		end)
@@ -442,6 +446,7 @@ local function sender()
 			continue
 		end
 		tokens -= 1
+		deps.count("game", "messaging", "publish")
 		local ok, err = pcall(function()
 			MessagingService:PublishAsync(Constants.GAME_TOPIC, item.text)
 		end)

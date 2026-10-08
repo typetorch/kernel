@@ -321,6 +321,29 @@ function Api.forEntry(entry: Script)
 		return Api.runDetached(generation, fn, done)
 	end
 
+	-- Kernel 0.4.0 (additive; plans/21 C). Error reports (Errors.luau): the framework's analytics engine tells the kernel
+	-- each player's pid (the pseudonymous analytics id), so error reports count affected players without names or
+	-- UserIds. Returns whether it was taken. `setAnalyticsId` doubles as the feature test for error reports.
+	local Errors = services.Errors
+	if Errors and not Errors.missing then
+		function api:setAnalyticsId(player: Player, pid: string): boolean
+			return Errors.setPid(player, pid)
+		end
+	end
+	-- The budget view (Budget.luau): the framework (and game code) counts its own DataStore / MemoryStore / HTTP /
+	-- MessagingService requests: caller "devtools" | "analytics" | "game" | "framework" (anything else: "game"), kind
+	-- "datastore" | "memorystore" | "http" | "messaging", op a category or label, n (default 1). Never errors.
+	-- api:budget() is the full view for the dev menu (Server > Budget). `budget` doubles as the feature test.
+	local Budget = services.Budget
+	if Budget and not Budget.missing then
+		function api:budgetCount(caller: string, kind: string, op: string, n: number?)
+			Budget.countFromApi(caller, kind, op, n)
+		end
+		function api:budget()
+			return Budget.snapshot()
+		end
+	end
+
 	-- Entry-only (not on the TS interface).
 	function api.ready(stop: () -> ())
 		generation.stop = stop

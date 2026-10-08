@@ -4,7 +4,9 @@
 -- One DataStore entry, Constants.DATASTORE / SETTINGS_KEY ("settings"), written only by the CLI (`typetorch settings`,
 -- `fleet setup`, `access push`): { v = 1, seq, at, body, sig, sigF }. `body` is JSON text:
 --   { defaultBranch?, channels? = { [branch] = "prod" | "dev" }, access? = { members, revoked, devBadgeId },
---     fleet? = { url, token }, analytics? = { ...sink settings }, game? = { [key] = JSON } }
+--     fleet? = { url, token }, analytics? = { ...sink settings }, game? = { [key] = JSON },
+--     backend? = { url, key, analytics? = { flushSeconds, recordShare } } (0.4.0, plans/21: one backend, one key; it
+--     replaces fleet and analytics, which the CLI keeps writing for one release so 0.3.x kernels keep working) }
 -- `sig` / `sigF` are the main and fallback prod keys' Ed25519 signatures of
 --   "tt1settings" \n seq \n at \n body
 -- (Signing.settingsCanonical), checked by the same strict rule as signed deploys (Signing.verify). The body is signed as
@@ -20,7 +22,7 @@
 -- SETTINGS_REFRESH_SECONDS, and right after a ping (`{ k = "settings", s = seq }` on TypeTorch/deploy) with a newer seq,
 -- at most every SETTINGS_PING_GAP seconds.
 --
--- SERVER ONLY: the record holds tokens (fleet, analytics). Nothing in it ever replicates; the framework gets a copy
+-- SERVER ONLY: the record holds tokens (backend, fleet, analytics). Nothing in it ever replicates; the framework gets a copy
 -- through the server API (api:settings()).
 
 local DataStoreService = game:GetService("DataStoreService")
@@ -34,6 +36,8 @@ local deps = {
 	signing = nil,
 	warn = warn,
 	print = print,
+	-- 0.4.0: (kind, op) counts a request for the budget view (Budget.luau, through Registry.useBudget).
+	count = function(_kind, _op) end,
 }
 
 function Settings.configure(overrides)
@@ -42,7 +46,7 @@ function Settings.configure(overrides)
 	end
 end
 
-local FIELDS = { "defaultBranch", "channels", "access", "fleet", "analytics", "game" }
+local FIELDS = { "defaultBranch", "channels", "access", "backend", "fleet", "analytics", "game" }
 
 local good = nil -- { seq, at, body (decoded), text (the body text), by = "sig" | "sigF", takenAt = os.time() }
 local info = {
@@ -109,7 +113,7 @@ local function checkBody(text: string): (any?, string?)
 			end
 		end
 	end
-	for _, field in { "access", "fleet", "analytics", "game" } do
+	for _, field in { "access", "backend", "fleet", "analytics", "game" } do
 		if body[field] ~= nil and typeof(body[field]) ~= "table" then
 			return nil, `{field} must be an object`
 		end
@@ -185,6 +189,7 @@ local function read(): boolean
 	reading = true
 	readAt = os.clock()
 	info.reads += 1
+	deps.count("datastore", "read")
 	local ok, value = pcall(function()
 		return DataStoreService:GetDataStore(Constants.DATASTORE):GetAsync(Constants.SETTINGS_KEY)
 	end)

@@ -28,7 +28,7 @@ local TOKEN = "fleet-token-0123456789"
 local Constants = luau.load(fs.readFile("src/shared/Constants.luau"), { debugName = "Constants.luau" })()
 local http = {
 	RequestAsync = function(_, request)
-		table.insert(requests, { at = clock, path = string.sub(request.Url, #"https://fleet.example.test" + 1) })
+		table.insert(requests, { at = clock, path = string.sub(request.Url, #"https://fleet.example.test" + 1), url = request.Url, auth = request.Headers.Authorization, body = request.Body })
 		if answer == "netfail" then
 			error("HttpError: NetFail", 0)
 		elseif answer == "dns" then
@@ -210,7 +210,7 @@ local held = heartbeatsBetween(holdStart, clock)
 check("401: one request, no retries", #held == 1, #held)
 info = Fleet.info()
 check("401: held off about 5 minutes (225-375 s)", typeof(info.retryIn) == "number" and info.retryIn >= 225 - 31 and info.retryIn <= 375, info.retryIn)
-check("401: the line says the token is wrong (settings.fleet.token)", said("the fleet token is wrong (settings.fleet.token") >= 1)
+check("401: the line says the key is wrong (settings.backend.key)", said("the backend key is wrong (settings.backend.key") >= 1)
 advance(180)
 check("401: nothing more within 3 minutes", #heartbeatsBetween(holdStart, clock) == 1)
 answer = "ok"
@@ -229,6 +229,45 @@ local function backoffSample(): number
 end
 local a, b, c = backoffSample(), backoffSample(), backoffSample()
 check("the backoff is jittered (three outages, not all the same wait)", a > 0 and b > 0 and c > 0 and not (a == b and b == c), `{a} {b} {c}`)
+
+-- 6. 0.4.0 (plans/21 C): settings.backend = { url, key } first; settings.fleet = { url, token } while backend is missing;
+-- Fleet.target() hands the same URL and key to the error reports; heartbeats carry `bu`.
+answer = "ok"
+local BACKEND_KEY = "backend-key-0123456789abcdef"
+Fleet.configure({
+	readSettings = function()
+		return true, { url = "https://backend.example.test/", key = BACKEND_KEY, analytics = { flushSeconds = 20 } }, "backend"
+	end,
+	heartbeatExtra = function()
+		return { bu = { p = 3, h = { r = 2, l = 500 } }, j = "not-overwritten" }
+	end,
+})
+Fleet.refreshSettings()
+info = Fleet.info()
+local target = Fleet.target()
+check("backend { url, key }: taken, source backend, the trailing slash dropped", info.enabled and info.source == "backend" and target and target.url == "https://backend.example.test" and target.token == BACKEND_KEY and target.host == "backend.example.test")
+check("a new host is said once (no key)", said("backend: backend.example.test (settings.backend)") == 1 and said(BACKEND_KEY) == 0)
+local mark = #requests
+Fleet.heartbeat()
+advance(1)
+local beat = requests[mark + 1]
+local decoded = beat and serde.decode("json", beat.body)
+check("heartbeats go to <url>/v1/fleet/heartbeat with the key", beat ~= nil and beat.url == "https://backend.example.test/v1/fleet/heartbeat" and beat.auth == "Bearer " .. BACKEND_KEY)
+check("heartbeats carry the budget summary `bu`; extras never overwrite the status (j stays the JobId)", decoded and decoded.bu and decoded.bu.p == 3 and decoded.j == "job-1")
+Fleet.configure({
+	readSettings = function()
+		return true, { url = "https://fleet.example.test", token = TOKEN }, "fleet"
+	end,
+})
+Fleet.refreshSettings()
+check("fleet { url, token } (old settings): taken, source fleet", Fleet.info().source == "fleet" and Fleet.target().token == TOKEN)
+Fleet.configure({
+	readSettings = function()
+		return true, { url = "http://insecure.example.test", key = BACKEND_KEY }, "backend"
+	end,
+})
+Fleet.refreshSettings()
+check("a non-https backend is refused (no target)", Fleet.info().settings == "invalid" and Fleet.target() == nil and said("settings.backend) ignored") == 1)
 
 print(`fleet: {passed} passed, {failed} failed`)
 process.exit(if failed == 0 then 0 else 1)
