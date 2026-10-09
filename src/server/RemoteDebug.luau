@@ -134,10 +134,13 @@ function RemoteDebug.collectSecrets(value: any, out: { string }, depth: number?,
 	return out
 end
 
-local function jsonEscaped(text: string): string
-	return (string.gsub(text, '[\\"/]', function(char)
+-- The ways a JSON encoder may write `text`: quotes and backslashes escaped, and also forward slashes.
+local function jsonForms(text: string): { string }
+	local plain = string.gsub(text, '[\\"]', function(char)
 		return "\\" .. char
-	end))
+	end)
+	local slashed = string.gsub(plain, "/", "\/")
+	return { plain, slashed }
 end
 
 -- `text` with every copy of each secret, and every piece of one at least 12 characters long (a preview cut a long
@@ -147,9 +150,10 @@ function RemoteDebug.scrub(text: string, secrets: { string }): (string, number)
 	for _, secret in secrets do
 		if typeof(secret) == "string" and #secret >= 8 then
 			local variants = { secret }
-			local escaped = jsonEscaped(secret)
-			if escaped ~= secret then
-				table.insert(variants, escaped)
+			for _, form in jsonForms(secret) do
+				if not table.find(variants, form) then
+					table.insert(variants, form)
+				end
 			end
 			for _, variant in variants do
 				local prefix = string.sub(variant, 1, math.min(#variant, 12))

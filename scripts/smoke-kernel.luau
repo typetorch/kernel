@@ -22,7 +22,10 @@
 -- outlives its generation's hard stop; errors, the cap and the slow-job warning), and 0.3.9's `--rollback-prev`
 -- (/tt rollback on a server with no earlier generation: the branch's previous heads, only verified ones on a signed
 -- server; the kernel's durable writes keep `prev`); `--hold`, `--client` and `--switch` check the 0.3.9 hold fixes and
--- the channel / rules split too.
+-- the channel / rules split too. 0.5.0's `--remote-debug` (plans/25): a public prod server whose signed settings hold
+-- `backend`; the heartbeat reply's `rd = 1` starts the long-poll, the kernel ops answer, a write op and a non-owner are
+-- refused, framework ops go through api:onRemoteDebug, a player's client logs come over __tt/rdlogs, answers carry no
+-- secret, and "not watched" stops the polling.
 -- Every mode also checks that no swap ran on a thread its own stopped generation owned.
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore; 0.3.8: no ConfigService at all), then drives it:
@@ -750,12 +753,13 @@ local services = {
 		end,
 		RequestAsync = function(_, request)
 			local scripted = table.remove(httpScript, 1)
-			local entry = { url = request.Url, method = request.Method, headers = request.Headers, body = serde.decode("json", request.Body), status = if scripted == "error" then 0 else scripted or 200 }
+			-- 0.5.0: GET requests (remote debug's poll) have no body; httpScript.respond (`--remote-debug`) answers bodies.
+			local entry = { url = request.Url, method = request.Method, headers = request.Headers, body = if request.Body then serde.decode("json", request.Body) else nil, raw = request.Body, status = if scripted == "error" then 0 else scripted or 200 }
 			table.insert(httpRequests, entry)
 			if scripted == "error" then
 				error("HttpError: ConnectFail (smoke)")
 			end
-			return { Success = entry.status >= 200 and entry.status < 300, StatusCode = entry.status, Body = "{}" }
+			return { Success = entry.status >= 200 and entry.status < 300, StatusCode = entry.status, Body = if httpScript.respond then httpScript.respond(entry) or "{}" else "{}" }
 		end,
 	},
 	Players = {
@@ -958,7 +962,7 @@ end
 
 local kernelFolder = newInstance("Folder", "TypeTorchKernel")
 kernelFolder.Parent = services.ServerScriptService
-for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Messaging = "Messaging.luau", Budget = "Budget.luau", Errors = "Errors.luau", Settings = "Settings.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
+for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Messaging = "Messaging.luau", Budget = "Budget.luau", Errors = "Errors.luau", RemoteDebug = "RemoteDebug.luau", Settings = "Settings.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
 	sourceInstance(if name == "Kernel" then "Script" else "ModuleScript", name, `src/server/{file}`).Parent = kernelFolder
 end
 local entryTemplate = sourceInstance("Script", "Entry", "src/server/Entry.server.luau")
@@ -1072,6 +1076,8 @@ local MODES38 = {
 	-- batch templated and posted to <url>/v1/errors with the player's pid, status().errors / status().budget,
 	-- api:budget() and api:budgetCount.
 	errors = table.find(process.args, "--errors") ~= nil,
+	-- 0.5.0 `--remote-debug` (plans/25): see the header.
+	remoteDebug = table.find(process.args, "--remote-debug") ~= nil,
 }
 -- 0.3.8 loading screens (plans/19 item 13), client side: `--client-boot` (the game's BootScreen replaces the kernel's
 -- "Starting..." until the first client generation runs and the server's hold ends), `--client-own` (KernelScreen =
@@ -1751,6 +1757,14 @@ end
 if MODES38.settingsMissing then
 	kernelFolder.Settings.Parent = nil
 end
+if MODES38.remoteDebug then
+	dataStore.data.settings = deepCopy(SMOKE.settings.backend)
+	Constants.FLEET_HEARTBEAT_SECONDS = 0.5
+	Constants.FLEET_RATE_PER_MINUTE = 6000
+	Constants.FLEET_SETTINGS_SECONDS = 0.5
+	Constants.RD_POLL_GAP = 0.1
+	Constants.RD_COMMANDS_BURST = 30 -- the rate limit has its own test (scripts/test-remote-debug.luau)
+end
 if MODES38.errors then
 	dataStore.data.settings = deepCopy(SMOKE.settings.backend)
 	Constants.FLEET_HEARTBEAT_SECONDS = 0.5
@@ -1900,7 +1914,7 @@ local function finish()
 	check(`no unexpected errors on kernel threads{if #unexpected > 0 then ": " .. unexpected[1] else ""}`, #unexpected == 0)
 	check(`no swap ran on a thread its own stopped generation owned (busy-flag hazard){if #hazards > 0 then ": " .. hazards[1] else ""}`, #hazards == 0)
 	check("the kernel never used a MemoryStore sorted map (0.3.2: fleet status and reports are API only)", #sortedMapRequests == 0)
-	if not FLEET_MODE and not SWITCH_MODE and not FALLBACK_FLEET and not ACCESS_MODE and not MODES38.errors then
+	if not FLEET_MODE and not SWITCH_MODE and not FALLBACK_FLEET and not ACCESS_MODE and not MODES38.errors and not MODES38.remoteDebug then
 		check("no HTTP request without settings.fleet", #httpRequests == 0)
 	end
 	local leaked = false
@@ -1926,7 +1940,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if MODES38.errors then "--errors" elseif MODES38.rollbackPrev then "--rollback-prev" elseif MODES38.detached then "--detached" elseif MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if MODES38.remoteDebug then "--remote-debug" elseif MODES38.errors then "--errors" elseif MODES38.rollbackPrev then "--rollback-prev" elseif MODES38.detached then "--detached" elseif MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -3979,6 +3993,148 @@ if MODES38.errors then
 	snapshot = SMOKE.kernel:budget()
 	check("budget: api:budgetCount counts for its caller (never as the kernel)", snapshot.kinds.datastore.callers.analytics == 2 and snapshot.kinds.http.callers.game == 1)
 	check("budget: status().budget is the heartbeat summary; the snapshot lists the running generation", status().budget ~= nil and status().budget.h.l == 500 and snapshot.generations[1] ~= nil and snapshot.generations[1].running == true)
+	finish()
+end
+
+if MODES38.remoteDebug then
+	local BASE = "https://backend.example.test/api"
+	local rd = { watched = false, queue = {}, gets = 0 }
+	httpScript.respond = function(entry)
+		if entry.url == BASE .. "/v1/fleet/heartbeat" then
+			return if rd.watched then '{"ok":true,"rd":1}' else '{"ok":true}'
+		elseif string.find(entry.url, BASE .. "/v1/fleet/commands", 1, true) == 1 then
+			rd.gets += 1
+			local commands = rd.queue
+			rd.queue = {}
+			return serde.encode("json", { watch = rd.watched, commands = commands })
+		end
+		return "{}"
+	end
+	local function command(id: string, op: string, args: any?, by: any?)
+		return { id = id, op = op, args = args or {}, by = by or { kind = "token" }, exp = (os.time() + 60) * 1000 }
+	end
+	local function answer(id: string)
+		for _, entry in httpRequests do
+			if entry.url == BASE .. "/v1/fleet/results" and entry.body and entry.body.results then
+				for _, result in entry.body.results do
+					if result.id == id then
+						return result, entry
+					end
+				end
+			end
+		end
+		return nil
+	end
+	local function decoded(id: string)
+		local result = answer(id)
+		return if result and result.json then serde.decode("json", result.json) else nil
+	end
+	check("remote debug: boots", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() == "aaaaaaa-111111"
+	end))
+	check("remote debug: heartbeats go out; no poll while nobody watches", waitFor("heartbeat", function()
+		local n = 0
+		for _, entry in httpRequests do
+			if entry.url == BASE .. "/v1/fleet/heartbeat" then
+				n += 1
+			end
+		end
+		return n >= 2
+	end) and rd.gets == 0)
+	local rider = joinPlayer(424242424, "Rider", nil, false)
+	services.Players.PlayerAdded:Fire(rider)
+	rd.watched = true
+	rd.queue = {
+		command("a1", "status"),
+		command("a2", "logs", { limit = 50 }),
+		command("a3", "players"),
+		command("a4", "errors"),
+		command("a5", "budget"),
+		command("a6", "kick", { userId = 424242424 }),
+		command("a7", "status", nil, { kind = "roblox", userId = 999999 }),
+		command("a8", "status", nil, { kind = "roblox", userId = 1 }),
+		command("a9", "modules"),
+		command("a10", "builds"),
+	}
+	check("remote debug: a watched heartbeat's reply (rd = 1) starts the long-poll with the key and the JobId", waitFor("poll", function()
+		return rd.gets >= 1
+	end, 4))
+	local poll = nil
+	for _, entry in httpRequests do
+		if entry.method == "GET" then
+			poll = entry
+			break
+		end
+	end
+	check("remote debug: GET <url>/v1/fleet/commands?wait=8, Authorization + X-TT-Job", poll ~= nil and poll.url == BASE .. "/v1/fleet/commands?wait=8" and poll.headers.Authorization == "Bearer " .. FLEET_TOKEN and poll.headers["X-TT-Job"] == JOB)
+	check("remote debug: every command is answered", waitFor("answers", function()
+		return answer("a10") ~= nil and answer("a1") ~= nil
+	end, 6))
+	local a1 = decoded("a1")
+	check("remote debug: status = the kernel's status() and the fleet status, without the access code", a1 ~= nil and a1.status.jobId == JOB and a1.status.branch == "prod" and a1.fleet.v == Constants.KERNEL_VERSION and a1.fleet.k == nil)
+	local a2 = decoded("a2")
+	check("remote debug: logs = the server log ring", a2 ~= nil and typeof(a2.entries) == "table" and #a2.entries > 0 and #a2.entries <= 50)
+	local a3 = decoded("a3")
+	check("remote debug: players lists the rider", a3 ~= nil and a3.players[1] ~= nil and a3.players[1].userId == 424242424 and a3.players[1].name == "Rider")
+	check("remote debug: errors and budget answer", decoded("a4") ~= nil and decoded("a4").enabled ~= nil and decoded("a5") ~= nil and decoded("a5").kinds ~= nil)
+	check("remote debug: builds answers (branches, artifacts)", decoded("a10") ~= nil and decoded("a10").branches ~= nil)
+	local a6 = answer("a6")
+	check("remote debug: no write op (kick) runs", a6 ~= nil and a6.ok == false and string.find(a6.error, "op_not_allowed", 1, true) ~= nil)
+	local a7, a8 = answer("a7"), answer("a8")
+	check("remote debug: a Roblox user who isn't an owner is refused; the creator is an owner", a7 ~= nil and a7.ok == false and a7.error == "owners_only" and a8 ~= nil and a8.ok == true)
+	local a9 = answer("a9")
+	check("remote debug: a framework op without the generation's hook says not supported", a9 ~= nil and a9.ok == false and string.find(a9.error, "not_supported", 1, true) ~= nil)
+	-- The running generation installs its hook (the framework does it in its devtools); an answer holding the key.
+	local calls = {}
+	SMOKE.kernel:onRemoteDebug(function(op, args, caller)
+		table.insert(calls, { op = op, args = args, caller = caller })
+		return { op = op, leak = `the key is {FLEET_TOKEN}` }
+	end)
+	rd.queue = { command("b1", "state", { queries = { { root = "", path = {}, page = 0 } } }, { kind = "roblox", userId = 1 }) }
+	check("remote debug: framework ops go to api:onRemoteDebug with the owner caller", waitFor("framework op", function()
+		return answer("b1") ~= nil
+	end, 4) and calls[1] ~= nil and calls[1].op == "state" and calls[1].caller.userId == 1 and calls[1].caller.owner == true)
+	local b1 = answer("b1")
+	check("remote debug: the key is scrubbed from the answer (redacted counted)", b1 ~= nil and b1.ok == true and not string.find(b1.json, FLEET_TOKEN, 1, true) and b1.redacted == 1)
+	-- A player's client logs: the kernel asks that client on __tt/rdlogs; the client (played here) answers.
+	local firedBefore = #firedToClient
+	rd.queue = { command("c1", "player.logs", { userId = 424242424, since = 0 }) }
+	local ask = nil
+	check("remote debug: player.logs asks the player's client (kernel channel __tt/rdlogs)", waitFor("rdlogs ask", function()
+		for index = firedBefore + 1, #firedToClient do
+			local fired = firedToClient[index]
+			if fired[1] == rider and fired[2] == "*" and fired[3] == "__tt/rdlogs" then
+				ask = fired[4]
+				return true
+			end
+		end
+		return false
+	end, 4) and typeof(ask) == "table" and typeof(ask.id) == "number")
+	local net = services.ReplicatedStorage.TypeTorch.Net
+	net.OnServerEvent:Fire(rider, "*", "__tt/rdlogs", { id = ask and ask.id, logs = { { i = 1, t = 1, kind = "output", text = "hello from the client" } } })
+	check("remote debug: the client's logs come back as the answer", waitFor("client logs", function()
+		return answer("c1") ~= nil
+	end, 4) and decoded("c1") ~= nil and decoded("c1").entries[1].text == "hello from the client" and decoded("c1").name == "Rider")
+	-- Not watched any more: the polling stops.
+	rd.watched = false
+	task.wait(0.6)
+	local gets = rd.gets
+	task.wait(1.5)
+	check("remote debug: 'not watched' stops the polling", rd.gets == gets)
+	local info = status().remoteDebug
+	check("remote debug: status().remoteDebug counts (sessions, commands, refused) and says off", info ~= nil and info.state == "off" and info.sessions >= 1 and info.commands >= 9 and info.refused >= 2 and info.redacted >= 1)
+	local labels = {}
+	for _, row in SMOKE.kernel:budget().detail do
+		labels[`{row.caller}/{row.kind}/{row.op}`] = row.total
+	end
+	check("remote debug: polls and result posts count in the budget view (kernel/http/debug)", (labels["kernel/http/debug"] or 0) >= 3)
+	local leaked = false
+	for _, entry in httpRequests do
+		if entry.url == BASE .. "/v1/fleet/results" and entry.raw then
+			leaked = leaked or string.find(entry.raw, FLEET_TOKEN, 1, true) ~= nil
+		end
+	end
+	check("remote debug: no answer carries the backend key", not leaked)
 	finish()
 end
 
