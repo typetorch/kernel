@@ -236,12 +236,31 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   applied and reported `swapped` (d = 0). A deploy that arrives while a local rollback runs waits for it, then adopts
   instead of swapping the same build in again. Whenever the applied seq moves, a `seq` heartbeat is sent ahead of the
   queued reports, so `deploy --wait` never sees the report before the server's new `q`.
+- Remote debug (0.5.0, plans/25; `src/server/RemoteDebug.luau`, optional): the backend explorer's `/servers/<JobId>`
+  page reads this server like the dev menu, read-only. A Roblox server can't be called into, so it pulls: once the
+  backend says the job is watched, the kernel long-polls the signed settings' backend (`GET <url>/v1/fleet/commands?wait=8`,
+  `X-TT-Job`), runs each allow-listed op on a kernel thread (kernel ops: status, builds, budget, logs, players,
+  player.logs over `__tt/rdlogs`, errors; framework ops through `api:onRemoteDebug`), owners only, at most 30 a minute,
+  answers scrubbed of every secret the kernel knows, and posts them to `POST <url>/v1/fleet/results`. It stops when the
+  backend says "not watched" (no request at all while nobody watches). Counted in the budget view (HTTP, `debug`);
+  `status().remoteDebug` has the counters (never a command, the URL or the key).
+  - How it learns it is watched: a heartbeat reply `{ ok, rd = 1 }` (up to one heartbeat, 30 s), or (0.5.1, **instant
+    wake**) a wake message `{ k = "rd", j = <JobId> }` on `TypeTorch/deploy` that a backend with
+    `TYPETORCH_MESSAGING_KEY` publishes through Open Cloud when the watch starts: the named server starts polling at
+    once. No new subscription (the kernel's control topic already carries the settings ping and the peers' ask). The
+    wake is unsigned and only does what `rd = 1` does: the first poll asks the backend, which says whether the job is
+    really watched, so a forged wake costs one poll. Another JobId's or a malformed wake is ignored, one per
+    `RD_WAKE_GAP` (10) s at most, none without a backend in the settings; it never becomes `status().lastMessage`.
+    `status().remoteDebug.wakes` / `wakesIgnored` / `lastWakeAt` count them. Older kernels ignore the message (no branch).
 - Tests (Lune): `lune run scripts/test-errors.luau` (0.4.0: templating, fingerprints, per-minute counts, limits, batches,
   the sender, client batches, the dedup), `lune run scripts/test-budget.luau` (0.4.0: proxies, limits, the sliding
   minute, callers, the summary; 0.4.2: TPS windows, the slowest second, physics FPS, the Lua heap fallback),
   `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules),
   `lune run scripts/test-access.luau`, `lune run scripts/test-fleet.luau` (0.3.9: the fleet sender's backoff, hold and
-  log lines on a fake clock; 0.4.2: a `seq` heartbeat goes before queued reports) and
+  log lines on a fake clock; 0.4.2: a `seq` heartbeat goes before queued reports),
+  `lune run scripts/test-remote-debug.luau` (0.5.0: allow-list, owners only, rate, secret scrub, plain data, the
+  session, client logs; 0.5.1: the wake: this JobId within a tick, other JobIds and malformed ignored, the local rate,
+  a forged wake costs one poll, no backend no poll) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
   `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, `--durable`, 0.3.6's `--hold`, `--hold-optout`,
@@ -252,7 +271,9 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   batch posted templated with the pid, the budget view), 0.4.2's `--perf` (heartbeat `pf` from Heartbeat frames, its
   size, `bu.mem`, `status().perf`) and `--adopt` (a deploy's heartbeat before its report; the rollback drill: a local
   health rollback, then the branch rollback naming the same build, adopted with no swap, also when it arrives mid
-  rollback and when only the poll finds it), and `--boot-budget`, which runs 25 boot scenarios
+  rollback and when only the poll finds it), 0.5.0's `--remote-debug` (the heartbeat's `rd` starts the poll, kernel and
+  framework ops, refusals, client logs, no secret in an answer; 0.5.1: a wake on `TypeTorch/deploy` starts it with
+  quiet heartbeats), and `--boot-budget`, which runs 25 boot scenarios
   with simulated slow or failing dependencies and
   checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
