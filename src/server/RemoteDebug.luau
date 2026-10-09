@@ -259,6 +259,69 @@ function RemoteDebug.clientLogs(player: Player, since: number?)
 	return pending.logs
 end
 
+-- Plain data -----------------------------------------------------------------------------------------------------------
+
+-- `value` as data JSON can carry: finite numbers, strings, booleans, arrays and string-keyed tables; NaN and infinities
+-- become nil, an Instance its full name, a function or thread its type name, a cycle "<cycle>", other datatypes their
+-- tostring; numeric keys of a table that isn't an array become strings. At most 40 deep and 100,000 values (then "...").
+function RemoteDebug.toPlain(value: any)
+	local seen = {}
+	local budget = 100000
+	local function plain(v, depth)
+		budget -= 1
+		if budget < 0 then
+			return "..."
+		end
+		local kind = typeof(v)
+		if kind == "nil" or kind == "boolean" or kind == "string" then
+			return v
+		elseif kind == "number" then
+			return if v == v and v ~= math.huge and v ~= -math.huge then v else nil
+		elseif kind == "table" then
+			if seen[v] then
+				return "<cycle>"
+			end
+			if depth > 40 then
+				return "..."
+			end
+			seen[v] = true
+			local count, maxIndex = 0, 0
+			for key in v do
+				count += 1
+				if typeof(key) == "number" and key >= 1 and key % 1 == 0 then
+					maxIndex = math.max(maxIndex, key)
+				end
+			end
+			local out = {}
+			if count > 0 and maxIndex == count then
+				for index = 1, count do
+					local inner = plain(v[index], depth + 1)
+					out[index] = if inner == nil then false else inner
+				end
+			else
+				for key, inner in v do
+					local name = if typeof(key) == "string" then key elseif typeof(key) == "number" or typeof(key) == "boolean" then tostring(key) else nil
+					if name then
+						out[name] = plain(inner, depth + 1)
+					end
+				end
+			end
+			seen[v] = nil
+			return out
+		elseif kind == "Instance" then
+			local ok, name = pcall(function()
+				return v:GetFullName()
+			end)
+			return if ok then name else "Instance"
+		elseif kind == "function" or kind == "thread" or kind == "userdata" or kind == "buffer" then
+			return kind
+		end
+		local ok, text = pcall(tostring, v)
+		return if ok then text else kind
+	end
+	return plain(value, 0)
+end
+
 -- Running commands ---------------------------------------------------------------------------------------------------
 
 local function takeToken(): boolean
@@ -344,7 +407,11 @@ function RemoteDebug.run(command: any)
 		local text = RemoteDebug.scrub(clean(result, 300), secrets)
 		return { id = id, ok = false, error = text, ms = ms }
 	end
-	local encodedOk, encoded = pcall(deps.encode, if result == nil then {} else result)
+	local plainOk, plainResult = pcall(RemoteDebug.toPlain, result)
+	local encodedOk, encoded = false, nil
+	if plainOk then
+		encodedOk, encoded = pcall(deps.encode, if plainResult == nil then {} else plainResult)
+	end
 	if not encodedOk or typeof(encoded) ~= "string" then
 		stats.failed += 1
 		return { id = id, ok = false, error = "the answer can't be encoded as JSON", ms = ms }

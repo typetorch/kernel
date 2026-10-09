@@ -530,6 +530,26 @@ local function onClientEvent(artifactId, channel, ...)
 				holdScreen.mine = mode
 				holdScreen.refresh()
 			end
+		elseif channel == (Constants.CHANNEL_RDLOGS or "__tt/rdlogs") then
+			-- 0.5.0 (plans/25, remote debug): the server asks for this client's log ring (an owner reads it from the
+			-- explorer). Like the dev menu's Logs > Others: the newest entries after `since`, texts cut at 600 bytes, at
+			-- most RD_CLIENT_LOGS_MAX entries and RD_CLIENT_LOGS_BYTES bytes. Never shown here.
+			local request = ...
+			if typeof(request) == "table" and typeof(request.id) == "number" then
+				local since = if typeof(request.since) == "number" then request.since else nil
+				local entries = logs.since(since, Constants.RD_CLIENT_LOGS_MAX or 200)
+				local picked, bytes = {}, 0
+				for index = #entries, 1, -1 do
+					local entry = entries[index]
+					local text = string.sub(entry.text, 1, 600)
+					bytes += #text + 32
+					if bytes > (Constants.RD_CLIENT_LOGS_BYTES or 64000) then
+						break
+					end
+					table.insert(picked, 1, { i = entry.i, t = entry.t, kind = entry.kind, text = text })
+				end
+				net:FireServer("*", Constants.CHANNEL_RDLOGS or "__tt/rdlogs", { id = request.id, logs = picked })
+			end
 		end
 		return
 	end
