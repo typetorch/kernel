@@ -3,7 +3,8 @@
 -- errors"): a fake clock drives the sender thread, a fake HttpService answers. Checks: retries are jittered; after a
 -- request's retries all failed the sender backs off exponentially (30 s doubling, at most 300 s, +-25%); a 401 holds it
 -- off ~300 s; one success resets everything and says so once; at most one warning line a minute, with the reason;
--- Fleet.info() has `failures` (failed requests in a row) and `retryIn`; the token is never in a line.
+-- Fleet.info() has `failures` (failed requests in a row) and `retryIn`; the token is never in a line. 0.4.2: a "seq"
+-- heartbeat goes ahead of the queued reports.
 local fs = require("@lune/fs")
 local luau = require("@lune/luau")
 local process = require("@lune/process")

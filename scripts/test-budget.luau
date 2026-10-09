@@ -3,7 +3,8 @@
 -- kind and op; the sliding per-minute estimate; the counting proxies (DataStore categories with UpdateAsync as read +
 -- write, MemoryStore units, HTTP labels, MessagingService) that pass self, results and errors through; Roblox's limits
 -- for the player count; api counts (callers checked, n clamped); the counter cap; the game's DataStore budget left; the
--- heartbeat summary (`bu`) and the dev menu snapshot. A fake clock.
+-- heartbeat summary (`bu`) and the dev menu snapshot; 0.4.2: TPS (`pf` per heartbeat window, status().perf over the
+-- last minute, the slowest second, physics FPS) and the Lua heap fallback. A fake clock.
 local fs = require("@lune/fs")
 local luau = require("@lune/luau")
 local process = require("@lune/process")

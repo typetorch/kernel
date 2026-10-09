@@ -22,7 +22,8 @@
 -- outlives its generation's hard stop; errors, the cap and the slow-job warning), and 0.3.9's `--rollback-prev`
 -- (/tt rollback on a server with no earlier generation: the branch's previous heads, only verified ones on a signed
 -- server; the kernel's durable writes keep `prev`); `--hold`, `--client` and `--switch` check the 0.3.9 hold fixes and
--- the channel / rules split too.
+-- the channel / rules split too. 0.4.0: `--errors`; 0.4.2: `--perf` (heartbeat TPS `pf`) and `--adopt` (seq adoption after a
+-- local rollback: the 2026-10-09 rollback drill); see MODES38 below.
 -- Every mode also checks that no swap ran on a thread its own stopped generation owned.
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore; 0.3.8: no ConfigService at all), then drives it:

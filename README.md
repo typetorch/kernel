@@ -226,11 +226,22 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   memory (total, per developer tag, the Lua heap; the mounted generations and their modules). `api:budget()` is the
   full view (the dev menu's Server > Budget); `status().budget` and every fleet heartbeat (`bu`) carry a compact
   summary the backend stores per server.
+- Server TPS (0.4.2, `src/server/Budget.luau`): `RunService.Heartbeat` frames are counted into one-second buckets.
+  Every fleet heartbeat carries `pf` = `{ a, m, p }`: the average TPS and the slowest second since the previous heartbeat,
+  and `workspace:GetRealPhysicsFPS()` (0.1 steps, about 25 bytes; nil before the first second). Memory is not repeated:
+  it stays in `bu.mem` = `{ t, h }` (total MB, LuaHeap MB; the Lua VM heap when the tag can't be read). `status().perf`
+  = `{ a, m, p, s }` over the last 60 s (the dev menu's Server > Status).
+- Seq adoption (0.4.2; the 2026-10-09 rollback drill): a deploy, branch rollback or poll head whose artifact this server
+  already runs (typically the build a local health rollback just restored) is adopted without a swap: the seq is
+  applied and reported `swapped` (d = 0). A deploy that arrives while a local rollback runs waits for it, then adopts
+  instead of swapping the same build in again. Whenever the applied seq moves, a `seq` heartbeat is sent ahead of the
+  queued reports, so `deploy --wait` never sees the report before the server's new `q`.
 - Tests (Lune): `lune run scripts/test-errors.luau` (0.4.0: templating, fingerprints, per-minute counts, limits, batches,
   the sender, client batches, the dedup), `lune run scripts/test-budget.luau` (0.4.0: proxies, limits, the sliding
-  minute, callers, the summary), `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules),
+  minute, callers, the summary; 0.4.2: TPS windows, the slowest second, physics FPS, the Lua heap fallback),
+  `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules),
   `lune run scripts/test-access.luau`, `lune run scripts/test-fleet.luau` (0.3.9: the fleet sender's backoff, hold and
-  log lines on a fake clock) and
+  log lines on a fake clock; 0.4.2: a `seq` heartbeat goes before queued reports) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
   `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, `--durable`, 0.3.6's `--hold`, `--hold-optout`,
@@ -238,7 +249,10 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   `--kernel-crash`, `--heads-cap`, `--access`, 0.3.7's `--health-config` and `--health-missing`, 0.3.8's
   `--messaging`, `--messaging-studio`, `--messaging-missing`, `--client-boot`, `--client-own`, `--settings`,
   `--settings-missing` and `--detached`, 0.3.9's `--rollback-prev`, 0.4.0's `--errors` (settings.backend, heartbeats with `bu`, a server error and a client
-  batch posted templated with the pid, the budget view), and `--boot-budget`, which runs 25 boot scenarios
+  batch posted templated with the pid, the budget view), 0.4.2's `--perf` (heartbeat `pf` from Heartbeat frames, its
+  size, `bu.mem`, `status().perf`) and `--adopt` (a deploy's heartbeat before its report; the rollback drill: a local
+  health rollback, then the branch rollback naming the same build, adopted with no swap, also when it arrives mid
+  rollback and when only the poll finds it), and `--boot-budget`, which runs 25 boot scenarios
   with simulated slow or failing dependencies and
   checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
