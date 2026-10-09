@@ -6,7 +6,9 @@
 -- rate-limited, expired ones refused; framework ops go to the generation's handler (none: not supported); answers are
 -- plain JSON, scrubbed of every secret (whole, JSON-escaped, or a 12+ character piece), refused when too large; the
 -- session ends when the backend says "not watched", after 3 failed polls, or at once (and holds off) on a 401; client
--- logs come only from the asked player, once, cleaned; the key never appears in any line or answer.
+-- logs come only from the asked player, once, cleaned; the key never appears in any line or answer. 0.5.1 (instant wake):
+-- a wake message for this JobId starts the poll within a tick, other JobIds and malformed wakes do nothing, one wake per
+-- RD_WAKE_GAP s, a forged wake costs one poll, no backend (or not a live server) means no poll.
 local fs = require("@lune/fs")
 local luau = require("@lune/luau")
 local process = require("@lune/process")
@@ -425,7 +427,82 @@ do
 	check("client logs: no answer in RD_CLIENT_LOGS_TIMEOUT s is an error", late ~= nil and late.ok == false and string.find(tostring(late.value), "no_reply", 1, true) ~= nil)
 end
 
--- 8. The key never leaks -------------------------------------------------------------------------------------------------
+-- 8. Instant wake (0.5.1; plans/25 "Instant wake") ------------------------------------------------------------------------
+-- The backend publishes { k = "rd", j = JobId } on TypeTorch/deploy when a watch starts; the kernel hands the decoded
+-- message to RemoteDebug.onWake.
+RemoteDebug._reset()
+do
+	clock += (Constants.RD_AUTH_HOLD or 300) + 1
+	table.clear(requests)
+	table.clear(pollAnswers)
+	local other = RemoteDebug.onWake({ k = "rd", j = "another-job" })
+	local bad = {
+		RemoteDebug.onWake(nil),
+		RemoteDebug.onWake("job-rd-1"),
+		RemoteDebug.onWake({ k = "rd" }),
+		RemoteDebug.onWake({ k = "rd", j = 5 }),
+		RemoteDebug.onWake({ k = "rd", j = "" }),
+		RemoteDebug.onWake({ k = "rd", j = string.rep("a", 65) }),
+		RemoteDebug.onWake({ k = "rd", j = { "job-rd-1" } }),
+	}
+	advance(3)
+	local anyBad = false
+	for _, result in bad do
+		anyBad = anyBad or result ~= false
+	end
+	check("wake: another JobId's wake is ignored (no request)", other == false and #requests == 0)
+	check("wake: malformed wakes are ignored (no request, nothing counted)", not anyBad and #requests == 0 and RemoteDebug.info().wakes == 0 and RemoteDebug.info().wakesIgnored == 0)
+	check("wake: no session runs before a wake for this JobId", RemoteDebug.info().state == "off")
+
+	-- This server's wake: the long-poll starts at once (on the same tick), like a heartbeat reply's rd = 1.
+	table.insert(pollAnswers, { watch = true, commands = { cmd("w1", "status") } })
+	table.insert(pollAnswers, { watch = false, commands = {} })
+	local wokeAt = clock
+	local woke = RemoteDebug.onWake({ k = "rd", j = "job-rd-1" })
+	tick()
+	local first = requests[1]
+	check("wake: this JobId's wake starts the long-poll within a tick", woke == true and first ~= nil and first.method == "GET" and first.at == wokeAt and first.url == BASE .. "/v1/fleet/commands?wait=8")
+	check("wake: the poll goes to the settings' backend with its key and the JobId (the same poll as rd = 1)", first and first.headers.Authorization == "Bearer " .. KEY and first.headers["X-TT-Job"] == "job-rd-1")
+	local info = RemoteDebug.info()
+	check("wake: info() counts it (wakes, lastWakeAt) and says polling", info.wakes == 1 and info.wakesIgnored == 0 and info.lastWakeAt == math.floor(wokeAt) and info.state == "polling")
+	advance(3)
+	check("wake: the session answers commands like any other", answerOf("w1") ~= nil and answerOf("w1").ok == true)
+	check("wake: the backend's 'not watched' still ends the session", RemoteDebug.info().state == "off")
+
+	-- At most one wake per RD_WAKE_GAP s is acted on.
+	local before = polls()
+	local again = RemoteDebug.onWake({ k = "rd", j = "job-rd-1" })
+	advance(3)
+	check("wake: a second wake inside RD_WAKE_GAP is ignored (counted, no poll)", again == false and polls() == before and RemoteDebug.info().wakesIgnored == 1 and RemoteDebug.info().wakes == 1)
+
+	-- A forged wake (the job isn't watched): exactly one poll, then nothing.
+	clock += Constants.RD_WAKE_GAP or 10
+	table.insert(pollAnswers, { watch = false, commands = {} })
+	before = polls()
+	local forged = RemoteDebug.onWake({ k = "rd", j = "job-rd-1" })
+	advance(10)
+	check("wake: a forged wake (job not watched) costs one poll, then stops", forged == true and polls() == before + 1 and RemoteDebug.info().state == "off" and RemoteDebug.info().wakes == 2)
+
+	-- No backend in the signed settings: no effect.
+	clock += Constants.RD_WAKE_GAP or 10
+	table.clear(requests)
+	local saved = target
+	target = nil
+	local none = RemoteDebug.onWake({ k = "rd", j = "job-rd-1" })
+	advance(3)
+	check("wake: no backend in the settings, no poll (counted as ignored)", none == false and #requests == 0 and RemoteDebug.info().wakesIgnored == 2)
+	target = saved
+
+	-- Not a live server (Studio): no effect.
+	clock += Constants.RD_WAKE_GAP or 10
+	RemoteDebug.configure({ active = false })
+	local studio = RemoteDebug.onWake({ k = "rd", j = "job-rd-1" })
+	advance(3)
+	check("wake: a server that isn't live (Studio) never polls", studio == false and #requests == 0)
+	RemoteDebug.configure({ active = true })
+end
+
+-- 9. The key never leaks -------------------------------------------------------------------------------------------------
 do
 	local leaked = false
 	for _, line in output do

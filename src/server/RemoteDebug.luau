@@ -5,7 +5,11 @@
 --
 -- A Roblox server can't be called into, so it PULLS:
 --   1. the explorer marks the job watched on the backend; this server's next heartbeat reply carries `rd = 1`
---      (Fleet.luau hands it to RemoteDebug.wake);
+--      (Fleet.luau hands it to RemoteDebug.wake). 0.5.1 INSTANT WAKE: a backend with an Open Cloud messaging key also
+--      publishes { k = "rd", j = JobId } on TypeTorch/deploy when the watch starts (RemoteDebug.onWake), so the session
+--      starts within a second instead of at the next heartbeat (up to 30 s). The wake is unsigned and only does what
+--      `rd = 1` does: the session's first poll asks the backend, which says whether the job is really watched (a forged
+--      wake costs one poll); other JobIds and malformed wakes are ignored; one wake per RD_WAKE_GAP s at most;
 --   2. the kernel long-polls `GET <url>/v1/fleet/commands?wait=8` (Authorization: the settings' backend key, X-TT-Job:
 --      the JobId), runs each command on a kernel thread and posts the answers to `POST <url>/v1/fleet/results`;
 --   3. it stops as soon as the backend says the job is no longer watched (the backend keeps a job watched 60 s after
@@ -80,8 +84,9 @@ local state = {
 	holdUntil = 0, -- a 401/403/404: no session before then
 	tokens = 0,
 	tokensAt = 0,
+	wakeAt = nil, -- 0.5.1: deps.clock() of the last wake message acted on (RD_WAKE_GAP)
 }
-local stats = { sessions = 0, polls = 0, commands = 0, answered = 0, refused = 0, failed = 0, timeouts = 0, redacted = 0, lastPollAt = nil, lastCommandAt = nil, lastError = nil, lastErrorAt = nil, lastOp = nil }
+local stats = { sessions = 0, polls = 0, commands = 0, answered = 0, refused = 0, failed = 0, timeouts = 0, redacted = 0, wakes = 0, wakesIgnored = 0, lastPollAt = nil, lastCommandAt = nil, lastError = nil, lastErrorAt = nil, lastOp = nil, lastWakeAt = nil }
 
 function RemoteDebug.configure(overrides)
 	for key, value in overrides do
@@ -592,19 +597,52 @@ local function sessionLoop()
 	deps.print(`[TypeTorch] remote debug: stopped polling ({why})`)
 end
 
--- A heartbeat reply (Fleet.luau): `rd = 1` starts (or extends) a session.
-function RemoteDebug.wake(reply: any)
-	if typeof(reply) ~= "table" or (reply.rd ~= 1 and reply.rd ~= true) then
-		return
-	end
+-- Starts (or extends) a session. false when none can run: not a live server, closing, held after a 401/403/404, or no
+-- backend in the signed settings.
+local function start(): boolean
 	if not deps.active or state.closed or deps.clock() < state.holdUntil or not deps.target() then
-		return
+		return false
 	end
 	state.watchUntil = math.max(state.watchUntil, deps.clock() + (Constants.RD_IDLE_SECONDS or 60))
 	if not state.running then
 		state.running = true
 		deps.spawn(sessionLoop)
 	end
+	return true
+end
+
+-- A heartbeat reply (Fleet.luau): `rd = 1` starts (or extends) a session.
+function RemoteDebug.wake(reply: any)
+	if typeof(reply) ~= "table" or (reply.rd ~= 1 and reply.rd ~= true) then
+		return
+	end
+	start()
+end
+
+-- 0.5.1 INSTANT WAKE: a wake message on TypeTorch/deploy ({ k = "rd", j = JobId }, the decoded JSON; unsigned, from the
+-- backend through Open Cloud). Every server hears every wake: only the one whose JobId it names acts, at most once per
+-- RD_WAKE_GAP s, exactly like a heartbeat reply's rd = 1 (the session's first poll asks the backend whether this job
+-- is really watched). Returns whether a session runs now because of it. Never yields.
+function RemoteDebug.onWake(message: any): boolean
+	if typeof(message) ~= "table" or typeof(message.j) ~= "string" or #message.j == 0 or #message.j > 64 then
+		return false -- malformed
+	end
+	if deps.jobId == "" or message.j ~= deps.jobId then
+		return false -- another server's
+	end
+	local now = deps.clock()
+	if state.wakeAt ~= nil and now - state.wakeAt < (Constants.RD_WAKE_GAP or 10) then
+		stats.wakesIgnored += 1
+		return false
+	end
+	state.wakeAt = now
+	if not start() then
+		stats.wakesIgnored += 1
+		return false
+	end
+	stats.wakes += 1
+	stats.lastWakeAt = deps.time()
+	return true
 end
 
 -- BindToClose: no new polls.
@@ -624,6 +662,11 @@ function RemoteDebug.info()
 		failed = stats.failed,
 		timeouts = stats.timeouts,
 		redacted = stats.redacted,
+		-- 0.5.1: wake messages for this server that started (or extended) a session, those ignored (RD_WAKE_GAP, or no
+		-- session possible: no backend, held, closing), and when the last one acted (unix s).
+		wakes = stats.wakes,
+		wakesIgnored = stats.wakesIgnored,
+		lastWakeAt = stats.lastWakeAt,
 		lastPollAt = stats.lastPollAt,
 		lastCommandAt = stats.lastCommandAt,
 		lastOp = stats.lastOp,
@@ -634,7 +677,7 @@ end
 
 -- Tests: start over.
 function RemoteDebug._reset()
-	state.running, state.closed, state.watchUntil, state.holdUntil = false, false, 0, 0
+	state.running, state.closed, state.watchUntil, state.holdUntil, state.wakeAt = false, false, 0, 0, nil
 	state.tokens, state.tokensAt = Constants.RD_COMMANDS_BURST or 10, deps.clock()
 	for key in stats do
 		stats[key] = if typeof(stats[key]) == "number" then 0 else nil

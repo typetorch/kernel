@@ -27,7 +27,9 @@
 -- the channel / rules split too. 0.5.0's `--remote-debug` (plans/25): a public prod server whose signed settings hold
 -- `backend`; the heartbeat reply's `rd = 1` starts the long-poll, the kernel ops answer, a write op and a non-owner are
 -- refused, framework ops go through api:onRemoteDebug, a player's client logs come over __tt/rdlogs, answers carry no
--- secret, and "not watched" stops the polling.
+-- secret, and "not watched" stops the polling. 0.5.1 adds the instant wake to it: with heartbeat replies quiet, a wake
+-- { k = "rd", j = JobId } on TypeTorch/deploy starts the poll at once; another JobId's or a malformed wake does nothing,
+-- and a wake never becomes the last deploy message.
 -- Every mode also checks that no swap ran on a thread its own stopped generation owned.
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore; 0.3.8: no ConfigService at all), then drives it:
@@ -4184,10 +4186,11 @@ end
 
 if MODES38.remoteDebug then
 	local BASE = "https://backend.example.test/api"
-	local rd = { watched = false, queue = {}, gets = 0 }
+	-- quietHeartbeats (0.5.1): heartbeat replies never say rd (a heartbeat 30 s away): only a wake can start the poll.
+	local rd = { watched = false, queue = {}, gets = 0, quietHeartbeats = false }
 	httpScript.respond = function(entry)
 		if entry.url == BASE .. "/v1/fleet/heartbeat" then
-			return if rd.watched then '{"ok":true,"rd":1}' else '{"ok":true}'
+			return if rd.watched and not rd.quietHeartbeats then '{"ok":true,"rd":1}' else '{"ok":true}'
 		elseif string.find(entry.url, BASE .. "/v1/fleet/commands", 1, true) == 1 then
 			rd.gets += 1
 			local commands = rd.queue
@@ -4307,8 +4310,38 @@ if MODES38.remoteDebug then
 	local gets = rd.gets
 	task.wait(1.5)
 	check("remote debug: 'not watched' stops the polling", rd.gets == gets)
+	-- 0.5.1 INSTANT WAKE (plans/25): heartbeat replies stay quiet (as if the next heartbeat were 30 s away); the
+	-- backend's wake on TypeTorch/deploy starts the poll at once. Another JobId's or a malformed wake does nothing, and a
+	-- wake is never taken for a deploy message.
+	rd.quietHeartbeats = true
+	rd.watched = true
+	task.wait(1.2)
+	check("remote debug wake: watched but quiet heartbeats: no poll yet", rd.gets == gets)
+	publish("TypeTorch/deploy", { k = "rd", j = "some-other-job-id" })
+	publish("TypeTorch/deploy", { k = "rd" })
+	publish("TypeTorch/deploy", { k = "rd", j = 42 })
+	task.wait(0.5)
+	check("remote debug wake: another JobId's or a malformed wake starts nothing", rd.gets == gets and status().remoteDebug.wakes == 0)
+	rd.queue = { command("w1", "status") }
+	local wokeAt = os.clock()
+	publish("TypeTorch/deploy", { k = "rd", j = JOB })
+	check("remote debug wake: this JobId's wake starts the poll at once (no heartbeat)", waitFor("wake poll", function()
+		return rd.gets > gets
+	end, 0.5) and os.clock() - wokeAt < 0.5)
+	check("remote debug wake: the woken session answers", waitFor("wake answer", function()
+		return answer("w1") ~= nil
+	end, 4) and answer("w1").ok == true)
+	local last = status().lastMessage
+	check("remote debug wake: a wake is not a deploy message (lastMessage untouched)", last == nil or last.data == nil or last.data.k ~= "rd")
+	check("remote debug wake: status().remoteDebug counts it", status().remoteDebug.wakes == 1 and typeof(status().remoteDebug.lastWakeAt) == "number")
+	rd.watched = false
+	rd.quietHeartbeats = false
+	task.wait(0.6)
+	gets = rd.gets
+	task.wait(1.5)
+	check("remote debug wake: 'not watched' stops the woken session too", rd.gets == gets)
 	local info = status().remoteDebug
-	check("remote debug: status().remoteDebug counts (sessions, commands, refused) and says off", info ~= nil and info.state == "off" and info.sessions >= 1 and info.commands >= 9 and info.refused >= 2 and info.redacted >= 1)
+	check("remote debug: status().remoteDebug counts (sessions, commands, refused) and says off", info ~= nil and info.state == "off" and info.sessions >= 2 and info.commands >= 10 and info.refused >= 2 and info.redacted >= 1)
 	local labels = {}
 	for _, row in SMOKE.kernel:budget().detail do
 		labels[`{row.caller}/{row.kind}/{row.op}`] = row.total
@@ -4447,7 +4480,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.5.0")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.5.1")
 
 -- 0.3.8: no settings record here (a game that never ran `typetorch settings push`): the defaults, reported as missing.
 do

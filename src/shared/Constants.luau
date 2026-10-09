@@ -7,7 +7,7 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.5.0",
+	KERNEL_VERSION = "0.5.1",
 
 	-- The kernel's DataStore: durable heads, deployments, private records, events, and (0.3.8) the signed settings.
 	DATASTORE = "TypeTorch",
@@ -26,7 +26,9 @@ return {
 	-- runs longer than DETACHED_SLOW seconds is logged once.
 	DETACHED_MAX = 256,
 	DETACHED_SLOW = 60,
-	-- Fast path for deploys; the poll below is the backup (MessagingService delivery is best-effort).
+	-- Fast path for deploys; the poll below is the backup (MessagingService delivery is best-effort). The kernel's one
+	-- control topic: it also carries the settings ping ({ k = "settings", s }, 0.3.8), the peers' roll call ask
+	-- ({ rc = 1, ... }, 0.3.6) and the remote debug wake ({ k = "rd", j = JobId }, 0.5.1, RD_WAKE_GAP), none a deploy.
 	DEPLOY_TOPIC = "TypeTorch/deploy",
 	-- 0.2.3: remote experiment pins (A/B) from Manage > Servers: { j?, pct?, a?, b, by, t, unpin? }.
 	PIN_TOPIC = "TypeTorch/pin",
@@ -343,6 +345,12 @@ return {
 	RD_FAILURES_MAX = 3,
 	RD_RETRY_SECONDS = 5,
 	RD_AUTH_HOLD = 300,
+	-- 0.5.1 INSTANT WAKE (plans/25 "Instant wake"): when the explorer starts watching a server that isn't polling, the
+	-- backend publishes { k = "rd", j = JobId } on DEPLOY_TOPIC (Open Cloud Messaging; unsigned). The server with that
+	-- JobId starts its session at once, as if a heartbeat reply said rd = 1; its first poll asks the backend whether it is
+	-- really watched, so a forged wake costs one poll. Other JobIds and malformed wakes are ignored; at most one wake per
+	-- RD_WAKE_GAP s is acted on.
+	RD_WAKE_GAP = 10,
 	-- The read-only ops (v1): the kernel's own, and the ones the running generation answers through api:onRemoteDebug.
 	RD_KERNEL_OPS = { "status", "builds", "budget", "logs", "players", "player.logs", "errors" },
 	RD_FRAMEWORK_OPS = { "modules", "state", "assets", "network", "dex.children", "dex.props" },

@@ -59,6 +59,8 @@
 -- heartbeat reply says so (`rd = 1`) and the kernel long-polls the signed settings' backend for read-only commands
 -- (status, builds, budget, logs, players, a player's client logs, errors; and through api:onRemoteDebug the running
 -- generation's modules, state, assets, network and a read-only Dex), owners only, answers scrubbed of secrets.
+-- 0.5.1 (plans/25 "Instant wake"): the backend may also publish { k = "rd", j = JobId } on TypeTorch/deploy when the
+-- watch starts; the named server starts its poll at once instead of at its next heartbeat (RemoteDebug.onWake).
 
 -- 0.3.2 (boot budget): every boot wait and cap counts from here.
 local kernelStartedAt = os.clock()
@@ -2079,6 +2081,13 @@ local function onDeployMessage(message)
 		Registry.settings.ping(data.s)
 		return
 	end
+	-- 0.5.1 (plans/25 "Instant wake"): the backend's remote debug wake ({ k = "rd", j = JobId }; unsigned, Open Cloud).
+	-- Only the named server acts, like a heartbeat reply's rd = 1 (rate-limited; the poll asks the backend). Not a
+	-- deploy, so it never becomes lastMessage. Older kernels ignore it (no branch).
+	if data.k == "rd" then
+		RemoteDebug.onWake(data)
+		return
+	end
 	lastMessage = {
 		data = data,
 		receivedMs = DateTime.now().UnixTimestampMillis,
@@ -3207,8 +3216,8 @@ local function status()
 		-- counted }; nil before the first second (the heartbeat's `pf` is the same over the heartbeat interval).
 		perf = Budget.perf(),
 		-- 0.5.0 (plans/25): remote debug ({ state = "off" | "polling" | "held", sessions, polls, commands, answered,
-		-- refused, failed, timeouts, redacted, lastPollAt?, lastCommandAt?, lastOp?, lastError? }; never a command's
-		-- contents, the URL or the key).
+		-- refused, failed, timeouts, redacted, lastPollAt?, lastCommandAt?, lastOp?, lastError?; 0.5.1: wakes,
+		-- wakesIgnored, lastWakeAt? }; never a command's contents, the URL or the key).
 		remoteDebug = RemoteDebug.info(),
 	}
 end
