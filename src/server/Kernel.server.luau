@@ -3631,7 +3631,8 @@ Fleet.start()
 -- 0.4.1 (plans/22): the loader ran the baked fallback kernel because the kernel asset couldn't be used. Said once per
 -- server; the fleet API groups them. "unavailable" (moderated, archived, deleted) is critical: kernel updates can't
 -- reach new servers until `typetorch kernel deploy --reupload` (or a rollback to a version that loads).
-if kernelFolder:GetAttribute("KernelSource") == "baked" and typeof(kernelFolder:GetAttribute("KernelLoadError")) == "string" then
+-- (Not for "nopointer": the settings hold no kernel pointer yet, the baked kernel is the plan.)
+if kernelFolder:GetAttribute("KernelSource") == "baked" and typeof(kernelFolder:GetAttribute("KernelLoadError")) == "string" and kernelFolder:GetAttribute("KernelLoadClass") ~= "nopointer" then
 	local class = kernelFolder:GetAttribute("KernelLoadClass")
 	fleetAlert(if class == "unavailable" then "critical" else "warning", "kernel_asset_unavailable", `{kernelFolder:GetAttribute("KernelLoadError")} (the baked fallback kernel {Constants.KERNEL_VERSION} runs)`, nil, true)
 end

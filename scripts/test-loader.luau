@@ -273,7 +273,7 @@ d, installs = deps({ readSettings = function()
 	return VECTORS.noKernel
 end })
 result = Core.run(d)
-check("run: no pointer -> baked (settings)", result.source == "baked" and result.class == "settings", result.error)
+check("run: no pointer -> baked (nopointer: not set up yet)", result.source == "baked" and result.class == "nopointer", result.error)
 
 print(`{passed} passed, {failed} failed`)
 process.exit(if failed == 0 then 0 else 1)

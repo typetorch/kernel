@@ -58,7 +58,8 @@ function Core.compareVersions(a: string, b: string): number
 end
 
 -- What a failure was, for the fleet (plans/22 "Moderation and outages"): "unavailable" (the asset or version is
--- moderated, archived, deleted or not ours), "timeout", "settings" (no usable record), "unsigned", "invalid" (the
+-- moderated, archived, deleted or not ours), "timeout", "settings" (no usable record), "nopointer" (a record without a
+-- kernel pointer: not set up yet), "unsigned", "invalid" (the
 -- package or the pointer is wrong), "error" (anything else). The exact Roblox texts are unverified (spike K4).
 function Core.classify(message: string): string
 	local text = string.lower(tostring(message))
@@ -343,7 +344,9 @@ function Core.run(deps)
 	end
 	local pointer, channel = Core.pickPointer(body, { serverType = deps.serverType, privateBranch = privateBranch })
 	if pointer == nil then
-		fallback("settings", tostring(channel))
+		-- "nopointer": the kernel asset isn't set up yet (no `typetorch kernel deploy --asset`): the baked kernel is the
+		-- plan, not an outage (the kernel raises no alert for it).
+		fallback("nopointer", tostring(channel))
 		result.seconds = deps.now() - startedAt
 		return result
 	end
