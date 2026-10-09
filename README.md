@@ -165,13 +165,13 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   a test place).
 - The signed settings record (0.3.8, `src/server/Settings.luau`; plans/20): ONE DataStore entry, `TypeTorch` /
   `settings` = `{ v = 1, seq, at, body, sig, sigF }`, replaces every ConfigService key. `body` is JSON text
-  (`defaultBranch`, `channels`, `access`, `fleet`, `analytics`, `game`); `sig` / `sigF` are both prod keys' Ed25519
+  (`defaultBranch`, `channels`, `access`, `backend`, `fleet`, `analytics`, `game`); `sig` / `sigF` are both prod keys' Ed25519
   signatures of `tt1settings \n seq \n at \n body` (Signing.settingsCanonical; the strict rule of signed deploys).
   Read at boot (inside the 3 s gate), every 55 s from the sync tick and right after a ping (`{"k":"settings","s":seq}` on
   `TypeTorch/deploy`); taken only when it verifies and its seq is newer; a missing, unsigned, invalid or older copy keeps
   the last good one. `api:settings()` (a copy, server only: it holds tokens), `api:onSettingsChanged(fn)`,
   `status().settings` (state, seq, age, verifiedBy, fields, refused). Written only by the CLI (`typetorch settings`,
-  `fleet setup`, `access push`). The Studio `Registry` / `BootAssetId` overrides and the ConfigService log quieting are
+  `backend setup`, `access push`). The Studio `Registry` / `BootAssetId` overrides and the ConfigService log quieting are
   gone.
 - Game messaging (0.3.8, `src/server/Messaging.luau`; plans/19 item 4): game topics ride ONE MessagingService topic,
   `TypeTorch/game`, subscribed on the first listener and held for the server's life (a swap never subscribes again).
