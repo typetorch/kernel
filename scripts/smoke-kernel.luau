@@ -442,6 +442,13 @@ local SMOKE = { boots = {}, stops = {}, closed = {}, behave = {}, messages = {},
 -- 0.3.8 (plans/20): signed settings records, made by the CLI with the public plans/03 test keys
 -- (cli/test/fixtures/settings-fixtures.ts; the CLI's tests check it still signs them byte for byte).
 SMOKE.settings = serde.decode("json", fs.readFile("scripts/smoke-settings.json"))
+-- 0.4.2: the `workspace` scripts see (only GetRealPhysicsFPS: the kernel's physics FPS for `pf`).
+SMOKE.physicsFps = 59.5
+SMOKE.workspace = {
+	GetRealPhysicsFPS = function()
+		return SMOKE.physicsFps
+	end,
+}
 local moduleCache = {}
 local game
 
@@ -547,7 +554,7 @@ local function runSource(scriptInstance)
 	local env = setmetatable({
 		script = scriptInstance,
 		game = game,
-		workspace = nil,
+		workspace = SMOKE.workspace,
 		require = function(target)
 			if type(target) == "string" then
 				return requireInstance(resolve(scriptInstance, target))
@@ -735,6 +742,8 @@ local services = {
 		IsStudio = function()
 			return table.find(process.args, "--studio-local") ~= nil or table.find(process.args, "--messaging-studio") ~= nil
 		end,
+		-- 0.4.2: the kernel counts TPS from it (Budget.luau); `--perf` fires frames with their dt.
+		Heartbeat = signal(),
 	},
 	Stats = {
 		GetTotalMemoryUsageMb = function()
@@ -1072,16 +1081,25 @@ local MODES38 = {
 	-- batch templated and posted to <url>/v1/errors with the player's pid, status().errors / status().budget,
 	-- api:budget() and api:budgetCount.
 	errors = table.find(process.args, "--errors") ~= nil,
+	-- 0.4.2 `--perf` (heartbeat metrics): the --errors server; RunService.Heartbeat frames give every heartbeat `pf` =
+	-- { a, m, p } (TPS average and slowest second since the previous heartbeat, physics FPS; a few bytes), memory stays
+	-- in `bu.mem`, status().perf has the last minute, api:fleetStatus() never carries it.
+	perf = table.find(process.args, "--perf") ~= nil,
+	-- 0.4.2 `--adopt` (seq adoption; the 2026-10-09 rollback drill): a reserved dev server on the fleet API. A deploy
+	-- posts the heartbeat with its seq before its report; after a local health rollback to B, the branch rollback naming
+	-- B is adopted (applied, reported swapped, no swap), also when it arrives while the local rollback still loads B,
+	-- and when only the poll finds it.
+	adopt = table.find(process.args, "--adopt") ~= nil,
 }
 -- 0.3.8 loading screens (plans/19 item 13), client side: `--client-boot` (the game's BootScreen replaces the kernel's
 -- "Starting..." until the first client generation runs and the server's hold ends), `--client-own` (KernelScreen =
 -- false: the game draws its own; the kernel's shows only for moves and later holds). `--client` checks ClientReady,
 -- ClientGeneration and Holding too.
 
-if FLEET_MODE then
+if FLEET_MODE or MODES38.adopt then
 	dataStore.data.settings = deepCopy(SMOKE.settings.fleetSlash) -- 0.3.8: was ConfigService TypeTorchFleet
 end
-if DEV_MODE or VIP_MODE or HEALTH_MODE or FLEET_MODE or DURABLE_MODE or HEALTH_CONFIG_MODE then
+if DEV_MODE or VIP_MODE or HEALTH_MODE or FLEET_MODE or DURABLE_MODE or HEALTH_CONFIG_MODE or MODES38.adopt then
 	GAME_ROOT_PROPS.PrivateServerId = "ps-smoke"
 	GAME_ROOT_PROPS.PrivateServerOwnerId = if VIP_MODE then 777 else 0
 	dataStore.data["private/ps-smoke"] = { branch = "dev", setBy = 1, setAt = "2026-10-04T00:00:00Z", code = if HEALTH_MODE or FLEET_MODE then "smoke-access-code" else nil }
@@ -1693,7 +1711,7 @@ if SWITCH_MODE then
 	Constants.FLEET_RETRY_DELAYS = { 0.05 }
 	Constants.FLEET_RATE_PER_MINUTE = 6000
 end
-if FLEET_MODE then
+if FLEET_MODE or MODES38.adopt then
 	Constants.FLEET_HEARTBEAT_SECONDS = 0.5
 	Constants.FLEET_PLAYERS_GAP = 0.2
 	Constants.FLEET_WATCH_SECONDS = 0.2
@@ -1728,7 +1746,7 @@ if HOLD_MODE or HOLD_OPTOUT_MODE or PEERS_MODE or PEERS_UNTRUSTED_MODE or BACKUP
 		Constants.READY_TIMEOUT = 1.5
 	end
 end
-if HEALTH_MODE or HEALTH_PROD_MODE or LKG_BOOT_MODE or FLEET_MODE or HEALTH_CONFIG_MODE then
+if HEALTH_MODE or HEALTH_PROD_MODE or LKG_BOOT_MODE or FLEET_MODE or HEALTH_CONFIG_MODE or MODES38.adopt then
 	Constants.HEALTH_WINDOW = 1.5
 	Constants.POLL_SECONDS = 0.3
 end
@@ -1751,7 +1769,7 @@ end
 if MODES38.settingsMissing then
 	kernelFolder.Settings.Parent = nil
 end
-if MODES38.errors then
+if MODES38.errors or MODES38.perf then
 	dataStore.data.settings = deepCopy(SMOKE.settings.backend)
 	Constants.FLEET_HEARTBEAT_SECONDS = 0.5
 	Constants.FLEET_RATE_PER_MINUTE = 6000
@@ -1900,7 +1918,7 @@ local function finish()
 	check(`no unexpected errors on kernel threads{if #unexpected > 0 then ": " .. unexpected[1] else ""}`, #unexpected == 0)
 	check(`no swap ran on a thread its own stopped generation owned (busy-flag hazard){if #hazards > 0 then ": " .. hazards[1] else ""}`, #hazards == 0)
 	check("the kernel never used a MemoryStore sorted map (0.3.2: fleet status and reports are API only)", #sortedMapRequests == 0)
-	if not FLEET_MODE and not SWITCH_MODE and not FALLBACK_FLEET and not ACCESS_MODE and not MODES38.errors then
+	if not FLEET_MODE and not SWITCH_MODE and not FALLBACK_FLEET and not ACCESS_MODE and not MODES38.errors and not MODES38.perf and not MODES38.adopt then
 		check("no HTTP request without settings.fleet", #httpRequests == 0)
 	end
 	local leaked = false
@@ -1926,7 +1944,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if MODES38.errors then "--errors" elseif MODES38.rollbackPrev then "--rollback-prev" elseif MODES38.detached then "--detached" elseif MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if MODES38.errors then "--errors" elseif MODES38.perf then "--perf" elseif MODES38.adopt then "--adopt" elseif MODES38.rollbackPrev then "--rollback-prev" elseif MODES38.detached then "--detached" elseif MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -3982,6 +4000,172 @@ if MODES38.errors then
 	finish()
 end
 
+if MODES38.perf then
+	local BASE = "https://backend.example.test/api"
+	local function beats(from: number?)
+		local list = {}
+		for index = from or 1, #httpRequests do
+			local request = httpRequests[index]
+			if request.url == BASE .. "/v1/fleet/heartbeat" then
+				table.insert(list, request.body)
+			end
+		end
+		return list
+	end
+	-- A heartbeat now, and its body (the kernel's own Fleet module: the same instance the kernel required).
+	local Fleet = requireInstance(kernelFolder.Fleet)
+	local function beatNow()
+		local from = #httpRequests + 1
+		Fleet.heartbeat()
+		local body = nil
+		waitFor("heartbeat", function()
+			body = beats(from)[1]
+			return body ~= nil
+		end, 2)
+		return body
+	end
+	local function frames(count: number, dt: number)
+		for _ = 1, count do
+			services.RunService.Heartbeat:Fire(dt)
+		end
+		task.wait(0.05) -- the handlers run deferred
+	end
+	services.Stats.GetTotalMemoryUsageMb = function()
+		return 812.5
+	end
+	services.Stats.GetMemoryUsageMbForTag = function(_, tag)
+		return if tag == Enum.DeveloperMemoryTag.LuaHeap then 120.25 else 1
+	end
+	check("perf: boots; heartbeats go out", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() == "aaaaaaa-111111" and #beats() > 0
+	end))
+	check("perf: no pf (and no status().perf) before the first whole second was counted", beats()[1].pf == nil and status().perf == nil)
+	Constants.FLEET_HEARTBEAT_SECONDS = 1000 -- only the heartbeats this test asks for from here
+	task.wait(0.3)
+	frames(128, 1 / 64) -- two seconds at 64 TPS (1/64 and 1/8 add up exactly)
+	frames(8, 0.125) -- one second at 8 TPS
+	frames(16, 1 / 64) -- a quarter second: the open bucket
+	local body = beatNow()
+	local pf = body and body.pf
+	check("perf: the heartbeat's pf = { a = TPS average, m = the slowest second, p = physics FPS } since the last heartbeat", pf ~= nil and pf.a == 45.3 and pf.m == 8 and pf.p == 59.5, pf and serde.encode("json", pf))
+	local size = if pf then #serde.encode("json", pf) else math.huge
+	check(`perf: pf is a few bytes of JSON ({size} <= 40)`, size <= 40)
+	check("perf: memory stays in bu.mem (total MB, LuaHeap MB), not repeated in pf", body ~= nil and body.bu ~= nil and body.bu.mem.t == 812.5 and body.bu.mem.h == 120.3 and pf.t == nil)
+	body = beatNow()
+	check("perf: a heartbeat within the same second repeats the newest second", body ~= nil and body.pf ~= nil and body.pf.a == 8 and body.pf.m == 8)
+	frames(48, 1 / 64) -- closes the open bucket (64 frames in 1 s)
+	frames(64, 1 / 64)
+	SMOKE.physicsFps = 240
+	body = beatNow()
+	check("perf: the next heartbeat covers only the seconds since the previous one", body ~= nil and body.pf ~= nil and body.pf.a == 64 and body.pf.m == 64 and body.pf.p == 240)
+	local perf = status().perf
+	check("perf: status().perf = the last minute (a, m, p, s), untouched by heartbeats", perf ~= nil and perf.s == 5 and perf.m == 8 and perf.a == 52.8 and perf.p == 240)
+	check("perf: api:fleetStatus() (the roll call, analytics) carries no pf", SMOKE.kernel:fleetStatus().pf == nil)
+	finish()
+end
+
+if MODES38.adopt then
+	local PREFIX = "https://fleet.example.test/api/v1/fleet/"
+	-- Requests to <PREFIX><path> from index `from` on: { index, body }.
+	local function posts(path: string, from: number)
+		local list = {}
+		for index = from, #httpRequests do
+			local request = httpRequests[index]
+			if request.url == PREFIX .. path then
+				table.insert(list, { index = index, body = request.body })
+			end
+		end
+		return list
+	end
+	local function reportAt(seq: number, result: string, from: number): number?
+		for _, item in posts("report", from) do
+			if item.body.s == seq and item.body.r == result then
+				return item.index
+			end
+		end
+		return nil
+	end
+	local function beatAt(seq: number, from: number): number?
+		for _, item in posts("heartbeat", from) do
+			if typeof(item.body.q) == "number" and item.body.q >= seq then
+				return item.index
+			end
+		end
+		return nil
+	end
+	-- The heartbeat with the seq reached the backend before the report did (`deploy --wait` ends on the report).
+	local function beatFirst(seq: number, result: string, from: number): boolean
+		local report, beat = reportAt(seq, result, from), beatAt(seq, from)
+		return report ~= nil and beat ~= nil and beat < report
+	end
+	local function deploy(seq: number, assetId: number, artifactId: string, rollback: boolean?)
+		publish("TypeTorch/deploy", { b = "dev", a = assetId, i = artifactId, s = seq, c = string.sub(artifactId, 1, 7), ch = "dev", t = nowMs(), r = if rollback then 1 else nil })
+	end
+	check("adopt: boots the dev head D (#5)", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() == "ddddddd-444444" and status().appliedSeq == 5
+	end))
+
+	-- 1. A plain deploy: the heartbeat with its seq goes out before its report.
+	local mark = #httpRequests + 1
+	deploy(6, 1002, "bbbbbbb-222222")
+	check("adopt: a deploy (#6) swaps; the heartbeat with q = 6 is posted before the swapped report", waitFor("deploy", function()
+		return running() == "bbbbbbb-222222" and beatFirst(6, "swapped", mark)
+	end, 4))
+
+	-- 2. The drill: H (#7) fails its onStart, the server rolls itself back to B; then the CLI's branch rollback (#8)
+	-- names B, the build it already runs.
+	deploy(7, 1008, "hhhhhhh-888888")
+	check("adopt: H (#7) fails its onStart: rolled back locally to B; the applied seq stays 7", waitFor("local rollback", function()
+		return reported(7, "rolled_back") and running() == "bbbbbbb-222222" and status().appliedSeq == 7
+	end, 6))
+	local loadsB = assets[1002].loads
+	local generation = status().generation.number
+	mark = #httpRequests + 1
+	deploy(8, 1002, "bbbbbbb-222222", true)
+	check("adopt: the branch rollback (#8) to the build it runs is adopted: applied seq 8, reported swapped in 0 s, no swap", waitFor("adopt", function()
+		local report = reportOf(8)
+		return status().appliedSeq == 8 and report ~= nil and report.r == "swapped" and report.d == 0
+	end, 3) and status().generation.number == generation and assets[1002].loads == loadsB and running() == "bbbbbbb-222222")
+	check("adopt: the heartbeat with q = 8 reaches the backend before the #8 report (deploy --wait: no server on an older seq)", waitFor("order", function()
+		return beatFirst(8, "swapped", mark)
+	end, 3))
+
+	-- 3. The race: N (#9) fails its onStart and the branch rollback (#10) to B arrives while the local rollback is still
+	-- loading B. It waits for the local rollback, then adopts #10: B is loaded once, not swapped in a second time.
+	addAsset(1020, payload("nnnnnnn-202020", "prod"))
+	SMOKE.behave["nnnnnnn-202020"] = function(kernel)
+		kernel:reportError({ kind = "onStart", module = "CoinService", message = "attempt to index nil with 'coins'" })
+	end
+	LATENCY.payloadLoad = 0.6
+	mark = #httpRequests + 1
+	deploy(9, 1020, "nnnnnnn-202020")
+	check("adopt: N (#9) fails its onStart; the local rollback starts loading B", waitFor("restore load", function()
+		return (assets[1002].loads or 0) == loadsB + 1 and running() == "nnnnnnn-202020"
+	end, 4))
+	local newest = status().generation.number
+	deploy(10, 1002, "bbbbbbb-222222", true)
+	check("adopt: the local rollback finishes (#9 rolled_back), then #10 is adopted (applied 10, swapped in 0 s)", waitFor("race", function()
+		local report = reportOf(10)
+		return reported(9, "rolled_back") and report ~= nil and report.r == "swapped" and report.d == 0 and status().appliedSeq == 10
+	end, 6) and running() == "bbbbbbb-222222")
+	task.wait(0.8) -- a second swap would have loaded B again by now
+	check("adopt: B was loaded once (one new generation): no second swap of the same build", assets[1002].loads == loadsB + 1 and status().generation.number == newest + 1 and running() == "bbbbbbb-222222")
+	local exhausted = false
+	for _, item in posts("alert", mark) do
+		exhausted = exhausted or item.body.code == "lkg_exhausted"
+	end
+	check("adopt: no lkg_exhausted alert and no degraded restart of N", not exhausted and not said("nothing else runs: restarting nnnnnnn"))
+	LATENCY.payloadLoad = nil
+
+	-- 4. A branch rollback whose message never came (#11): the poll finds the head names the running build.
+	mark = #httpRequests + 1
+	memoryStore.data.heads.dev = { assetId = 1002, artifactId = "bbbbbbb-222222", seq = 11, commit = "bbbbbbb", channel = "dev", t = nowMs(), deployedAt = "2026-10-09T00:00:00Z", rollback = true }
+	check("adopt: the poll adopts a head (#11) naming the running build: applied 11, reported swapped, heartbeat first", waitFor("poll", function()
+		return status().appliedSeq == 11 and reported(11, "swapped") and beatFirst(11, "swapped", mark)
+	end, 4) and assets[1002].loads == loadsB + 1)
+	finish()
+end
+
 if ACCESS_MODE then
 	check("access: boots", waitFor("boot", function()
 		return SMOKE.kernel ~= nil and running() ~= nil
@@ -4105,7 +4289,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.4.0")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.4.2")
 
 -- 0.3.8: no settings record here (a game that never ran `typetorch settings push`): the defaults, reported as missing.
 do
