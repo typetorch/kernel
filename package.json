@@ -1,6 +1,6 @@
 {
 	"name": "@typetorch/kernel",
-	"version": "0.4.2",
+	"version": "0.5.0",
 	"description": "TypeTorch kernel: the small Luau loader baked into the place (boot, branches, hot swaps, stable remotes, /tt).",
 	"license": "MIT",
 	"repository": {

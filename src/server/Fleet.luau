@@ -29,6 +29,9 @@
 -- 0.4.2: heartbeats also carry `pf` = { a, m, p } (TPS average and slowest second since the last heartbeat, physics FPS;
 -- Budget.perfWindow through deps.heartbeatExtra). Fleet.heartbeat("seq") (the applied seq moved) is sent AHEAD of the
 -- queued reports, so the backend's servers row has the new `q` before the deploy report that ends `deploy --wait`.
+-- 0.5.0 (plans/25, remote debug): a heartbeat's reply is read: `{ ok, rd = 1 }` means the explorer watches this server,
+-- and deps.onHeartbeatReply hands it to RemoteDebug.luau (which then polls for commands). Only heartbeat replies are
+-- read, and only as JSON; anything else is ignored.
 
 local Constants = require(game:GetService("ReplicatedStorage"):WaitForChild("TypeTorchKernelShared"):WaitForChild("Constants"))
 
@@ -50,6 +53,8 @@ local deps = {
 	heartbeatExtra = function()
 		return nil
 	end,
+	-- 0.5.0: (reply: table) -> (): a heartbeat's decoded JSON reply (remote debug's `rd`).
+	onHeartbeatReply = function(_reply) end,
 	encode = nil, -- (table) -> string
 	decode = nil, -- (string) -> any
 	warn = warn,
@@ -262,8 +267,9 @@ local function noteFailedCycle(code: number?, errorText: string?)
 	outageLine(`[TypeTorch] fleet API {host} {if hold then "refused" else "unreachable"} ({outage.reason or "?"}): {hintFor(code, errorText)}; {outage.failures} failed request(s) in a row, next try in {math.ceil(wait)} s`)
 end
 
--- One POST (yields). Returns (ok, retry, code?, errorText?): retry = worth trying again (no answer, 429, 5xx).
-local function post(path: string, body): (boolean, boolean, number?, string?)
+-- One POST (yields). Returns (ok, retry, code?, errorText?, responseBody?): retry = worth trying again (no answer, 429,
+-- 5xx); responseBody (0.5.0) only on success.
+local function post(path: string, body): (boolean, boolean, number?, string?, string?)
 	local current = settings
 	if not current then
 		return false, false
@@ -285,7 +291,7 @@ local function post(path: string, body): (boolean, boolean, number?, string?)
 		stats.lastOkAt = os.time()
 		stats.lastStatus = response.StatusCode
 		noteSuccess()
-		return true, false
+		return true, false, nil, nil, if typeof(response.Body) == "string" then response.Body else nil
 	end
 	stats.failed += 1
 	stats.lastErrorAt = os.time()
@@ -379,7 +385,14 @@ local function step(): boolean
 	end
 	heartbeat.due, heartbeat.urgent = false, false
 	heartbeat.lastAt = now
-	local ok, retry, code, errorText = post("/v1/fleet/heartbeat", heartbeatBody())
+	local ok, retry, code, errorText, reply = post("/v1/fleet/heartbeat", heartbeatBody())
+	if ok and reply and #reply > 0 and #reply < 4096 and deps.decode then
+		-- 0.5.0: the reply may ask for a remote debug session (`rd`); a bad reply is ignored.
+		local decodedOk, decoded = pcall(deps.decode, reply)
+		if decodedOk and typeof(decoded) == "table" then
+			pcall(deps.onHeartbeatReply, decoded)
+		end
+	end
 	if ok or not retry or heartbeat.attempts >= #Constants.FLEET_RETRY_DELAYS then
 		heartbeat.attempts, heartbeat.nextAt = 0, 0
 		if not ok then

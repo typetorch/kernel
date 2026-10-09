@@ -7,7 +7,7 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.4.2",
+	KERNEL_VERSION = "0.5.0",
 
 	-- The kernel's DataStore: durable heads, deployments, private records, events, and (0.3.8) the signed settings.
 	DATASTORE = "TypeTorch",
@@ -321,4 +321,37 @@ return {
 	-- request TypeTorch makes, per minute and per caller, next to Roblox's limits for the current player count (the
 	-- formulas and their sources are in Budget.luau). At most BUDGET_KEYS_MAX (caller, kind, op) counters.
 	BUDGET_KEYS_MAX = 96,
+
+	-- 0.5.0 REMOTE DEBUG (plans/25; src/server/RemoteDebug.luau). The explorer's /servers/<JobId> page asks the backend to
+	-- watch this server; the heartbeat reply then carries `rd = 1` and this server long-polls the backend for commands
+	-- (RD_COMMANDS_PATH, held up to RD_POLL_WAIT s), runs each read-only op on a kernel thread and posts the answers
+	-- (RD_RESULTS_PATH). It polls while the backend says it is watched and RD_IDLE_SECONDS after the last command or
+	-- watch signal, never otherwise. Only ops in RD_OPS run; at most RD_COMMANDS_PER_MINUTE (burst RD_COMMANDS_BURST);
+	-- each gets RD_OP_TIMEOUT s; an answer over RD_RESULT_MAX bytes of JSON is refused. Callers must be owners.
+	RD_COMMANDS_PATH = "/v1/fleet/commands",
+	RD_RESULTS_PATH = "/v1/fleet/results",
+	RD_POLL_WAIT = 8,
+	-- At least this long between two polls that brought nothing (a backend that answers at once can't make a tight loop).
+	RD_POLL_GAP = 2,
+	RD_IDLE_SECONDS = 60,
+	RD_COMMANDS_PER_MINUTE = 30,
+	RD_COMMANDS_BURST = 10,
+	RD_OP_TIMEOUT = 10,
+	RD_RESULT_MAX = 200000,
+	-- Failed polls in a row before the session ends (the next watched heartbeat starts a new one); a 401/403/404 holds
+	-- new sessions off RD_AUTH_HOLD s.
+	RD_FAILURES_MAX = 3,
+	RD_RETRY_SECONDS = 5,
+	RD_AUTH_HOLD = 300,
+	-- The read-only ops (v1): the kernel's own, and the ones the running generation answers through api:onRemoteDebug.
+	RD_KERNEL_OPS = { "status", "builds", "budget", "logs", "players", "player.logs", "errors" },
+	RD_FRAMEWORK_OPS = { "modules", "state", "assets", "network", "dex.children", "dex.props" },
+	-- server -> client, tagged "*": { id, since } asks this client for its log ring; client -> server, tagged "*":
+	-- { id, logs } (the asked player only, once, within RD_CLIENT_LOGS_TIMEOUT s; at most RD_CLIENT_LOGS_MAX entries
+	-- and RD_CLIENT_LOGS_BYTES bytes are kept).
+	CHANNEL_RDLOGS = "__tt/rdlogs",
+	RD_CLIENT_LOGS_TIMEOUT = 5,
+	RD_CLIENT_LOGS_MAX = 200,
+	RD_CLIENT_LOGS_BYTES = 64000,
+
 }

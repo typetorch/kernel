@@ -27,6 +27,12 @@ function Api.unregister(entry: Script)
 	entries[entry] = nil
 end
 
+-- 0.5.0 (remote debug): the raw persist value under `key`, for the kernel itself (RemoteDebug collects the remote-claude
+-- store's tokens to scrub them from answers). Not on the generation API.
+function Api.persistPeek(key: string)
+	return persistStore[key]
+end
+
 -- 0.3.8: runs fn() on a KERNEL thread (services.onKernel), so stopping or hard-stopping `generation` never kills it:
 -- the fix for a library call (a ProfileStore load, save or release) that a swap's hard stop would cut off halfway.
 -- The job keeps the old generation's closures alive until it ends. done(ok, result) runs on the kernel thread, only
@@ -342,6 +348,15 @@ function Api.forEntry(entry: Script)
 		function api:budget()
 			return Budget.snapshot()
 		end
+	end
+
+	-- Kernel 0.5.0 (additive; plans/25): REMOTE DEBUG. fn(op, args, caller) answers the explorer's read-only ops that need
+	-- the framework (modules, state, assets, network, dex.children, dex.props) while this generation runs; the kernel
+	-- has already checked the op (its allow-list), the rate and that `caller` ({ kind = "roblox" | "token", userId?,
+	-- owner = true, via }) is an owner. It runs on a kernel thread with a deadline; its result is JSON-encoded, scrubbed
+	-- of secrets and posted to the backend. One handler per generation; `onRemoteDebug` doubles as the feature test.
+	function api:onRemoteDebug(fn)
+		generation.remoteDebugHandler = if typeof(fn) == "function" then fn else nil
 	end
 
 	-- Entry-only (not on the TS interface).

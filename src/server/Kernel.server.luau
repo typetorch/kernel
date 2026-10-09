@@ -55,6 +55,10 @@
 -- or branch rollback whose artifact this server already runs (typically the build a local health rollback just
 -- restored) is adopted without a swap: the seq is applied and reported "swapped" (d = 0) and a heartbeat with the new
 -- `q` goes out before the report. A deploy that arrives while a local rollback runs waits for it, then adopts.
+-- 0.5.0 (plans/25): REMOTE DEBUG (RemoteDebug.luau). The explorer's /servers/<JobId> page watches this server; the next
+-- heartbeat reply says so (`rd = 1`) and the kernel long-polls the signed settings' backend for read-only commands
+-- (status, builds, budget, logs, players, a player's client logs, errors; and through api:onRemoteDebug the running
+-- generation's modules, state, assets, network and a read-only Dex), owners only, answers scrubbed of secrets.
 
 -- 0.3.2 (boot budget): every boot wait and cap counts from here.
 local kernelStartedAt = os.clock()
@@ -201,7 +205,7 @@ end
 -- TypeTorch makes, per minute and per caller) and the error reports (Errors.luau: templated, fingerprinted, counted,
 -- posted to the backend's /v1/errors). A place project that lists the kernel's files one by one and doesn't map them yet
 -- still boots, without them, and says so.
-local Budget, Errors
+local Budget, Errors, RemoteDebug
 do
 	local function optional(name: string, what: string)
 		local module = script.Parent:FindFirstChild(name)
@@ -238,6 +242,18 @@ do
 			end,
 			setPid = function()
 				return false
+			end,
+		}, {
+			__index = function()
+				return noop
+			end,
+		})
+	-- 0.5.0 (plans/25): remote debug. Without the module the server never polls (heartbeat replies are ignored).
+	RemoteDebug = optional("RemoteDebug", "remote debug")
+		or setmetatable({
+			missing = true,
+			info = function()
+				return { state = "off", missing = true }
 			end,
 		}, {
 			__index = function()
@@ -3190,6 +3206,10 @@ local function status()
 		-- 0.4.2: server TPS over the last minute { a = average, m = the slowest second, p = physics FPS, s = seconds
 		-- counted }; nil before the first second (the heartbeat's `pf` is the same over the heartbeat interval).
 		perf = Budget.perf(),
+		-- 0.5.0 (plans/25): remote debug ({ state = "off" | "polling" | "held", sessions, polls, commands, answered,
+		-- refused, failed, timeouts, redacted, lastPollAt?, lastCommandAt?, lastOp?, lastError? }; never a command's
+		-- contents, the URL or the key).
+		remoteDebug = RemoteDebug.info(),
 	}
 end
 
@@ -3418,6 +3438,116 @@ Api.init({
 	end,
 })
 
+-- 0.5.0 REMOTE DEBUG (plans/25; RemoteDebug.luau) ---------------------------------------------------------------------
+-- The kernel's own read-only ops (the rest go to the running generation through api:onRemoteDebug). Each gets
+-- (args, caller) after RemoteDebug checked the allow-list, the rate and that the caller is an owner.
+do -- (scoped: the main chunk is near Luau's 200-local limit)
+	local function fleetCopy()
+		local copy = fleetStatus()
+		copy.k = nil -- a reserved server's access code never leaves the server
+		return copy
+	end
+	local ops = {
+		-- What Server > Status shows: the kernel's status() and the heartbeat's fleet status.
+		status = function()
+			return { status = status(), fleet = fleetCopy() }
+		end,
+		-- Server > Branch: branches, known builds (one DataStore read, like the dev menu) and the last deploy reports.
+		builds = function()
+			local ok, list = pcall(artifacts)
+			local reports = {}
+			for index, report in recentReports do
+				reports[index] = table.clone(report)
+			end
+			return { branches = branchList(), artifacts = if ok then list else nil, artifactsError = if ok then nil else clip(tostring(list), 200), reports = reports }
+		end,
+		budget = function()
+			return Budget.snapshot()
+		end,
+		-- The server log ring after `since`, at most `limit` (<= 500) entries.
+		logs = function(args)
+			local since = if typeof(args.since) == "number" and args.since >= 0 then args.since else nil
+			local limit = math.clamp(math.floor(tonumber(args.limit) or 200), 1, 500)
+			local entries = Logs.since(since, limit)
+			return { entries = entries, last = if #entries > 0 then entries[#entries].i else (since or 0) }
+		end,
+		-- The players here: who they are, dev or not, ping, account age, how their client start went.
+		players = function()
+			local list = {}
+			for _, player in Players:GetPlayers() do
+				local accessOk, dev, reason, role = pcall(Access.check, player)
+				local pingOk, ping = pcall(function()
+					return player:GetNetworkPing()
+				end)
+				local client = clientStatus[player]
+				table.insert(list, {
+					userId = player.UserId,
+					name = player.Name,
+					displayName = player.DisplayName,
+					dev = accessOk and dev == true,
+					reason = if accessOk then reason else nil,
+					role = if accessOk then role else nil,
+					accountAge = player.AccountAge,
+					pingMs = if pingOk and typeof(ping) == "number" then math.floor(ping * 1000 + 0.5) else nil,
+					client = if client then table.clone(client) else nil,
+				})
+			end
+			return { players = list, max = Players.MaxPlayers }
+		end,
+		-- One player's client log history: the kernel asks that client (kernel channel __tt/rdlogs), so it works while
+		-- the generation is broken.
+		["player.logs"] = function(args)
+			if typeof(args.userId) ~= "number" then
+				error("bad_args: userId", 0)
+			end
+			local player = Players:GetPlayerByUserId(args.userId)
+			if not player then
+				error("not_in_server: that player isn't in this server", 0)
+			end
+			local since = if typeof(args.since) == "number" and args.since >= 0 then args.since else 0
+			return { userId = player.UserId, name = player.Name, entries = RemoteDebug.clientLogs(player, since) }
+		end,
+		-- Error reports (counters and the top templates: never a raw message).
+		errors = function()
+			return Errors.info()
+		end,
+	}
+	RemoteDebug.configure({
+		http = Budget.wrap(HttpService, "kernel", "http", "debug"), -- counted for the budget view
+		jobId = game.JobId,
+		active = game.JobId ~= "" and serverType() ~= "studio",
+		target = function()
+			return if Fleet.target then Fleet.target() else nil
+		end,
+		encode = function(value)
+			return HttpService:JSONEncode(value)
+		end,
+		decode = function(text)
+			return HttpService:JSONDecode(text)
+		end,
+		-- Every secret the kernel knows: the settings' key / token / secret / password fields (backend.key, fleet.token,
+		-- analytics.token, the game's own), and the remote-claude store's tokens. Fleet.target()'s key is added by the module.
+		secrets = function()
+			local list = {}
+			RemoteDebug.collectSecrets(Registry.settings.copy(), list)
+			RemoteDebug.collectSecrets(Api.persistPeek("remoteClaude"), list, 5, true)
+			return list
+		end,
+		ops = ops,
+		framework = function()
+			return current and current.remoteDebugHandler
+		end,
+		isOwner = Access.isOwnerUserId,
+		spawn = spawnOnKernel,
+		kernelSend = Transport.kernelSend,
+		warn = warn,
+		print = print,
+	})
+	Transport.onKernel(Constants.CHANNEL_RDLOGS, RemoteDebug.onClientLogs)
+	-- A watched server's heartbeat reply carries `rd = 1`: start polling.
+	Fleet.configure({ onHeartbeatReply = RemoteDebug.wake })
+end
+
 -- /tt chat commands (TextChatCommand), the fallback when a generation is broken --------------------------------------
 
 do -- (scoped: the main chunk is near Luau's 200-local limit)
@@ -3632,6 +3762,8 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 		task.spawn(Fleet.closing, 3)
 		-- 0.4.0: the last error reports go out too.
 		task.spawn(Errors.closing)
+		-- 0.5.0: no new remote debug polls.
+		RemoteDebug.close()
 		-- 0.3.6 (plans/17): closing in the middle of a swap (the old generation stopped, the next not ready yet): the
 		-- starting generation's handler if it installed one, else the stopped generation's (its last flush).
 		local generation = current
