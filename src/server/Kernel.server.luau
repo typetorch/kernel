@@ -49,6 +49,12 @@
 -- REPORTS (Errors.luau: server and client errors templated, fingerprinted, counted per minute and posted to
 -- <url>/v1/errors) and THE BUDGET VIEW (Budget.luau: every DataStore, MemoryStore, HTTP and MessagingService request
 -- TypeTorch makes, per minute and per caller, next to Roblox's limits; a summary rides on heartbeats as `bu`).
+--
+-- 0.4.2 (heartbeat metrics): heartbeats carry `pf` = { a, m, p } (server TPS average and slowest second since the last
+-- heartbeat, physics FPS; Budget.luau) next to `bu`'s memory; status().perf has the last minute. SEQ ADOPTION: a deploy
+-- or branch rollback whose artifact this server already runs (typically the build a local health rollback just
+-- restored) is adopted without a swap: the seq is applied and reported "swapped" (d = 0) and a heartbeat with the new
+-- `q` goes out before the report. A deploy that arrives while a local rollback runs waits for it, then adopts.
 
 -- 0.3.2 (boot budget): every boot wait and cap counts from here.
 local kernelStartedAt = os.clock()
@@ -219,6 +225,10 @@ do
 			snapshot = function()
 				return { missing = true }
 			end,
+			-- 0.4.2: TPS (no module, no `pf` and no status().perf).
+			startPerf = noop,
+			perf = noop,
+			perfWindow = noop,
 		}
 	Errors = optional("Errors", "error reports")
 		or setmetatable({
@@ -1355,9 +1365,10 @@ Fleet.configure({
 		return fleetOk, fleet, "fleet"
 	end,
 	status = fleetStatus,
-	-- 0.4.0: heartbeats carry the budget summary (`bu`; the backend stores it per server).
+	-- 0.4.0: heartbeats carry the budget summary (`bu`; the backend stores it per server). 0.4.2: and `pf` (TPS since the
+	-- last heartbeat, physics FPS); memory stays in `bu.mem`.
 	heartbeatExtra = function()
-		return { bu = Budget.summary() }
+		return { bu = Budget.summary(), pf = Budget.perfWindow() }
 	end,
 	encode = function(value)
 		return HttpService:JSONEncode(value)
@@ -1394,7 +1405,13 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 			end
 			return list
 		end,
+		-- 0.4.2: TPS from RunService.Heartbeat, and the physics FPS.
+		heartbeat = RunService.Heartbeat,
+		physicsFps = function()
+			return workspace:GetRealPhysicsFPS()
+		end,
 	})
+	Budget.startPerf()
 	local gzipOk, gzip = pcall(function()
 		return Enum.HttpCompression.Gzip
 	end)
@@ -1768,6 +1785,27 @@ local function blockedByFailure(head): boolean
 	return failing ~= nil and failing.seq == head.seq and failing.assetId == head.assetId and os.clock() < failing.nextAt
 end
 
+-- 0.4.2 (seq adoption; the 2026-10-09 rollback drill: after a local health rollback to D, the branch rollback to D (#65)
+-- left the server reporting the failed #64): when `head` is a deploy of the build this server runs (same artifact id or
+-- asset), there is nothing to swap. A newer seq is applied, a heartbeat with it is due BEFORE the report (Fleet sends a
+-- "seq" heartbeat ahead of the queue, so the backend's servers row already has the new `q` when `deploy --wait` sees
+-- the report), and with `report` the deploy is reported "swapped" (d = 0). Returns whether `head` is the running build.
+local function adoptIfRunning(head, report: boolean): boolean
+	if not current or not ((head.artifactId and head.artifactId == current.artifact.id) or head.assetId == current.artifact.assetId) then
+		return false
+	end
+	vouchFor(head)
+	local seq = head.seq
+	if typeof(seq) == "number" and seq > appliedSeq then
+		appliedSeq = seq
+		Fleet.heartbeat("seq")
+		if report then
+			reportOutcome(head, "swapped", { d = 0 })
+		end
+	end
+	return true
+end
+
 local runWorker
 
 local function want(head, reason: string, jitter: boolean)
@@ -1846,21 +1884,31 @@ runWorker = function()
 			end
 			continue
 		end
-		if current and ((head.artifactId and head.artifactId == current.artifact.id) or head.assetId == current.artifact.assetId) then
-			vouchFor(head)
-			if DEPLOY_REASONS[job.reason] and typeof(seq) == "number" and seq > appliedSeq then
-				reportOutcome(head, "swapped", { d = 0 }) -- 0.3.2: already running it
-			end
-			appliedSeq = math.max(appliedSeq, if typeof(seq) == "number" then seq else appliedSeq)
-			continue
+		if adoptIfRunning(head, DEPLOY_REASONS[job.reason] ~= nil) then
+			continue -- 0.3.2: already running it (0.4.2: adopted, see adoptIfRunning)
 		end
-		while busy do
-			task.wait(0.1) -- a dev's swap is running; the deploy goes right after it
+		-- A dev's swap is running (the deploy goes right after it), or (0.4.2) a local rollback is: the health window's
+		-- last known good may be the very build this deploy names (a branch rollback sent because this server failed), so
+		-- wait for it, then look again instead of swapping in the same build a second time (or racing the rollback for
+		-- `busy`, which made it give up and restart the failed build).
+		while busy or restoring do
+			task.wait(0.1)
+		end
+		local newer = wanted and typeof(wanted.head.seq) == "number" and typeof(seq) == "number" and wanted.head.seq > seq
+		if newer or (current and typeof(seq) == "number" and seq <= appliedSeq) then
+			if announced then
+				notifyPending(head, job.reason, 0, true)
+			end
+			continue -- a newer deploy arrived during the wait (that one goes next), or the swap that ran applied this seq
+		end
+		if adoptIfRunning(head, DEPLOY_REASONS[job.reason] ~= nil) then
+			continue
 		end
 		local report = swapTo(head, job.reason, nil, announced)
 		if report.ok then
-			if typeof(seq) == "number" then
-				appliedSeq = math.max(appliedSeq, seq)
+			if typeof(seq) == "number" and seq > appliedSeq then
+				appliedSeq = seq
+				Fleet.heartbeat("seq") -- 0.4.2: the new `q` goes out before the report below
 			end
 			failing = nil
 			if DEPLOY_REASONS[job.reason] and report.kind ~= "boot" then
@@ -1932,8 +1980,10 @@ local function followHead(reason: string, jitter: boolean?)
 		if current.pinned and inRollout(rollout) then
 			setHold(false, nil) -- the pinned artifact is the head now (seq > appliedSeq here)
 		end
-		vouchFor(head)
-		appliedSeq = seq
+		-- 0.4.2: adopted like a deploy message (reported, heartbeat first), e.g. a branch rollback whose message this
+		-- server missed.
+		adoptIfRunning(head, DEPLOY_REASONS[reason] ~= nil)
+		appliedSeq = math.max(appliedSeq, seq)
 		return
 	end
 	-- 0.2.3: a deploy rolled out to some servers only (`ro`). The others keep what they run (appliedSeq stays, so a
@@ -2139,14 +2189,13 @@ local function onDeployMessage(message)
 		if seq and seq > appliedSeq and r == "resign" then
 			print(`[TypeTorch] re-signed head for {data.b}: {data.i} #{seq} (no swap)`)
 		end
-		if typeof(seq) == "number" and seq > appliedSeq then
-			reportOutcome(reportHead, "swapped", { d = 0 }) -- 0.3.2: already running it
-		end
 		if signedOnly then
 			-- Verified above: it vouches for an unverified (boot fail-safe) generation running this asset.
 			vouchFor(admit({ assetId = data.a, artifactId = data.i, seq = seq, commit = data.c, channel = channel, branch = data.b, t = t, r = r, rollback = if r == 1 then true else nil, sig = sig, sigF = sigF }, "signed"))
 		end
-		appliedSeq = math.max(appliedSeq, seq or appliedSeq)
+		-- 0.3.2: already running it: reported "swapped" (d = 0). 0.4.2: the heartbeat with the new seq goes first (a
+		-- branch rollback to the build a local rollback restored is the usual case).
+		adoptIfRunning(reportHead, true)
 		return
 	end
 	-- A pin holds until a newer deploy seq for this branch arrives (late or repeated messages don't undo it).
@@ -3138,6 +3187,9 @@ local function status()
 		errors = Errors.info(),
 		-- 0.4.0 (problem 25): the budget summary the heartbeat carries (`bu`); the full view is api:budget().
 		budget = Budget.summary(),
+		-- 0.4.2: server TPS over the last minute { a = average, m = the slowest second, p = physics FPS, s = seconds
+		-- counted }; nil before the first second (the heartbeat's `pf` is the same over the heartbeat interval).
+		perf = Budget.perf(),
 	}
 end
 

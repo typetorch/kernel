@@ -261,6 +261,30 @@ Fleet.configure({
 })
 Fleet.refreshSettings()
 check("fleet { url, token } (old settings): taken, source fleet", Fleet.info().source == "fleet" and Fleet.target().token == TOKEN)
+
+-- 7. 0.4.2: a "seq" heartbeat (the applied seq moved) goes before the queued report, so the backend's row has the new
+-- `q` when `deploy --wait` sees the report; any other heartbeat still waits behind the queue.
+advance(40)
+local function order(): { string }
+	local list = {}
+	for index = mark + 1, #requests do
+		table.insert(list, requests[index].path)
+	end
+	return list
+end
+mark = #requests
+Fleet.report({ s = 65, r = "swapped" })
+Fleet.heartbeat("seq")
+advance(2)
+local sent = order()
+check("seq heartbeat: sent ahead of the queued report", sent[1] == "/v1/fleet/heartbeat" and sent[2] == "/v1/fleet/report", table.concat(sent, ", "))
+advance(40)
+mark = #requests
+Fleet.report({ s = 66, r = "swapped" })
+Fleet.heartbeat("swap")
+advance(2)
+sent = order()
+check("other heartbeats: the queue (reports, alerts) first, as before", sent[1] == "/v1/fleet/report" and sent[2] == "/v1/fleet/heartbeat", table.concat(sent, ", "))
 Fleet.configure({
 	readSettings = function()
 		return true, { url = "http://insecure.example.test", key = BACKEND_KEY }, "backend"

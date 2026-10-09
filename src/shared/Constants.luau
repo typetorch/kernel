@@ -7,7 +7,7 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.4.0",
+	KERNEL_VERSION = "0.4.2",
 
 	-- The kernel's DataStore: durable heads, deployments, private records, events, and (0.3.8) the signed settings.
 	DATASTORE = "TypeTorch",

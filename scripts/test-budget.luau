@@ -218,5 +218,66 @@ check("snapshot: memory tags biggest first, the Lua heap, the mounted generation
 left = {}
 check("no DataStore budget readable: left is simply missing", Budget.summary().ds.br == nil and rowOf(Budget.snapshot(), "datastore", "read").left == nil)
 
+-- 7. 0.4.2: the Lua heap when the LuaHeap tag can't be read; TPS (`pf`, status().perf) from Heartbeat frames.
+Budget.configure({
+	stats = {
+		GetTotalMemoryUsageMb = function()
+			return 812.5
+		end,
+		GetMemoryUsageMbForTag = function()
+			error("no such tag")
+		end,
+	},
+})
+check("summary: no LuaHeap tag: h is the Lua VM heap in MB", Budget.summary().mem.h == 120.6 and Budget.summary().mem.t == 812.5, Budget.summary().mem.h)
+Budget._reset()
+check("perf: nothing before the first whole second", Budget.perfWindow() == nil and Budget.perf() == nil)
+local connected = nil
+Budget.configure({
+	heartbeat = {
+		Connect = function(_, fn)
+			connected = fn
+			return { Disconnect = function() end }
+		end,
+	},
+	physicsFps = function()
+		return 59.94
+	end,
+})
+check("perf: startPerf connects RunService.Heartbeat once", Budget.startPerf() == true and connected == Budget.frame and Budget.startPerf() == true)
+local function frames(count: number, dt: number)
+	for _ = 1, count do
+		connected(dt)
+	end
+end
+frames(128, 1 / 64) -- 2 s at 64 TPS (1/64 and 1/8 add up exactly)
+frames(8, 0.125) -- 1 s at 8 TPS
+frames(32, 1 / 64) -- half a second: the open bucket, not counted yet
+local pf = Budget.perfWindow()
+check("pf: average and the slowest second since the last heartbeat (frames / seconds), physics FPS, 0.1 steps", pf ~= nil and pf.a == 45.3 and pf.m == 8 and pf.p == 59.9, pf and `{pf.a} {pf.m} {pf.p}`)
+local pfSize = #serde.encode("json", pf)
+check("pf: a few bytes of JSON (<= 40)", pfSize <= 40, pfSize)
+local again = Budget.perfWindow()
+check("pf: a heartbeat within the same second repeats the newest second (the window goes on)", again ~= nil and again.a == 8 and again.m == 8)
+frames(32, 1 / 64) -- closes the open bucket (64 frames in 1 s)
+frames(64, 1 / 64)
+pf = Budget.perfWindow()
+check("pf: the next window starts after the last heartbeat (no 8 TPS second in it)", pf ~= nil and pf.a == 64 and pf.m == 64, pf and `{pf.a} {pf.m}`)
+local perf = Budget.perf()
+check("status().perf: the last minute (s = seconds counted), untouched by the heartbeat window", perf ~= nil and perf.s == 5 and perf.m == 8 and perf.a == 52.8 and perf.p == 59.9, perf and `{perf.a} {perf.m} {perf.s}`)
+frames(70 * 64, 1 / 64) -- 70 more seconds at 64 TPS: the slow second leaves the minute
+perf = Budget.perf()
+check("status().perf keeps PERF_KEEP (60) seconds", perf.s == 60 and perf.m == 64 and perf.a == 64, `{perf.s} {perf.m}`)
+frames(1, 3) -- one 3 s hitch: a bucket of one frame
+pf = Budget.perfWindow()
+check("pf: a hitch shows as the slowest second (one frame in 3 s)", pf.m == 0.3, pf.m)
+Budget.configure({
+	physicsFps = function()
+		error("no workspace")
+	end,
+})
+pf = Budget.perfWindow()
+check("pf: an unreadable physics FPS is left out (TPS still sent)", pf ~= nil and pf.p == nil and pf.a ~= nil)
+
 print(`budget: {passed} passed, {failed} failed`)
 process.exit(if failed == 0 then 0 else 1)

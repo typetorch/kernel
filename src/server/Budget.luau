@@ -31,6 +31,11 @@
 --
 -- Per minute = a sliding estimate of the last 60 s: this clock minute's count plus the previous minute's, weighted by how
 -- much of it is still inside the window. Cheap: one table per (caller, kind, op), at most BUDGET_KEYS_MAX of them.
+--
+-- 0.4.2 (heartbeat metrics): SERVER TPS from RunService.Heartbeat (one counter a frame, closed into one-second buckets)
+-- and the physics FPS (workspace:GetRealPhysicsFPS()). Heartbeats carry `pf` = { a = average TPS, m = the slowest
+-- second's TPS, p = physics FPS } over the time since the previous heartbeat (Budget.perfWindow); status().perf has the
+-- same numbers over the last PERF_KEEP seconds (Budget.perf). Memory stays in the summary (`bu.mem`).
 
 local Constants = require(game:GetService("ReplicatedStorage"):WaitForChild("TypeTorchKernelShared"):WaitForChild("Constants"))
 
@@ -51,6 +56,10 @@ local deps = {
 	heap = function()
 		return collectgarbage("count")
 	end,
+	-- 0.4.2: RunService.Heartbeat (a signal; nil under tests that drive Budget.frame themselves) and () -> number, the
+	-- physics FPS (workspace:GetRealPhysicsFPS()).
+	heartbeat = nil,
+	physicsFps = nil,
 }
 
 function Budget.configure(overrides)
@@ -406,7 +415,8 @@ end
 -- The compact per-minute summary that rides on fleet heartbeats (key `bu`; the backend stores it per server):
 -- { p = players, ds = { r, w, l, x, lr, lw, br?, bw? }, ms = { u, l }, h = { r, l }, mg = { p, lp, s, ls },
 --   by = { k, d, a, g, f }, mem = { t?, h? } }: requests in the last 60 s (rounded), limits, the DataStore budget left
--- (br/bw: read/write, shared with the game), requests per caller over every kind, memory in MB.
+-- (br/bw: read/write, shared with the game), requests per caller over every kind, memory in MB (h: the LuaHeap tag;
+-- 0.4.2: the Lua VM heap when the tag can't be read).
 function Budget.summary()
 	local players = deps.players()
 	local limits = Budget.limits(players)
@@ -442,8 +452,114 @@ function Budget.summary()
 		h = { r = round(sum(byOp.http)), l = limits.http.request },
 		mg = { p = op("messaging", "publish"), lp = limits.messaging.publish, s = op("messaging", "subscribe"), ls = limits.messaging.subscribe },
 		by = by,
-		mem = { t = if mem.total then round(mem.total, 1) else nil, h = if mem.luaHeap then round(mem.luaHeap, 1) else nil },
+		mem = {
+			t = if mem.total then round(mem.total, 1) else nil,
+			h = if mem.luaHeap then round(mem.luaHeap, 1) elseif mem.heapKb > 0 then round(mem.heapKb / 1024, 1) else nil,
+		},
 	}
+end
+
+-- Perf (0.4.2) --------------------------------------------------------------------------------------------------------
+
+-- TPS = Heartbeat frames a second. Each frame adds to the open bucket; once it holds a second (the frames' dt summed) it
+-- closes: its frames and seconds go into a ring of the last PERF_KEEP buckets (status().perf) and into the window since
+-- the last heartbeat (`pf`), whose slowest bucket is the minimum. A frame costs two adds and a compare.
+local PERF_KEEP = 60
+local perf = {
+	connection = nil,
+	frames = 0, -- the open bucket
+	seconds = 0,
+	ringFrames = table.create(PERF_KEEP, 0),
+	ringSeconds = table.create(PERF_KEEP, 0),
+	ringMin = table.create(PERF_KEEP, 0),
+	closed = 0, -- buckets closed since start (the ring holds the last PERF_KEEP)
+	last = nil, -- the newest closed bucket's TPS
+	window = { frames = 0, seconds = 0, min = math.huge, buckets = 0 },
+}
+
+local function closeBucket()
+	local tps = perf.frames / perf.seconds
+	perf.closed += 1
+	local slot = (perf.closed - 1) % PERF_KEEP + 1
+	perf.ringFrames[slot], perf.ringSeconds[slot], perf.ringMin[slot] = perf.frames, perf.seconds, tps
+	perf.last = tps
+	local window = perf.window
+	window.frames += perf.frames
+	window.seconds += perf.seconds
+	window.buckets += 1
+	if tps < window.min then
+		window.min = tps
+	end
+	perf.frames, perf.seconds = 0, 0
+end
+
+-- One Heartbeat frame (`dt` seconds since the last one).
+function Budget.frame(dt: number)
+	perf.frames += 1
+	perf.seconds += dt
+	if perf.seconds >= 1 then
+		closeBucket()
+	end
+end
+
+-- Connects deps.heartbeat (RunService.Heartbeat) once. Returns whether frames are counted.
+function Budget.startPerf(): boolean
+	if perf.connection then
+		return true
+	end
+	local signal = deps.heartbeat
+	if signal == nil then
+		return false
+	end
+	local ok, connection = pcall(function()
+		return signal:Connect(Budget.frame)
+	end)
+	if ok then
+		perf.connection = connection
+	end
+	return ok
+end
+
+local function physics(): number?
+	local read = deps.physicsFps
+	if not read then
+		return nil
+	end
+	local ok, value = pcall(read)
+	return if ok and typeof(value) == "number" and value == value and value >= 0 and value < 1e6 then round(value, 1) else nil
+end
+
+-- `pf` for a heartbeat: { a, m, p } (TPS average, the slowest second, physics FPS; 0.1 steps) over the buckets closed
+-- since the previous call, which starts a new window. No bucket closed since (two heartbeats within a second): the
+-- newest one, and the window goes on. nil before the first second was counted (p alone is not worth sending).
+function Budget.perfWindow()
+	local window = perf.window
+	local average, slowest
+	if window.buckets > 0 then
+		average, slowest = window.frames / window.seconds, window.min
+		window.frames, window.seconds, window.min, window.buckets = 0, 0, math.huge, 0
+	elseif perf.last then
+		average, slowest = perf.last, perf.last
+	else
+		return nil
+	end
+	return { a = round(average, 1), m = round(slowest, 1), p = physics() }
+end
+
+-- status().perf (the dev menu): { a, m, p, s } over the last PERF_KEEP seconds (s = the seconds counted); nil before the
+-- first second. Doesn't touch the heartbeat window.
+function Budget.perf()
+	local count = math.min(perf.closed, PERF_KEEP)
+	if count == 0 then
+		return nil
+	end
+	local frames, seconds, slowest = 0, 0, math.huge
+	for slot = 1, count do
+		frames += perf.ringFrames[slot]
+		seconds += perf.ringSeconds[slot]
+		slowest = math.min(slowest, perf.ringMin[slot])
+	end
+	return { a = round(frames / seconds, 1), m = round(slowest, 1), p = physics(), s = math.floor(seconds + 0.5) }
 end
 
 -- Tests: forget every count.
@@ -452,6 +568,8 @@ function Budget._reset()
 	keys = 0
 	refused = 0
 	requestTypes = nil
+	perf.frames, perf.seconds, perf.closed, perf.last = 0, 0, 0, nil
+	perf.window = { frames = 0, seconds = 0, min = math.huge, buckets = 0 }
 end
 
 return Budget

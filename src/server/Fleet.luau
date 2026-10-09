@@ -25,6 +25,10 @@
 -- 0.4.0 (plans/21 C, one backend): the settings' `backend` = { url, key, analytics? } is read first (`fleet` = { url,
 -- token } only while `backend` is missing; Fleet.info().source says which). The same URL and key serve the error
 -- reports (Errors.luau, through Fleet.target()). Heartbeats carry the budget summary under `bu` (deps.heartbeatExtra).
+--
+-- 0.4.2: heartbeats also carry `pf` = { a, m, p } (TPS average and slowest second since the last heartbeat, physics FPS;
+-- Budget.perfWindow through deps.heartbeatExtra). Fleet.heartbeat("seq") (the applied seq moved) is sent AHEAD of the
+-- queued reports, so the backend's servers row has the new `q` before the deploy report that ends `deploy --wait`.
 
 local Constants = require(game:GetService("ReplicatedStorage"):WaitForChild("TypeTorchKernelShared"):WaitForChild("Constants"))
 
@@ -60,7 +64,8 @@ local settingsSource = nil -- 0.4.0: "backend" | "fleet" (the settings field the
 local settingsReadAt = -math.huge
 
 local queue = {} -- { path, body, attempts, nextAt }, oldest first
-local heartbeat = { due = false, attempts = 0, nextAt = 0, lastAt = -math.huge, lastPlayersAt = -math.huge }
+-- `urgent` (0.4.2): a "seq" heartbeat is due; it goes before the queue.
+local heartbeat = { due = false, urgent = false, attempts = 0, nextAt = 0, lastAt = -math.huge, lastPlayersAt = -math.huge }
 local started = false
 local closed = false
 local tokens, tokensAt = 10, os.clock()
@@ -328,8 +333,8 @@ local function enqueue(path: string, body)
 	end
 end
 
--- One step of the sender: the first due queued request (reports and alerts first), else a due heartbeat. Returns
--- whether it sent (or tried) something.
+-- One step of the sender: the first due queued request (reports and alerts first), else a due heartbeat; 0.4.2: an
+-- urgent ("seq") heartbeat goes before the queue. Returns whether it sent (or tried) something.
 local function step(): boolean
 	if not Fleet.enabled() then
 		return false
@@ -354,7 +359,7 @@ local function step(): boolean
 	if not free then
 		return false
 	end
-	if index then
+	if index and not (heartbeat.urgent and heartbeatReady) then
 		local item = queue[index]
 		local ok, retry, code, errorText = post(item.path, item.body)
 		local still = table.find(queue, item)
@@ -372,7 +377,7 @@ local function step(): boolean
 		end
 		return true
 	end
-	heartbeat.due = false
+	heartbeat.due, heartbeat.urgent = false, false
 	heartbeat.lastAt = now
 	local ok, retry, code, errorText = post("/v1/fleet/heartbeat", heartbeatBody())
 	if ok or not retry or heartbeat.attempts >= #Constants.FLEET_RETRY_DELAYS then
@@ -407,7 +412,8 @@ function Fleet.start()
 	end)
 end
 
--- A heartbeat now (coalesced). `reason` "players": at most once per FLEET_PLAYERS_GAP seconds.
+-- A heartbeat now (coalesced). `reason` "players": at most once per FLEET_PLAYERS_GAP seconds; "seq" (0.4.2: the
+-- applied seq moved): ahead of the queued reports.
 function Fleet.heartbeat(reason: string?)
 	if not accepting() then
 		return
@@ -420,6 +426,9 @@ function Fleet.heartbeat(reason: string?)
 		heartbeat.lastPlayersAt = now
 	end
 	heartbeat.due = true
+	if reason == "seq" then
+		heartbeat.urgent = true
+	end
 end
 
 function Fleet.report(report)
