@@ -21,7 +21,7 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   pointer's exact version; the package checks (one Model, the three slots, every script disabled, no trust roots,
   the pointer's KernelHash); then the slots go in place with the trust roots stamped and the kernel enabled. Any
   failure installs the baked kernel instead and says why (`KernelSource` = "baked", `KernelLoadError`,
-  `KernelLoadClass` = unavailable | timeout | settings | unsigned | invalid | error): the heartbeat carries `ks` / `ke`,
+  `KernelLoadClass` = unavailable | timeout | settings | nopointer | unsigned | invalid | error; nopointer = no `kernel deploy --asset` yet, no alert): the heartbeat carries `ks` / `ke`,
   `status().loader` and the critical alert `kernel_asset_unavailable` (a moderated or missing version). A place with a
   kernel installed directly keeps it (the loader stands down); Studio runs the baked kernel unless
   `ServerStorage.TypeTorchDev.UseAssetKernel` is true. Players who join before the kernel is installed get the
