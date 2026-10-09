@@ -1,5 +1,5 @@
 --!nonstrict
--- TypeTorch loader core (kernel 0.4.0; plans/22 "The kernel as an uploaded asset"). The decisions of the loader, with
+-- TypeTorch loader core (kernel 0.4.1; plans/22 "The kernel as an uploaded asset"). The decisions of the loader, with
 -- every Roblox call injected (deps), so they run under Lune: scripts/test-loader.luau.
 --
 -- The loader (Loader.server.luau, ServerScriptService.TypeTorchLoader) runs instead of a kernel baked into the place:

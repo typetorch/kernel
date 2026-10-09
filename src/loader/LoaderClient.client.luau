@@ -1,5 +1,5 @@
 --!nonstrict
--- TypeTorch loader, client half (kernel 0.4.0; plans/22): ReplicatedFirst.TypeTorchLoaderClient, baked into the place
+-- TypeTorch loader, client half (kernel 0.4.1; plans/22): ReplicatedFirst.TypeTorchLoaderClient, baked into the place
 -- with the loader. ReplicatedFirst replicates ONCE, at join (kernel 0.3.9), so:
 --   * a player who joins after the loader installed the kernel already has ReplicatedFirst.TypeTorchKernelClient
 --     (enabled): it runs by itself and draws the holding screen;

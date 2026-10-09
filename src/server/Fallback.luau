@@ -206,7 +206,7 @@ local function engage(mode: string, reason: string)
 	hold.mode = mode
 	hold.reason = reason
 	hold.stuckSince = nil
-	-- 0.4.0 (plans/22): the loader turned CharacterAutoLoads off before this kernel existed (Players.TypeTorchLoaderHeld):
+	-- 0.4.1 (plans/22): the loader turned CharacterAutoLoads off before this kernel existed (Players.TypeTorchLoaderHeld):
 	-- this hold takes it over, so the release turns it back on.
 	local loaderHeld = Players:GetAttribute(Constants.LOADER_HELD_ATTRIBUTE) == true
 	if not hold.optOut and (Players.CharacterAutoLoads == true or loaderHeld) then

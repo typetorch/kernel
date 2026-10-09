@@ -1,5 +1,5 @@
 --!nocheck
--- The loader's decisions (src/loader/LoaderCore.luau; kernel 0.4.0, plans/22): `lune run scripts/test-loader.luau`.
+-- The loader's decisions (src/loader/LoaderCore.luau; kernel 0.4.1, plans/22): `lune run scripts/test-loader.luau`.
 -- Signed settings records come from scripts/loader-vectors.json, made with node:crypto from the PUBLIC test keys of
 -- scripts/test-signing.luau (never real keys) and checked with the real Signing.luau. Packages are Lune instances.
 local fs = require("@lune/fs")

@@ -1,5 +1,5 @@
 --!nonstrict
--- TypeTorch loader (kernel 0.4.0; plans/22 "The kernel as an uploaded asset"): ServerScriptService.TypeTorchLoader,
+-- TypeTorch loader (kernel 0.4.1; plans/22 "The kernel as an uploaded asset"): ServerScriptService.TypeTorchLoader,
 -- baked into the place once (`typetorch kernel install-loader`). At boot it installs the kernel the signed settings
 -- record points at (a group-owned Model asset VERSION), else the fallback kernel baked into the place
 -- (ServerStorage.TypeTorchKernelBaked). The decisions live in the child ModuleScript `Core` (LoaderCore.luau, tested
