@@ -2008,6 +2008,55 @@ end
 -- servers started later boot it (0.3.5: the CLI writes the durable copy too). With `ro`, only servers whose jobBucket is below
 -- it swap; the others keep their current artifact (plans/12 P-R1). 0.3: on prod servers a message counts only with a
 -- valid signature, `ch` = "prod" and a seq newer than the applied one (plans/03 "Signed prod messages").
+-- 0.4.1 (plans/22): the KERNEL DRAIN (Drain.luau): a signed { k = "drain" } message on the deploy topic moves the players
+-- of public servers still on another kernel to fresh servers, at a random moment in its window. A place project
+-- without the module boots without drains.
+local Drain = nil
+do
+	local module = script.Parent:FindFirstChild("Drain")
+	if module then
+		Drain = require(module)
+		Drain.configure({
+			verify = function(canonical, sig, sigF)
+				return Signing.verify(canonical, sig, sigF)
+			end,
+			kernelHash = KERNEL_HASH,
+			serverType = serverType,
+			nowMs = function()
+				return DateTime.now().UnixTimestampMillis
+			end,
+			random = function(low, high)
+				return math.random(low, high)
+			end,
+			delay = function(seconds, fn)
+				task.delay(seconds, fn)
+			end,
+			players = function()
+				return Players:GetPlayers()
+			end,
+			teleport = function(list, data)
+				local ok, options = pcall(Instance.new, "TeleportOptions")
+				if not ok then
+					return false, options
+				end
+				pcall(options.SetTeleportData, options, data)
+				return pcall(TeleportService.TeleportAsync, TeleportService, game.PlaceId, list, options)
+			end,
+			kick = function(player, text)
+				pcall(player.Kick, player, text)
+			end,
+			onJoin = function(fn)
+				Players.PlayerAdded:Connect(fn)
+			end,
+			alert = function(level, code, text)
+				fleetAlert(level, code, text, nil, true)
+			end,
+			print = print,
+			warn = warn,
+		})
+	end
+end
+
 local function onDeployMessage(message)
 	local ok, data = pcall(HttpService.JSONDecode, HttpService, message.Data)
 	if not ok or typeof(data) ~= "table" then
@@ -2022,6 +2071,13 @@ local function onDeployMessage(message)
 	-- the content is only a hint, the record is verified). Older kernels ignore it (no branch).
 	if data.k == "settings" then
 		Registry.settings.ping(data.s)
+		return
+	end
+	-- 0.4.1 (plans/22): a signed kernel drain (Drain.luau); not a deploy.
+	if data.k == "drain" then
+		if Drain then
+			Drain.onMessage(data)
+		end
 		return
 	end
 	lastMessage = {
@@ -3095,6 +3151,8 @@ local function status()
 		kernelApi = Constants.KERNEL_API,
 		-- 0.4.1 (plans/22): { source = "asset" | "baked", asset?, versionId?, channel?, error?, class? } when the loader
 		-- installed this kernel; nil for a kernel baked into the place directly.
+		-- 0.4.1: a kernel drain ({ scheduled?, started, moved, kicked, ignored, lastIgnored? }), nil without Drain.luau.
+		drain = if Drain then Drain.status() else nil,
 		loader = if kernelFolder:GetAttribute("KernelSource") ~= nil
 			then {
 				source = kernelFolder:GetAttribute("KernelSource"),

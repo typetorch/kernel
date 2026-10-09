@@ -44,5 +44,25 @@
 		"body": "{\"defaultBranch\":\"prod\"}",
 		"sig": "BX4Ifd03YcjLrEBNH1JpYxIDMBIwN3spb/2q8bYb5risRcGqY4H1sWlJkkBO62g1nq+aJeAssO4w5aL9JVMsDA==",
 		"sigF": "MRNyP0dEvPjkgQGBMxy7KQ0nUeZIUlm4Jq3VzRdOBJq+nhTG0CKcMO04XF/WI640n8bmNBL1oXbmKsd9tD5jDg=="
+	},
+	"drain": {
+		"k": "drain",
+		"v": "0.4.1",
+		"h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		"w": 600,
+		"t": 1791500000000,
+		"sig": "mPEqz6fgW6CZ+mS4BiKasELnnYZrC/PIMutpmF/B65mUmYXk7c+rZv5xdmeY8BD+VqpfvovW31ogx9++SYz3BQ==",
+		"sigF": "49SirKmhOaFpxSQpjsjF6L7Hk6FWV2PLuCjJxmVeYphn9V+9kEQqa/Bf2rBDUcemi7bkpjF9TQYBdbW6qt+RCg==",
+		"canonical": "tt1drain\n0.4.1\ncccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n600\n1791500000000"
+	},
+	"drainNow": {
+		"k": "drain",
+		"v": "0.4.1",
+		"h": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		"w": 0,
+		"t": 1791500000000,
+		"sig": "bFvpyDZ1lW0m0xeWUqiPUEFQ+OQhOASxTW6nZ+upiezDKS2zgaOsz2Jjqox2NmCQtWxNXXLc3VIhnLaQprSBBg==",
+		"sigF": "f3+M/nH+kJ0EXs6SdQjzo3nkFTPR73TIXuUOlO3+rJYwPsJPXKNLuo6z9nBrlVzbslUVBcIUmMYWp0XyqjPHCg==",
+		"canonical": "tt1drain\n0.4.1\ncccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n0\n1791500000000"
 	}
 }
