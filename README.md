@@ -12,6 +12,27 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
 - `src/client/` → `ReplicatedFirst.TypeTorchKernelClient`: follows `ActiveGeneration`, swaps client generations.
 - `place.project.json`: the whole place (kernel + baseplate + spawn, HTTP on). `rojo build place.project.json -o
   build/place.rbxl`; the CLI publishes it.
+- `src/loader/` + `loader.project.json` (0.4.1; TypeTorch plans/22 "The kernel as an uploaded asset"): the KERNEL LOADER.
+  `ServerScriptService.TypeTorchLoader` (with its `Core` module) and `ReplicatedFirst.TypeTorchLoaderClient`, installed
+  once by `typetorch kernel install-loader` with the trust roots and a baked fallback kernel
+  (`ServerStorage.TypeTorchKernelBaked`). At boot: the hold, then (in parallel, 4 s budget) the signed settings record,
+  the key asset and a reserved server's private record; the record's `kernel.prod` / `kernel.dev` pointer must carry
+  sigF (the place's fallback key) and, once the key asset loaded, sig; `InsertService:LoadAssetVersion` of the
+  pointer's exact version; the package checks (one Model, the three slots, every script disabled, no trust roots,
+  the pointer's KernelHash); then the slots go in place with the trust roots stamped and the kernel enabled. Any
+  failure installs the baked kernel instead and says why (`KernelSource` = "baked", `KernelLoadError`,
+  `KernelLoadClass` = unavailable | timeout | settings | unsigned | invalid | error): the heartbeat carries `ks` / `ke`,
+  `status().loader` and the critical alert `kernel_asset_unavailable` (a moderated or missing version). A place with a
+  kernel installed directly keeps it (the loader stands down); Studio runs the baked kernel unless
+  `ServerStorage.TypeTorchDev.UseAssetKernel` is true. Players who join before the kernel is installed get the
+  client stub's screen and a late copy of the kernel client (ReplicatedFirst replicates once). The kernel takes the
+  loader's hold over (`Players.TypeTorchLoaderHeld`) and counts its 15 s boot budget from the loader's start
+  (`BootStartedAt`).
+- Kernel drain (0.4.1, `src/server/Drain.luau`): a signed `{ k = "drain", v, h, w, t, sig, sigF }` on
+  `TypeTorch/deploy` (`tt1drain \n v \n h \n w \n t`, the strict signing rule) makes each PUBLIC server whose kernel
+  hash isn't `h` move its players (and later joiners) out at a random moment within `w` seconds (at most 1 h), then
+  kick who is left after 30 s with a rejoin message. Private and reserved servers never drain; old (10 min+),
+  unsigned or badly signed messages are ignored. `status().drain`. Sent by `typetorch kernel drain` or `--drain`.
 - Syntax check (Lune, pinned in `rokit.toml`): `rokit install`, then `lune run scripts/check.luau` compiles every
   `.luau` file and exits non-zero on a parse error. Run it before every place publish.
 - Deployment history and pins (0.2.0): every deploy message is recorded in the DataStore key `deployments`;
@@ -226,7 +247,9 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   memory (total, per developer tag, the Lua heap; the mounted generations and their modules). `api:budget()` is the
   full view (the dev menu's Server > Budget); `status().budget` and every fleet heartbeat (`bu`) carry a compact
   summary the backend stores per server.
-- Tests (Lune): `lune run scripts/test-errors.luau` (0.4.0: templating, fingerprints, per-minute counts, limits, batches,
+- Tests (Lune): `lune run scripts/test-loader.luau` (0.4.1: the pointer per server type, the sigF-always rule with real
+  signatures, package checks, the fallback on every failure, the budget), `lune run scripts/test-drain.luau` (0.4.1:
+  the signed drain), `lune run scripts/test-errors.luau` (0.4.0: templating, fingerprints, per-minute counts, limits, batches,
   the sender, client batches, the dedup), `lune run scripts/test-budget.luau` (0.4.0: proxies, limits, the sliding
   minute, callers, the summary), `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules),
   `lune run scripts/test-access.luau`, `lune run scripts/test-fleet.luau` (0.3.9: the fleet sender's backoff, hold and
