@@ -3090,7 +3090,10 @@ local function branchList()
 		end
 		table.insert(list, {
 			name = name,
+			-- The head artifact's channel when the settings don't configure the branch (a promoted prod build: "prod").
 			channel = Registry.channelOf(name),
+			-- 0.5.2: what the branch is, as status() reports for this server's branch (the dev menu's Builds heading).
+			branchChannel = branchChannelOf(name),
 			artifactId = head.artifactId,
 			assetId = head.assetId,
 			commit = head.commit,
