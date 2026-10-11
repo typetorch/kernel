@@ -453,6 +453,28 @@ end
 -- `level`: "critical", "warning" or (0.3.4) "info". `fields` = { s?, a?, b?, g? } (the kernel fills them). One alert per code per FLEET_ALERT_GAP seconds
 -- (error_spike: FLEET_SPIKE_GAP), so a flood (forged messages, a crash loop) can't flood the API. `force` (0.3.3): no gap,
 -- for alerts a person caused on purpose (branch_switch, build_load; the kernel limits those requests itself).
+-- 0.5.2: an alert's `d` (details): one flat level of string / number / boolean values, strings scrubbed and clipped,
+-- at most 16 keys; anything else is left out.
+local function scrubDetails(details): { [string]: any }?
+	if typeof(details) ~= "table" then
+		return nil
+	end
+	local out, count = {}, 0
+	for key, value in details do
+		if typeof(key) == "string" and count < 16 then
+			local kind = typeof(value)
+			if kind == "string" then
+				out[string.sub(key, 1, 32)] = scrub(value, 1000)
+				count += 1
+			elseif (kind == "number" and value == value and math.abs(value) ~= math.huge) or kind == "boolean" then
+				out[string.sub(key, 1, 32)] = value
+				count += 1
+			end
+		end
+	end
+	return if count > 0 then out else nil
+end
+
 function Fleet.alert(level: string, code: string, message: string, fields, force: boolean?)
 	if not accepting() or (level ~= "critical" and level ~= "warning" and level ~= "info") then
 		return
@@ -476,6 +498,7 @@ function Fleet.alert(level: string, code: string, message: string, fields, force
 		t = os.time(),
 		g = fields.g,
 		k = Constants.KERNEL_VERSION,
+		d = scrubDetails(fields.d),
 	})
 	heartbeat.due = true
 end

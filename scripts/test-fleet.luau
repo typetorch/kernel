@@ -286,6 +286,35 @@ Fleet.heartbeat("swap")
 advance(2)
 sent = order()
 check("other heartbeats: the queue (reports, alerts) first, as before", sent[1] == "/v1/fleet/report" and sent[2] == "/v1/fleet/heartbeat", table.concat(sent, ", "))
+-- 0.5.2: an alert's details (`d`): flat values only, strings scrubbed and clipped, at most 16 keys.
+advance(40)
+mark = #requests
+local nested = { 1 }
+Fleet.alert("critical", "deploy_failed", "deploy #117 failed (swap): no error recorded", {
+	s = 117,
+	d = { stage = "swap", error = `boom {TOKEN}\n{string.rep("x", 2000)}`, attempts = 1, transient = false, nested = nested, nan = 0 / 0 },
+}, true)
+advance(2)
+local alertBody = nil
+for index = mark + 1, #requests do
+	if string.find(requests[index].url, "/v1/fleet/alert", 1, true) then
+		alertBody = serde.decode("json", requests[index].body)
+	end
+end
+local d = alertBody and alertBody.d
+check("alert details: sent as d", d ~= nil and d.stage == "swap" and d.attempts == 1 and d.transient == false)
+check("alert details: no key, no control characters, clipped to 1000 bytes", d ~= nil and not string.find(d.error, TOKEN, 1, true) and not string.find(d.error, "\n", 1, true) and #d.error == 1000)
+check("alert details: tables and NaN left out", d ~= nil and d.nested == nil and d.nan == nil)
+mark = #requests
+Fleet.alert("warning", "plain", "no details", {}, true)
+advance(2)
+local plain = nil
+for index = mark + 1, #requests do
+	if string.find(requests[index].url, "/v1/fleet/alert", 1, true) then
+		plain = serde.decode("json", requests[index].body)
+	end
+end
+check("alert without details: no d", plain ~= nil and plain.d == nil)
 Fleet.configure({
 	readSettings = function()
 		return true, { url = "http://insecure.example.test", key = BACKEND_KEY }, "backend"

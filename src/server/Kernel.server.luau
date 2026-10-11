@@ -659,12 +659,13 @@ local function rejectedInfo()
 end
 
 -- 0.3.2: an alert to the fleet API (when configured). `head` (optional) names the deploy: seq, artifact id.
-local function fleetAlert(level: string, code: string, message: string, head, force: boolean?)
+local function fleetAlert(level: string, code: string, message: string, head, force: boolean?, details: { [string]: any }?)
 	Fleet.alert(level, code, message, {
 		s = if typeof(head) == "table" and typeof(head.seq) == "number" then head.seq else appliedSeq,
 		a = if typeof(head) == "table" and typeof(head.artifactId) == "string" then head.artifactId elseif current then current.artifact.id else nil,
 		b = myBranch,
 		g = if current then current.number else 0,
+		d = details, -- 0.5.2: the alert's `details` (the backend stored null for every kernel alert before)
 	}, force)
 end
 
@@ -1851,12 +1852,24 @@ local function noteFailure(head, reason: string, report)
 	if not delay then
 		failing.nextAt = math.huge
 		local what = if report.stage == "load" then `failed to load {failing.attempts} times` else `failed ({report.stage or "swap"})`
+		-- 0.5.2: never a bare "?" (a report without an error is a kernel bookkeeping bug worth seeing as such).
+		local why = if report.error ~= nil and report.error ~= "" then tostring(report.error) else "no error recorded (please report this line)"
 		local keeps = if current then current.artifact.id elseif report.rollbackScheduled then "its last known good" else "nothing"
 		warn(`[TypeTorch] deploy #{head.seq} ({head.artifactId or head.assetId}) {what}; this server keeps {keeps} until a newer deploy`)
 		Registry.logEvent({ action = "deploy_failed", seq = head.seq, assetId = head.assetId, artifactId = head.artifactId, stage = report.stage, attempts = failing.attempts, error = clip(report.error, 300), job = game.JobId })
 		-- 0.3.2 (P-O1): the deploy's outcome on this server.
-		reportOutcome(head, "failed", { e = `{report.stage or "swap"}: {report.error or "?"}` })
-		fleetAlert("critical", "deploy_failed", `deploy #{head.seq} ({head.artifactId or head.assetId}) {what}: {report.error or "?"}`, head)
+		reportOutcome(head, "failed", { e = `{report.stage or "swap"}: {why}` })
+		fleetAlert("critical", "deploy_failed", `deploy #{head.seq} ({head.artifactId or head.assetId}) {what}: {why}`, head, nil, {
+			stage = report.stage or "swap",
+			error = clip(why, 1000),
+			attempts = failing.attempts,
+			reason = reason,
+			kind = report.kind,
+			loadSeconds = report.loadSeconds,
+			swapSeconds = report.swapSeconds,
+			transient = report.transient,
+			rollbackTo = report.rollbackTo,
+		})
 		return
 	end
 	failing.nextAt = os.clock() + delay
@@ -3845,6 +3858,7 @@ local bootSigned
 local function bootSignedOnce()
 	local tried = {}
 	local cut = false -- 0.3.6: out of boot time with a fallback ready (Fallback.cutOff): the rest are retried later
+	local tookOver = false -- 0.5.2: another swap left a generation running while boot waited for the lock
 	local function try(head, how: string): boolean
 		local key = `{tostring(head.assetId)}#{tostring(head.seq)}`
 		if tried[key] or cut then
@@ -3856,7 +3870,24 @@ local function bootSignedOnce()
 			return false
 		end
 		tried[key] = true
+		-- 0.5.2 (the 2026-10-11 prod alerts: deploy #117 "failed (swap): ?", then no_trusted_head): another swap (a
+		-- deploy message that arrived during boot, a pin, the last-known-good chain) may hold the swap lock. swapTo
+		-- would only queue this head ({ ok = false, queued = true }), and boot used to count that as a final failure of
+		-- every candidate. Wait for it like the deploy worker does; if it left something running, boot is done.
+		while busy or restoring do
+			task.wait(0.1)
+		end
+		if current then
+			tookOver = true
+			return true
+		end
+		if closing then
+			return false
+		end
 		local report = swapTo(head, "boot")
+		if report.queued then
+			return false -- not a failure: the queued head runs when the lock frees (swapTo's pendingHead)
+		end
 		if report.ok then
 			if how ~= "blind" and typeof(head.seq) == "number" then
 				appliedSeq = math.max(appliedSeq, head.seq)
@@ -3910,6 +3941,9 @@ local function bootSignedOnce()
 		if not trustedProd(myBranch, candidate) and not failedHere[candidate.assetId] then
 			local head = admit(table.clone(candidate), "blind")
 			if try(head, "blind") then
+				if tookOver then
+					return
+				end
 				warn(
 					`[TypeTorch] BOOT FAIL-SAFE: no verified head for {myBranch} loaded, so this server booted the UNVERIFIED stored head {head.artifactId or `asset-{head.assetId}`} (seq {tostring(head.seq)}). Updates still need signatures; the next signed deploy replaces it.`
 				)
