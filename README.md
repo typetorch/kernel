@@ -7,7 +7,8 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   swaps with soft + hard stop, automatic rollback, registry (in-game DataStore heads + the signed settings), dev access,
   stable transport, logs, the fleet API sender (`Fleet`), the fallbacks (`Fallback`), `/tt` chat commands. A place
   project that maps these files one by one must map `Fleet` (0.3.2), `Fallback` (0.3.6), `Health` (0.3.7) and
-  `Messaging` (0.3.8), `Budget` and `Errors` (0.4.0) too; without them the kernel boots without that part and says so.
+  `Messaging` (0.3.8), `Budget` and `Errors` (0.4.0), `RemoteDebug` (0.5.0) and `Bundle` (0.5.3) too; without them the
+  kernel boots without that part and says so.
 - `src/shared/` → `ReplicatedStorage.TypeTorchKernelShared`: constants, client API, ClientEntry template.
 - `src/client/` → `ReplicatedFirst.TypeTorchKernelClient`: follows `ActiveGeneration`, swaps client generations.
 - `place.project.json`: the whole place (kernel + baseplate + spawn, HTTP on). `rojo build place.project.json -o
@@ -252,6 +253,27 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
     really watched, so a forged wake costs one poll. Another JobId's or a malformed wake is ignored, one per
     `RD_WAKE_GAP` (10) s at most, none without a backend in the settings; it never becomes `status().lastMessage`.
     `status().remoteDebug.wakes` / `wakesIgnored` / `lastWakeAt` count them. Older kernels ignore the message (no branch).
+- Debug bundles (0.5.3; `src/server/Bundle.luau`, optional): when this server fails, or shuts down after a failure, it
+  posts what happened to `POST <url>/v1/fleet/bundle` (the same backend and key as the fleet API) by itself, so the
+  owner can see it without watching: `{ v = 1, id, j, t, k, b, a, s, g, code, level, message, closing, failure, server,
+  deploy, fallback, alerts, players, serverLog, playerLogs }`. Triggers: every critical alert (deploy_failed,
+  no_trusted_head, artifact_refused, kernel_api_mismatch, booted_unverified, health_rollback, lkg_exhausted, ...), a
+  generation that fails to start (`start_failed`), Fallback moving players off the server (`players_moved`) and a
+  dev's `/tt bundle` (`manual`). The trigger gets the bundle id at once (the alert carries it as `d.bundle`); the bundle
+  goes ~3 s later with that id (triggers in between join it, listed in `failure.triggers`). At most one per trigger
+  code per 60 s and 10 per server, plus one from BindToClose, which sends one ONLY when a failure fired in the last 10
+  minutes (or flushes the one still waiting), in parallel with the fleet and error closing requests, inside the close
+  deadline. Contents: the server section (identity, generation, fleet status without the access code, budget, health,
+  clients, errors), the deploy state (`appliedSeq`, `history`, the last 10 full swap `reports`, `failing`, `failedHere`,
+  `pending`, `wanted`, `busy`, `restoring`, the branch's `heads`, the last 10 `refusals`), `Fallback.status()`, the last
+  10 alerts, the last 300 server log lines, the players here and those who left in the last 10 minutes (user id, name,
+  join and leave time, ping, their client's start status) and player logs: the present clients' log rings over the
+  remote-debug channel (`__tt/rdlogs`; at most 20, in parallel, 5 s), and for the others the error lines their client
+  sent (kept 10 minutes after they leave). The JSON is cut to ~200 KB (player logs first, then the server log, then the
+  deploy history; `server.trimmed` says what went); the backend key and the settings' secrets are replaced with
+  `<key>`. A 404 (an older backend) stops bundles for the server's lifetime; no answer, 429 and 5xx are retried.
+  `status().bundles` has the counters (never the URL or the key). Studio and servers without backend settings send
+  nothing.
 - Tests (Lune): `lune run scripts/test-errors.luau` (0.4.0: templating, fingerprints, per-minute counts, limits, batches,
   the sender, client batches, the dedup), `lune run scripts/test-budget.luau` (0.4.0: proxies, limits, the sliding
   minute, callers, the summary; 0.4.2: TPS windows, the slowest second, physics FPS, the Lua heap fallback),
@@ -260,7 +282,9 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   log lines on a fake clock; 0.4.2: a `seq` heartbeat goes before queued reports),
   `lune run scripts/test-remote-debug.luau` (0.5.0: allow-list, owners only, rate, secret scrub, plain data, the
   session, client logs; 0.5.1: the wake: this JobId within a tick, other JobIds and malformed ignored, the local rate,
-  a forged wake costs one poll, no backend no poll) and
+  a forged wake costs one poll, no backend no poll), `lune run scripts/test-bundle.luau` (0.5.3: triggers and the id,
+  joining, the per-code and per-server limits, the close rule, parallel client logs and their timeout, the left
+  players' lines, trimming, the key scrub, retries and the 404 stop, the body against the contract) and
   `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
   `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
   `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, `--durable`, 0.3.6's `--hold`, `--hold-optout`,
@@ -273,7 +297,9 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   health rollback, then the branch rollback naming the same build, adopted with no swap, also when it arrives mid
   rollback and when only the poll finds it), 0.5.0's `--remote-debug` (the heartbeat's `rd` starts the poll, kernel and
   framework ops, refusals, client logs, no secret in an answer; 0.5.1: a wake on `TypeTorch/deploy` starts it with
-  quiet heartbeats), and `--boot-budget`, which runs 26 boot scenarios (0.5.2 adds `deploy-during-boot`: a deploy that takes the swap lock mid boot)
+  quiet heartbeats), 0.5.3's `--bundle` (a failed deploy's alert with `d.bundle`, then the bundle with that id,
+  players, client logs and the server log; `/tt bundle`; a closing bundle after the failure, none after a clean close),
+  and `--boot-budget`, which runs 26 boot scenarios (0.5.2 adds `deploy-during-boot`: a deploy that takes the swap lock mid boot)
   with simulated slow or failing dependencies and
   checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from

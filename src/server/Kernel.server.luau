@@ -61,6 +61,9 @@
 -- generation's modules, state, assets, network and a read-only Dex), owners only, answers scrubbed of secrets.
 -- 0.5.1 (plans/25 "Instant wake"): the backend may also publish { k = "rd", j = JobId } on TypeTorch/deploy when the
 -- watch starts; the named server starts its poll at once instead of at its next heartbeat (RemoteDebug.onWake).
+-- 0.5.3 (debug bundles; Bundle.luau): a failing server posts what happened to the backend by itself: every critical
+-- alert (its d.bundle names the bundle), a generation that fails to start, Fallback moving players and /tt bundle
+-- trigger one (~3 s later, limited); BindToClose sends one only after a failure in the last 10 minutes.
 
 -- 0.3.2 (boot budget): every boot wait and cap counts from here.
 local kernelStartedAt = os.clock()
@@ -207,7 +210,7 @@ end
 -- TypeTorch makes, per minute and per caller) and the error reports (Errors.luau: templated, fingerprinted, counted,
 -- posted to the backend's /v1/errors). A place project that lists the kernel's files one by one and doesn't map them yet
 -- still boots, without them, and says so.
-local Budget, Errors, RemoteDebug
+local Budget, Errors, RemoteDebug, Bundle
 do
 	local function optional(name: string, what: string)
 		local module = script.Parent:FindFirstChild(name)
@@ -256,6 +259,21 @@ do
 			missing = true,
 			info = function()
 				return { state = "off", missing = true }
+			end,
+		}, {
+			__index = function()
+				return noop
+			end,
+		})
+	-- 0.5.3: debug bundles. Without the module nothing is sent and alerts carry no d.bundle.
+	Bundle = optional("Bundle", "debug bundles")
+		or setmetatable({
+			missing = true,
+			enabled = function()
+				return false
+			end,
+			info = function()
+				return { enabled = false, missing = true }
 			end,
 		}, {
 			__index = function()
@@ -659,7 +677,14 @@ local function rejectedInfo()
 end
 
 -- 0.3.2: an alert to the fleet API (when configured). `head` (optional) names the deploy: seq, artifact id.
+-- 0.5.3: every alert is kept for the debug bundles; a critical one triggers a bundle (Bundle.luau) and carries its id
+-- as d.bundle (the bundle follows ~BUNDLE_DELAY s later with the same id).
 local function fleetAlert(level: string, code: string, message: string, head, force: boolean?, details: { [string]: any }?)
+	local bundleOk, bundleId = pcall(Bundle.alert, level, code, message, details)
+	if bundleOk and typeof(bundleId) == "string" then
+		details = if details then table.clone(details) else {}
+		details.bundle = bundleId
+	end
 	Fleet.alert(level, code, message, {
 		s = if typeof(head) == "table" and typeof(head.seq) == "number" then head.seq else appliedSeq,
 		a = if typeof(head) == "table" and typeof(head.artifactId) == "string" then head.artifactId elseif current then current.artifact.id else nil,
@@ -1462,6 +1487,7 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 	Errors.start({ scriptContext = game:GetService("ScriptContext"), logService = game:GetService("LogService"), players = Players })
 	Transport.onKernel(Constants.CHANNEL_ERRORS, function(player: Player, payload)
 		Errors.fromClient(player, payload)
+		Bundle.fromClient(player, payload) -- 0.5.3: kept for a debug bundle after the player left
 	end)
 end
 
@@ -1589,6 +1615,8 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 			warn(`[TypeTorch] {generation.name} failed to start: {startError}`)
 			stopGeneration(generation)
 			dropReportListeners(generation)
+			-- 0.5.3: a debug bundle (it waits BUNDLE_DELAY s, so the rollback and the alerts that follow are in it).
+			pcall(Bundle.trigger, "start_failed", "critical", `{generation.name} failed to start: {startError}`, { stage = "start", error = startError, report = report })
 			if timedOut and readyCap then
 				-- 0.3.2 (boot budget): out of boot time, not proven broken: retried in the background with the normal
 				-- timeout (noteFailure) while the next candidate boots.
@@ -1667,6 +1695,7 @@ swapTo = function(head, reason: string, by: number?, announced: boolean?)
 		notifyPending(head, reason, 0, true) -- load or mount failed: the old generation keeps running
 	end
 	print("[TypeTorch] swap " .. HttpService:JSONEncode(report))
+	pcall(Bundle.noteSwap, { report = report, seq = head.seq, by = by, at = os.time() }) -- 0.5.3: deploy.reports
 	Fleet.heartbeat("swap")
 	for _, player in Players:GetPlayers() do
 		sendDevStatus(player)
@@ -3235,6 +3264,9 @@ local function status()
 		-- refused, failed, timeouts, redacted, lastPollAt?, lastCommandAt?, lastOp?, lastError?; 0.5.1: wakes,
 		-- wakesIgnored, lastWakeAt? }; never a command's contents, the URL or the key).
 		remoteDebug = RemoteDebug.info(),
+		-- 0.5.3: debug bundles ({ enabled, stopped?, triggered, max, pending?, sent, failed, skipped, trimmed, lastId?,
+		-- lastCode?, lastAt?, lastBytes?, lastError?, lastStatus?, closingId?, lastFailureAt? }; never the URL or the key).
+		bundles = Bundle.info(),
 	}
 end
 
@@ -3573,10 +3605,152 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 	Fleet.configure({ onHeartbeatReply = RemoteDebug.wake })
 end
 
+-- 0.5.3 DEBUG BUNDLES (Bundle.luau) ----------------------------------------------------------------------------------
+-- A failing server posts, by itself, what an owner needs to see what happened: the snapshots below, the server log, the
+-- players and their client logs (over the remote-debug channel). Same backend and key as the fleet API.
+do -- (scoped: the main chunk is near Luau's 200-local limit)
+	local function headSummary(head)
+		if typeof(head) ~= "table" then
+			return nil
+		end
+		return {
+			assetId = head.assetId,
+			artifactId = head.artifactId,
+			seq = head.seq,
+			commit = head.commit,
+			channel = head.channel,
+			branch = head.branch,
+			t = head.t,
+			rollback = head.rollback,
+			signed = head.sig ~= nil or head.sigF ~= nil,
+			how = admitted[head], -- "signed" | "bootstrap" | "blind" | ... (how this server admitted it)
+		}
+	end
+	Bundle.configure({
+		active = game.JobId ~= "" and serverType() ~= "studio",
+		jobId = game.JobId,
+		http = Budget.wrap(HttpService, "kernel", "http", "bundle"), -- counted for the budget view
+		encode = function(value)
+			return HttpService:JSONEncode(value)
+		end,
+		gzip = (function()
+			local ok, gzip = pcall(function()
+				return Enum.HttpCompression.Gzip
+			end)
+			return if ok then gzip else nil
+		end)(),
+		target = function()
+			return if Fleet.target then Fleet.target() else nil
+		end,
+		-- The settings' keys and tokens (as RemoteDebug scrubs them); Fleet.target()'s key is added by the module.
+		secrets = function()
+			local list = {}
+			if RemoteDebug.collectSecrets then
+				RemoteDebug.collectSecrets(Registry.settings.copy(), list)
+			end
+			return list
+		end,
+		summary = function()
+			return { b = myBranch, a = current and current.artifact.id, s = if appliedSeq >= 0 then appliedSeq else nil, g = current and current.number }
+		end,
+		server = function()
+			local fleet = fleetStatus()
+			fleet.k = nil -- a reserved server's access code never leaves the server
+			return {
+				jobId = game.JobId,
+				placeId = game.PlaceId,
+				placeVersion = game.PlaceVersion,
+				serverType = serverType(),
+				branch = myBranch,
+				channel = if myBranch then branchChannelOf(myBranch) else nil,
+				rules = if current then current.rules elseif myBranch then rulesFor(myBranch, nil) else nil,
+				kernelVersion = Constants.KERNEL_VERSION,
+				kernelBuild = KERNEL_BUILD,
+				startedAt = startedAt,
+				uptime = os.time() - startedAt,
+				generation = current and { name = current.name, number = current.number, startedAt = current.startedAt, artifact = runningArtifact() },
+				fleet = fleet,
+				budget = Budget.summary(),
+				health = Health.info(),
+				clients = clientSummary(),
+				errors = Errors.info(),
+				signedOnly = requiresSignatures(myBranch),
+				unverified = if current and current.unverified then true else nil,
+				backup = if current and current.backup then true else nil,
+				settings = Registry.settings.status(),
+				memoryMb = Stats:GetTotalMemoryUsageMb(),
+			}
+		end,
+		deploy = function()
+			local list = {}
+			for index, entry in history do
+				list[index] = { name = entry.name, artifactId = entry.artifactId, branch = entry.branch, seq = entry.head and entry.head.seq, assetId = entry.head and entry.head.assetId, at = entry.at, reason = entry.reason, loadSeconds = entry.loadSeconds, swapSeconds = entry.swapSeconds }
+			end
+			local stored = nil
+			if myBranch then
+				local _, fromStore = Registry.headCandidates(myBranch)
+				stored = fromStore
+			end
+			return {
+				appliedSeq = appliedSeq,
+				history = list,
+				failing = failing and {
+					seq = failing.seq,
+					assetId = failing.assetId,
+					attempts = failing.attempts,
+					final = failing.nextAt == math.huge or nil,
+					retryIn = if failing.nextAt ~= math.huge and failing.nextAt > os.clock() then math.ceil(failing.nextAt - os.clock()) else nil,
+				},
+				failedHere = failedList(),
+				pending = pendingHead and { reason = pendingHead.reason, by = pendingHead.by, head = headSummary(pendingHead.head) },
+				wanted = wanted and { reason = wanted.reason, jitter = wanted.jitter, head = headSummary(wanted.head) },
+				busy = busy,
+				restoring = restoring,
+				closing = closing,
+				heads = {
+					branch = myBranch,
+					stored = headSummary(stored),
+					trusted = if myBranch then headSummary(headFor(myBranch)) else nil,
+					running = if current then headSummary(current.head) else nil,
+				},
+				refusals = table.clone(refusals),
+				rejected = rejectedInfo(),
+			}
+		end,
+		fallback = Fallback.status,
+		serverLog = function(limit)
+			return Logs.since(nil, limit)
+		end,
+		players = function()
+			return Players:GetPlayers()
+		end,
+		playerInfo = function(player)
+			local pingOk, ping = pcall(function()
+				return player:GetNetworkPing()
+			end)
+			local client = clientStatus[player]
+			return {
+				ping = if pingOk and typeof(ping) == "number" then math.floor(ping * 1000 + 0.5) else nil,
+				client = if client then table.clone(client) else nil,
+			}
+		end,
+		clientLogs = RemoteDebug.clientLogs,
+		newId = function()
+			return HttpService:GenerateGUID(false)
+		end,
+		spawn = spawnOnKernel,
+		warn = warn,
+		print = print,
+	})
+	for _, player in Players:GetPlayers() do
+		Bundle.playerAdded(player)
+	end
+end
+
 -- /tt chat commands (TextChatCommand), the fallback when a generation is broken --------------------------------------
 
 do -- (scoped: the main chunk is near Luau's 200-local limit)
-	local HELP = "/tt status | branch <name> | new <branch> [assetId] | pin <assetId> | unpin | reload | rollback | dev"
+	local HELP = "/tt status | branch <name> | new <branch> [assetId] | pin <assetId> | unpin | reload | rollback | bundle | dev"
 
 	local function describe(report): string
 		if report.ok then
@@ -3634,6 +3808,10 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 			notice(player, describe(reload(player)))
 		elseif command == "rollback" then
 			notice(player, describe(rollback(player)))
+		elseif command == "bundle" then
+			-- 0.5.3: a debug bundle now (the same limits as the automatic ones: one "manual" per BUNDLE_CODE_GAP s).
+			local id, why = Bundle.trigger("manual", "info", `/tt bundle by {player.Name} ({player.UserId})`, { stage = "manual" })
+			notice(player, if id then `debug bundle {id} goes to the backend in about {Constants.BUNDLE_DELAY} s` else `no bundle: {why or "debug bundles are off on this server"}`)
 		elseif command == "dev" then
 			Transport.kernelSend(player, Constants.CHANNEL_EVENT, "dev-open")
 		else
@@ -3657,11 +3835,13 @@ end
 
 Players.PlayerAdded:Connect(function(player)
 	Fleet.heartbeat("players")
+	Bundle.playerAdded(player) -- 0.5.3: join times for the debug bundles
 	task.defer(sendDevStatus, player)
 end)
 Players.PlayerRemoving:Connect(function(player)
 	lastDev[player] = nil
 	Fleet.heartbeat("players")
+	Bundle.playerRemoving(player, clientStatus[player]) -- 0.5.3: kept BUNDLE_LEFT_SECONDS with their client status
 	clientStatus[player] = nil
 end)
 
@@ -3783,6 +3963,14 @@ end)
 do -- (scoped: the main chunk is near Luau's 200-local limit)
 	local function onClose()
 		closing = true
+		local closeStarted = os.clock()
+		-- 0.5.3: a closing debug bundle, only when something failed in the last BUNDLE_CLOSE_WINDOW s (or the one still
+		-- waiting), in parallel with everything below and inside the same deadline.
+		local bundleDone = false
+		task.spawn(function()
+			pcall(Bundle.closing, Constants.CLOSE_DEADLINE * 0.9)
+			bundleDone = true
+		end)
 		-- The fleet API hears a clean close (not a lost server), in parallel with the generation's handler.
 		task.spawn(Fleet.closing, 3)
 		-- 0.4.0: the last error reports go out too.
@@ -3817,6 +4005,9 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 				pcall(task.cancel, thread)
 				warn(`[TypeTorch] {generation.name} onClose took more than {Constants.CLOSE_DEADLINE} s`)
 			end
+		end
+		while not bundleDone and os.clock() < closeStarted + Constants.CLOSE_DEADLINE do
+			task.wait()
 		end
 	end
 	local bound, bindError = pcall(function()
@@ -4157,6 +4348,10 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 		kernelSend = Transport.kernelSend,
 		alert = function(level, code, message, head)
 			fleetAlert(level, code, message, head)
+		end,
+		-- 0.5.3: players are being moved off this server: a debug bundle (the alert right after joins it).
+		moved = function(level, text)
+			pcall(Bundle.trigger, "players_moved", level, text, { stage = "fallback", error = text })
 		end,
 		logEvent = function(entry)
 			entry.job = game.JobId

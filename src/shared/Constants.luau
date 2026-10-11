@@ -7,7 +7,7 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.5.2",
+	KERNEL_VERSION = "0.5.3",
 
 	-- The kernel's DataStore: durable heads, deployments, private records, events, and (0.3.8) the signed settings.
 	DATASTORE = "TypeTorch",
@@ -361,5 +361,32 @@ return {
 	RD_CLIENT_LOGS_TIMEOUT = 5,
 	RD_CLIENT_LOGS_MAX = 200,
 	RD_CLIENT_LOGS_BYTES = 64000,
+
+	-- 0.5.3 DEBUG BUNDLES (Bundle.luau): a failing server posts what happened to BUNDLE_PATH on the backend (the settings'
+	-- backend key). A trigger (a critical alert, a generation that fails to start, Fallback moving players, /tt bundle)
+	-- gets its id at once; the bundle goes BUNDLE_DELAY s later (triggers meanwhile join it). At most one per trigger code
+	-- per BUNDLE_CODE_GAP s and BUNDLE_MAX per server, plus one from BindToClose, only when a failure fired in the last
+	-- BUNDLE_CLOSE_WINDOW s. The JSON is cut to BUNDLE_BYTES (player logs first). It carries the last BUNDLE_LOG_LINES
+	-- server log lines, BUNDLE_ALERTS alerts and BUNDLE_REPORTS swap reports, the players here and those who left in the
+	-- last BUNDLE_LEFT_SECONDS, and client logs: at most BUNDLE_PLAYERS_MAX present clients asked at once (waiting
+	-- BUNDLE_LOGS_TIMEOUT s, BUNDLE_CLOSE_LOGS_TIMEOUT when closing; BUNDLE_PLAYER_LINES each), and for the others the
+	-- BUNDLE_CLIENT_LINES newest error lines their client sent. No answer, 429 and 5xx are retried after
+	-- BUNDLE_RETRY_DELAYS; a 404 stops bundles for the server's lifetime.
+	BUNDLE_PATH = "/v1/fleet/bundle",
+	BUNDLE_DELAY = 3,
+	BUNDLE_CODE_GAP = 60,
+	BUNDLE_MAX = 10,
+	BUNDLE_CLOSE_WINDOW = 600,
+	BUNDLE_BYTES = 200000,
+	BUNDLE_LOG_LINES = 300,
+	BUNDLE_ALERTS = 10,
+	BUNDLE_REPORTS = 10,
+	BUNDLE_LEFT_SECONDS = 600,
+	BUNDLE_PLAYERS_MAX = 20,
+	BUNDLE_LOGS_TIMEOUT = 5,
+	BUNDLE_CLOSE_LOGS_TIMEOUT = 2,
+	BUNDLE_PLAYER_LINES = 150,
+	BUNDLE_CLIENT_LINES = 30,
+	BUNDLE_RETRY_DELAYS = { 2, 5 },
 
 }
