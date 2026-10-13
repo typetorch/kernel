@@ -30,6 +30,10 @@
 -- secret, and "not watched" stops the polling. 0.5.1 adds the instant wake to it: with heartbeat replies quiet, a wake
 -- { k = "rd", j = JobId } on TypeTorch/deploy starts the poll at once; another JobId's or a malformed wake does nothing,
 -- and a wake never becomes the last deploy message.
+-- 0.5.3's `--bundle` (debug bundles, Bundle.luau): a reserved dev server on the fleet API; a deploy that fails to start
+-- sends its alert with d.bundle, then the bundle with that id (players, a client's logs over __tt/rdlogs, a left
+-- player's error lines, the server log, the deploy state, no key); /tt bundle sends one; a close after the failure sends
+-- a closing bundle, and (in a child process, `--bundle-clean`) a clean close sends none.
 -- Every mode also checks that no swap ran on a thread its own stopped generation owned.
 -- Boots the real src/server/*.luau as a PUBLIC (prod) server under Lune, with a small Instance emulator and stubbed
 -- services (InsertService, MessagingService, DataStore, MemoryStore; 0.3.8: no ConfigService at all), then drives it:
@@ -975,7 +979,7 @@ end
 
 local kernelFolder = newInstance("Folder", "TypeTorchKernel")
 kernelFolder.Parent = services.ServerScriptService
-for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Messaging = "Messaging.luau", Budget = "Budget.luau", Errors = "Errors.luau", RemoteDebug = "RemoteDebug.luau", Settings = "Settings.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
+for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Messaging = "Messaging.luau", Budget = "Budget.luau", Errors = "Errors.luau", RemoteDebug = "RemoteDebug.luau", Bundle = "Bundle.luau", Settings = "Settings.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
 	sourceInstance(if name == "Kernel" then "Script" else "ModuleScript", name, `src/server/{file}`).Parent = kernelFolder
 end
 local entryTemplate = sourceInstance("Script", "Entry", "src/server/Entry.server.luau")
@@ -1100,16 +1104,23 @@ local MODES38 = {
 	adopt = table.find(process.args, "--adopt") ~= nil,
 	-- 0.5.0 `--remote-debug` (plans/25): see the header.
 	remoteDebug = table.find(process.args, "--remote-debug") ~= nil,
+	-- 0.5.3 `--bundle` (debug bundles): a reserved dev server on the fleet API. A deploy that fails to start sends its
+	-- alert with d.bundle, then the bundle with that id (players present and left, a client's log ring over
+	-- __tt/rdlogs, the left player's error lines, the server log, the deploy state); /tt bundle sends one; a close
+	-- after the failure sends a closing bundle. `--bundle-clean` (run by `--bundle` as a child process): a clean close
+	-- sends none.
+	bundle = table.find(process.args, "--bundle") ~= nil,
+	bundleClean = table.find(process.args, "--bundle-clean") ~= nil,
 }
 -- 0.3.8 loading screens (plans/19 item 13), client side: `--client-boot` (the game's BootScreen replaces the kernel's
 -- "Starting..." until the first client generation runs and the server's hold ends), `--client-own` (KernelScreen =
 -- false: the game draws its own; the kernel's shows only for moves and later holds). `--client` checks ClientReady,
 -- ClientGeneration and Holding too.
 
-if FLEET_MODE or MODES38.adopt then
+if FLEET_MODE or MODES38.adopt or MODES38.bundle or MODES38.bundleClean then
 	dataStore.data.settings = deepCopy(SMOKE.settings.fleetSlash) -- 0.3.8: was ConfigService TypeTorchFleet
 end
-if DEV_MODE or VIP_MODE or HEALTH_MODE or FLEET_MODE or DURABLE_MODE or HEALTH_CONFIG_MODE or MODES38.adopt then
+if DEV_MODE or VIP_MODE or HEALTH_MODE or FLEET_MODE or DURABLE_MODE or HEALTH_CONFIG_MODE or MODES38.adopt or MODES38.bundle or MODES38.bundleClean then
 	GAME_ROOT_PROPS.PrivateServerId = "ps-smoke"
 	GAME_ROOT_PROPS.PrivateServerOwnerId = if VIP_MODE then 777 else 0
 	dataStore.data["private/ps-smoke"] = { branch = "dev", setBy = 1, setAt = "2026-10-04T00:00:00Z", code = if HEALTH_MODE or FLEET_MODE then "smoke-access-code" else nil }
@@ -1735,6 +1746,12 @@ Constants.SUBSCRIBE_RETRY_DELAYS = { 0.05 }
 Constants.PRIVATE_READ_RETRY_DELAYS = { 0.05, 0.05, 0.05 }
 Constants.CLOSE_DEADLINE = 1
 Constants.SETTINGS_PING_GAP = 0.05 -- 0.3.8: a settings ping re-reads at once
+-- 0.5.3: debug bundles go 0.3 s after their trigger (3 s), wait 0.5 s for client logs (5 s; the smoke's clients
+-- answer only in `--bundle`), and retry fast.
+Constants.BUNDLE_DELAY = 0.3
+Constants.BUNDLE_LOGS_TIMEOUT = 0.5
+Constants.BUNDLE_CLOSE_LOGS_TIMEOUT = 0.3
+Constants.BUNDLE_RETRY_DELAYS = { 0.05, 0.1 }
 if BOOT_SCENARIO then
 	-- Real kernel timing, SCALE times faster (and the same constants an older kernel had, for before/after runs).
 	for _, name in { "BOOT_BUDGET", "BOOT_READS_WAIT", "KEYS_BOOT_WAIT", "CONFIG_BOOT_WAIT", "BOOT_OWNER_CHECK", "BOOT_DEADLINE", "BOOT_LOAD_TIMEOUT", "BOOT_READY_TIMEOUT", "BOOT_LATE_LOAD", "BOOT_LATE_READY", "READY_TIMEOUT", "POLL_SECONDS", "STOP_DEADLINE", "PUBLIC_JITTER_SECONDS", "FALLBACK_AT", "PEER_COLLECT", "PEER_CACHE", "PEER_REPLY_JITTER", "TELEPORT_GRACE", "TELEPORT_RETRY" } do
@@ -1755,7 +1772,7 @@ if SWITCH_MODE then
 	Constants.FLEET_RETRY_DELAYS = { 0.05 }
 	Constants.FLEET_RATE_PER_MINUTE = 6000
 end
-if FLEET_MODE or MODES38.adopt then
+if FLEET_MODE or MODES38.adopt or MODES38.bundle or MODES38.bundleClean then
 	Constants.FLEET_HEARTBEAT_SECONDS = 0.5
 	Constants.FLEET_PLAYERS_GAP = 0.2
 	Constants.FLEET_WATCH_SECONDS = 0.2
@@ -1790,7 +1807,7 @@ if HOLD_MODE or HOLD_OPTOUT_MODE or PEERS_MODE or PEERS_UNTRUSTED_MODE or BACKUP
 		Constants.READY_TIMEOUT = 1.5
 	end
 end
-if HEALTH_MODE or HEALTH_PROD_MODE or LKG_BOOT_MODE or FLEET_MODE or HEALTH_CONFIG_MODE or MODES38.adopt then
+if HEALTH_MODE or HEALTH_PROD_MODE or LKG_BOOT_MODE or FLEET_MODE or HEALTH_CONFIG_MODE or MODES38.adopt or MODES38.bundle or MODES38.bundleClean then
 	Constants.HEALTH_WINDOW = 1.5
 	Constants.POLL_SECONDS = 0.3
 end
@@ -1970,7 +1987,7 @@ local function finish()
 	check(`no unexpected errors on kernel threads{if #unexpected > 0 then ": " .. unexpected[1] else ""}`, #unexpected == 0)
 	check(`no swap ran on a thread its own stopped generation owned (busy-flag hazard){if #hazards > 0 then ": " .. hazards[1] else ""}`, #hazards == 0)
 	check("the kernel never used a MemoryStore sorted map (0.3.2: fleet status and reports are API only)", #sortedMapRequests == 0)
-	if not FLEET_MODE and not SWITCH_MODE and not FALLBACK_FLEET and not ACCESS_MODE and not MODES38.errors and not MODES38.perf and not MODES38.adopt and not MODES38.remoteDebug then
+	if not FLEET_MODE and not SWITCH_MODE and not FALLBACK_FLEET and not ACCESS_MODE and not MODES38.errors and not MODES38.perf and not MODES38.adopt and not MODES38.remoteDebug and not MODES38.bundle and not MODES38.bundleClean then
 		check("no HTTP request without settings.fleet", #httpRequests == 0)
 	end
 	local leaked = false
@@ -1996,7 +2013,7 @@ local function finish()
 			end
 		end
 	end
-	local mode = if MODES38.remoteDebug then "--remote-debug" elseif MODES38.errors then "--errors" elseif MODES38.perf then "--perf" elseif MODES38.adopt then "--adopt" elseif MODES38.rollbackPrev then "--rollback-prev" elseif MODES38.detached then "--detached" elseif MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
+	local mode = if MODES38.bundleClean then "--bundle-clean" elseif MODES38.bundle then "--bundle" elseif MODES38.remoteDebug then "--remote-debug" elseif MODES38.errors then "--errors" elseif MODES38.perf then "--perf" elseif MODES38.adopt then "--adopt" elseif MODES38.rollbackPrev then "--rollback-prev" elseif MODES38.detached then "--detached" elseif MODES38.settings then "--settings" elseif MODES38.settingsMissing then "--settings-missing" elseif MODES38.messaging then "--messaging" elseif MODES38.messagingStudio then "--messaging-studio" elseif MODES38.messagingMissing then "--messaging-missing" elseif MODES38.clientBoot then "--client-boot" elseif MODES38.clientOwn then "--client-own" elseif FALLBACK_MODE then "--fallback" elseif DEV_MODE then "--dev" elseif VIP_MODE then "--vip" elseif BOOTSTRAP_ONLY_MODE then "--bootstrap-only" elseif BOOTSTRAP_MODE then "--bootstrap" elseif BLIND_MODE then "--blind" elseif EMPTY_MODE then "--empty" elseif STUDIO_MODE then "--studio-local" elseif HEALTH_MODE then "--health" elseif HEALTH_PROD_MODE then "--health-prod" elseif LKG_BOOT_MODE then "--lkg-boot" elseif CLIENT_MODE then "--client" elseif FLEET_MODE then "--fleet" elseif SWITCH_MODE then "--switch" elseif DURABLE_MODE then "--durable" elseif HOLD_MODE then "--hold" elseif HOLD_OPTOUT_MODE then "--hold-optout" elseif PEERS_MODE then "--peers" elseif PEERS_UNTRUSTED_MODE then "--peers-untrusted" elseif BACKUP_MODE then "--backup" elseif RECOVER_MODE then "--recover" elseif TELEPORT_MODE then "--teleport" elseif BOUNCE_MODE then "--bounce" elseif MIDSWAP_MODE then "--mid-swap" elseif CLIENT_FAIL_MODE then "--client-fail" elseif KERNEL_CRASH_MODE then "--kernel-crash" elseif HEADS_CAP_MODE then "--heads-cap" elseif ACCESS_MODE then "--access" elseif HEALTH_CONFIG_MODE then "--health-config" elseif HEALTH_MISSING_MODE then "--health-missing" elseif BOOT_SCENARIO then `--boot-scenario {BOOT_SCENARIO}` else "public server"
 	print(`{passes} passed, {failures} failed ({mode})`)
 	process.exit(if failures == 0 then 0 else 1)
 end
@@ -4221,6 +4238,148 @@ if MODES38.adopt then
 	finish()
 end
 
+if MODES38.bundle or MODES38.bundleClean then
+	local PREFIX = "https://fleet.example.test/api/v1/fleet/"
+	local function requests(path: string, from: number?)
+		local list = {}
+		for index = from or 1, #httpRequests do
+			local request = httpRequests[index]
+			if request.url == PREFIX .. path then
+				table.insert(list, request)
+			end
+		end
+		return list
+	end
+	local function alerted(code: string)
+		for _, request in requests("alert") do
+			if request.body.code == code then
+				return request.body
+			end
+		end
+		return nil
+	end
+	local function bundleWith(id: string?)
+		for _, request in requests("bundle") do
+			if request.body.id == id then
+				return request
+			end
+		end
+		return nil
+	end
+	local function close()
+		local closeDone = false
+		task.spawn(function()
+			closeCallbacks[1]()
+			closeDone = true
+		end)
+		return waitFor("closing", function()
+			return closeDone and #requests("closing") == 1
+		end)
+	end
+	check("bundle: boots the dev head and beats", waitFor("boot", function()
+		return SMOKE.kernel ~= nil and running() == "ddddddd-444444" and #requests("heartbeat") >= 1
+	end))
+	if MODES38.bundleClean then
+		local guest = joinPlayer(55, "Guest")
+		task.wait(0.5)
+		check("bundle-clean: a clean close (nothing failed) sends the closing heartbeat ...", close())
+		task.wait(0.5)
+		check("bundle-clean: ... and no bundle", #requests("bundle") == 0 and guest ~= nil and status().bundles.sent == 0 and status().bundles.enabled == true)
+		finish()
+	end
+	-- A clean close sends no bundle: a fresh server (a child process), since BindToClose runs once per server.
+	local child = process.exec("lune", { "run", "scripts/smoke-kernel.luau", "--bundle-clean" })
+	check("bundle: a clean close sends no bundle (--bundle-clean)", child.ok and string.find(child.stdout, "0 failed (--bundle-clean)", 1, true) ~= nil)
+	if not child.ok then
+		print(child.stdout)
+	end
+	-- Two players; the rider's client answers the kernel's log ask (__tt/rdlogs) as the kernel client would.
+	local net = services.ReplicatedStorage.TypeTorch.Net
+	local rider = joinPlayer(424242424, "Rider")
+	local leaver = joinPlayer(515151, "Leaver")
+	local answeredAsks = 0
+	task.spawn(function()
+		local seen = #firedToClient
+		while true do
+			for index = seen + 1, #firedToClient do
+				local fired = firedToClient[index]
+				if fired[1] == rider and fired[3] == "__tt/rdlogs" and type(fired[4]) == "table" then
+					answeredAsks += 1
+					net.OnServerEvent:Fire(rider, "*", "__tt/rdlogs", { id = fired[4].id, logs = { { i = 1, t = os.time(), kind = "output", text = "rider: hello from the client" }, { i = 2, t = os.time(), kind = "error", text = `rider: an error with {FLEET_TOKEN}` } } })
+				end
+			end
+			seen = #firedToClient
+			task.wait(0.02)
+		end
+	end)
+	-- The leaver's client reports an error, then the player leaves (kept 10 minutes for the bundles).
+	net.OnServerEvent:Fire(leaver, "*", "__tt/errors", { e = { { m = "leaver: client boom", n = 2 } } })
+	task.wait(0.1)
+	table.remove(fakePlayers, table.find(fakePlayers, leaver))
+	services.Players.PlayerRemoving:Fire(leaver)
+	task.wait(0.1)
+	-- A deploy that fails to start (I): the server goes back to D; alert deploy_failed with d.bundle, then the bundle.
+	publish("TypeTorch/deploy", { b = "dev", a = 1009, i = "iiiiiii-999999", s = 6, c = "iiiiiii", ch = "dev", t = nowMs() })
+	local alert = nil
+	check("bundle: the failed deploy's alert (deploy_failed, critical) carries d.bundle", waitFor("alert", function()
+		alert = alerted("deploy_failed")
+		return alert ~= nil and alert.level == "critical" and type(alert.d) == "table" and type(alert.d.bundle) == "string" and string.match(alert.d.bundle, "^[0-9a-f]+$") ~= nil and #alert.d.bundle == 32
+	end, 6) and running() == "ddddddd-444444")
+	local id = alert and alert.d and alert.d.bundle
+	local request = nil
+	check("bundle: then POST <url>/v1/fleet/bundle with the same id, the bearer key, after the alert", waitFor("bundle", function()
+		request = bundleWith(id)
+		return request ~= nil
+	end, 5) and request.method == "POST" and request.headers.Authorization == "Bearer " .. FLEET_TOKEN and table.find(httpRequests, request) > table.find(httpRequests, requests("alert")[1]))
+	local body = if request then request.body else {}
+	check("bundle: top level (v, j, k, b, s, g, code start_failed joined by deploy_failed, critical, not closing)", body.v == 1 and body.j == JOB and body.k == Constants.KERNEL_VERSION and body.b == "dev" and body.s == 5 and body.g ~= nil and body.code == "start_failed" and body.level == "critical" and body.closing == false and type(body.failure) == "table" and body.failure.stage == "start")
+	local joinedCodes = {}
+	for _, trigger in (body.failure and body.failure.triggers) or {} do
+		joinedCodes[trigger.code] = true
+	end
+	check("bundle: the deploy_failed alert joined the start failure's bundle (failure.triggers)", joinedCodes.start_failed and joinedCodes.deploy_failed)
+	local byUser = {}
+	for _, entry in body.players or {} do
+		byUser[entry.u] = entry
+	end
+	check("bundle: players: the rider (present, joined) and the leaver (left)", byUser[424242424] ~= nil and byUser[424242424].n == "Rider" and type(byUser[424242424].joinedAt) == "number" and byUser[424242424].leftAt == nil and byUser[515151] ~= nil and type(byUser[515151].leftAt) == "number")
+	local logs = body.playerLogs or {}
+	check("bundle: the rider's client log ring came over __tt/rdlogs", answeredAsks >= 1 and logs["424242424"] ~= nil and logs["424242424"][1].text == "rider: hello from the client")
+	check("bundle: the leaver's error lines were kept", logs["515151"] ~= nil and string.find(logs["515151"][1].text, "leaver: client boom", 1, true) ~= nil)
+	local logged = false
+	for _, line in body.serverLog or {} do
+		logged = logged or string.find(line.text, "failed to start", 1, true) ~= nil
+	end
+	check("bundle: the server log has the failure", #(body.serverLog or {}) > 0 and #body.serverLog <= 300 and logged)
+	local deploy = body.deploy or {}
+	local reported = false
+	for _, entry in deploy.reports or {} do
+		reported = reported or (entry.report and entry.report.artifactId == "iiiiiii-999999" and entry.report.ok == false)
+	end
+	check("bundle: deploy: appliedSeq, history, the failed swap's report, failing, failedHere, heads, flags", deploy.appliedSeq == 5 and #(deploy.history or {}) >= 1 and reported and type(deploy.failing) == "table" and deploy.failing.seq == 6 and #(deploy.failedHere or {}) >= 1 and type(deploy.heads) == "table" and deploy.busy ~= nil and deploy.restoring ~= nil)
+	check("bundle: server and fallback sections, the alerts raised", type(body.server) == "table" and body.server.jobId == JOB and body.server.kernelVersion == Constants.KERNEL_VERSION and body.server.fleet ~= nil and body.server.fleet.k == nil and type(body.fallback) == "table" and #(body.alerts or {}) >= 1)
+	check("bundle: the backend key is nowhere in it", request ~= nil and not string.find(request.raw, FLEET_TOKEN, 1, true) and string.find(request.raw, "<key>", 1, true) ~= nil)
+	-- /tt bundle (a dev: the creator): a manual bundle.
+	services.TextChatService.TypeTorchCommand.Triggered:Fire({ UserId = 1 }, "/tt bundle")
+	local owner = joinPlayer(1, "Owner")
+	services.TextChatService.TypeTorchCommand.Triggered:Fire({ UserId = 1 }, "/tt bundle")
+	check("bundle: /tt bundle by a dev sends a manual bundle", waitFor("manual", function()
+		for _, entry in requests("bundle") do
+			if entry.body.code == "manual" and entry.body.level == "info" then
+				return true
+			end
+		end
+		return false
+	end, 4) and owner ~= nil)
+	check("bundle: status().bundles counts them", status().bundles.sent >= 2 and status().bundles.enabled == true)
+	-- The close, 10 minutes or less after the failure: one closing bundle.
+	local before = #requests("bundle")
+	check("bundle: a close after the failure: the closing heartbeat ...", close())
+	local closing = requests("bundle")[before + 1]
+	check("bundle: ... and a closing bundle (code closing, closing = true, the players)", closing ~= nil and #requests("bundle") == before + 1 and closing.body.code == "closing" and closing.body.closing == true and closing.body.id ~= id and #(closing.body.players or {}) >= 2)
+	finish()
+end
+
 if MODES38.remoteDebug then
 	local BASE = "https://backend.example.test/api"
 	-- quietHeartbeats (0.5.1): heartbeat replies never say rd (a heartbeat 30 s away): only a wake can start the poll.
@@ -4517,7 +4676,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.5.2")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.5.3")
 
 -- 0.3.8: no settings record here (a game that never ran `typetorch settings push`): the defaults, reported as missing.
 do
