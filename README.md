@@ -273,7 +273,7 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   health rollback, then the branch rollback naming the same build, adopted with no swap, also when it arrives mid
   rollback and when only the poll finds it), 0.5.0's `--remote-debug` (the heartbeat's `rd` starts the poll, kernel and
   framework ops, refusals, client logs, no secret in an answer; 0.5.1: a wake on `TypeTorch/deploy` starts it with
-  quiet heartbeats), and `--boot-budget`, which runs 25 boot scenarios
+  quiet heartbeats), and `--boot-budget`, which runs 26 boot scenarios (0.5.2 adds `deploy-during-boot`: a deploy that takes the swap lock mid boot)
   with simulated slow or failing dependencies and
   checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
 - `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from

@@ -1631,6 +1631,40 @@ local BOOT_SCENARIOS = {
 		dataStore.data.deployments = { list = { entry } }
 	end },
 	{ name = "studio-local", first = "local", within = 1 },
+	-- 0.5.2 (the 2026-10-11 prod alerts: deploy #117 "failed (swap): ?", then no_trusted_head): boot's first candidate
+	-- (B) fails to start, and a signed deploy (F, #15) that arrived meanwhile takes the swap lock before the boot tries
+	-- its next candidate. The boot must wait for that swap, not count every candidate as failed and queue an OLDER
+	-- build (A) that replaces F the moment F's swap ends.
+	{ name = "deploy-during-boot", first = "fffffff-666666", final = "fffffff-666666", setup = function()
+		assets[1006].failLoads = 0
+		-- The boot prefetch of the deployment list fails, so the boot reads it between its candidates (a yield).
+		dataStore.failGets.deployments = 1
+		local starting = false
+		SMOKE.behave["bbbbbbb-222222"] = function()
+			starting = true
+			SMOKE.task.wait(0.6 * SCALE)
+			return "fail"
+		end
+		task.spawn(function()
+			while not starting do
+				task.wait(0.01)
+			end
+			publish("TypeTorch/deploy", deployMessage("M6", FIELDS.M6, { "sig" }))
+		end)
+	end, after = function()
+		task.wait(1.5 * SCALE) -- a queued older head would swap in right after F's swap
+		local queuedAsFailed, nothingLoaded = false, false
+		for _, line in output do
+			queuedAsFailed = queuedAsFailed or string.find(line.text, "failed (swap)", 1, true) ~= nil
+			nothingLoaded = nothingLoaded or string.find(line.text, "nothing loaded", 1, true) ~= nil
+		end
+		check("deploy-during-boot: a candidate queued behind the deploy's swap is not a failed deploy (no \"failed (swap)\")", not queuedAsFailed)
+		check("deploy-during-boot: no \"nothing loaded\" (no_trusted_head) while the deploy's swap runs", not nothingLoaded)
+		local ok, artifact = pcall(function()
+			return SMOKE.kernel:status().generation.artifact.id
+		end)
+		check("deploy-during-boot: F keeps running (no older head queued behind it)", ok and artifact == "fffffff-666666")
+	end },
 	-- 0.3.6 never an empty server: the time to each fallback (a player waits on the holding screen meanwhile).
 	{ name = "peers-only", first = "bbbbbbb-222222", setup = function()
 		-- No head anywhere; live servers of the branch run B (signed). Publish 0.2 s, replies 0.4-0.6 s later.
@@ -2014,6 +2048,9 @@ if scenario then
 	check(`{scenario.name}: first {scenario.first}`, expected)
 	if scenario.final then
 		check(`{scenario.name}: then {scenario.final}`, finalArtifact == scenario.final)
+	end
+	if scenario.after then
+		scenario.after()
 	end
 	finish()
 end
@@ -4480,7 +4517,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.5.1")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.5.2")
 
 -- 0.3.8: no settings record here (a game that never ran `typetorch settings push`): the defaults, reported as missing.
 do
