@@ -109,6 +109,8 @@ local deps = {
 	end,
 	kernelSend = function() end,
 	alert = function() end,
+	-- 0.5.3: (level, text): players are being moved off this server (the kernel triggers a debug bundle).
+	moved = function(_level, _text) end,
 	logEvent = function() end,
 	refuse = function() end,
 	warn = warn,
@@ -777,6 +779,7 @@ local function enterMove(why: string)
 	local text = `nothing runs on this server (head, last known good, peers and backup failed): moving players to another server of {deps.branch() or "?"}`
 	engage("move", text) -- new joiners are held too; everyone sees "Reconnecting..."
 	deps.warn(`[TypeTorch] {text}`)
+	deps.moved("critical", text) -- 0.5.3: a debug bundle (the alert below joins it)
 	deps.alert("critical", "boot_failed_teleport", text)
 	deps.logEvent({ action = "boot_failed_teleport", branch = deps.branch(), players = #Players:GetPlayers() })
 	startRecovery()
@@ -803,6 +806,7 @@ local function moveClient(player: Player, generationName: string)
 	end
 	clients.moved += 1
 	deps.kernelSend(player, Constants.CHANNEL_HOLD, "move")
+	deps.moved("warning", `{player.UserId}'s client failed to start {generationName}: moving the player`) -- 0.5.3
 	deps.alert("warning", "client_failed", `{player.UserId}'s client failed to start {generationName} after its retry and a re-send: moving the player`)
 	deps.logEvent({ action = "client_moved", userId = player.UserId, generation = generationName })
 	if isStudio() then

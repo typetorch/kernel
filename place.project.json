@@ -56,6 +56,7 @@
 				"Budget": { "$path": "src/server/Budget.luau" },
 				"Errors": { "$path": "src/server/Errors.luau" },
 				"RemoteDebug": { "$path": "src/server/RemoteDebug.luau" },
+				"Bundle": { "$path": "src/server/Bundle.luau" },
 				"Settings": { "$path": "src/server/Settings.luau" },
 				"Registry": { "$path": "src/server/Registry.luau" },
 				"Transport": { "$path": "src/server/Transport.luau" },
