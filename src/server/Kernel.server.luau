@@ -4363,8 +4363,88 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 	})
 end
 
+-- 0.5.4: live reload in a Studio playtest. The TypeTorch Studio plugin (typetorch/cli studio-plugin) syncs Rojo into
+-- the playtest's server and sets the attribute LiveReload = true on ServerStorage.TypeTorchDev while that sync is up.
+-- Then a change to the local payload (a script's Source, a name, an instance added or removed) reloads a fresh clone
+-- of it once the changes settle (LIVE_RELOAD_SETTLE after the last one), like Reload does: no Stop + Play. Changes
+-- made while the attribute is off (Rojo's first sync, a dev editing by hand) are dropped, not saved for later.
+local LIVE_RELOAD_SETTLE = 0.4
+
+local function watchLocalPayload()
+	local dev = ServerStorage:FindFirstChild("TypeTorchDev")
+	if not dev then
+		return
+	end
+	local changedAt: number? = nil
+	local connections: { RBXScriptConnection } = {}
+	local function changed()
+		changedAt = os.clock()
+	end
+	local function watch(instance: Instance)
+		table.insert(connections, instance:GetPropertyChangedSignal("Name"):Connect(changed))
+		if instance:IsA("LuaSourceContainer") then
+			table.insert(connections, instance:GetPropertyChangedSignal("Source"):Connect(changed))
+		end
+	end
+	local function rewire()
+		for _, connection in connections do
+			connection:Disconnect()
+		end
+		table.clear(connections)
+		local source = localPayloadSource()
+		if not source then
+			return
+		end
+		for _, instance in source:GetDescendants() do
+			watch(instance)
+		end
+		table.insert(
+			connections,
+			source.DescendantAdded:Connect(function(instance)
+				watch(instance)
+				changed()
+			end)
+		)
+		table.insert(connections, source.DescendantRemoving:Connect(changed))
+	end
+	rewire()
+	-- Rojo may replace the Payload model itself.
+	dev.ChildAdded:Connect(function(child)
+		if child.Name == "Payload" then
+			rewire()
+			changed()
+		end
+	end)
+	dev.ChildRemoved:Connect(function(child)
+		if child.Name == "Payload" then
+			rewire()
+		end
+	end)
+	task.spawn(function()
+		while not closing do
+			task.wait(0.1)
+			if changedAt and os.clock() - changedAt >= LIVE_RELOAD_SETTLE then
+				changedAt = nil
+				if dev:GetAttribute("LiveReload") == true and localPayloadSource() then
+					print("[TypeTorch] live reload: the local payload changed")
+					spawnOnKernel(function()
+						local report = reload(nil)
+						if not report.ok then
+							warn(`[TypeTorch] live reload failed: {report.error or "see above"}`)
+						end
+					end)
+				end
+			end
+		end
+	end)
+end
+
 local bootHead = headFor(myBranch)
 if localMode then
+	local watching, watchError = pcall(watchLocalPayload)
+	if not watching then
+		warn(`[TypeTorch] live reload is off: {watchError}`)
+	end
 	-- 0.3.1: Studio with ServerStorage.TypeTorchDev.Payload: mount a clone of it; deploys and the poll don't move this
 	-- session, Reload remounts the local copy.
 	local head = localHead()

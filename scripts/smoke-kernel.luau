@@ -197,11 +197,23 @@ local function signal(noErrorEvent: boolean?)
 	return object
 end
 
-local SIGNALS = { Event = true, OnServerEvent = true, OnClientEvent = true, Triggered = true }
+local SIGNALS = {
+	Event = true,
+	OnServerEvent = true,
+	OnClientEvent = true,
+	Triggered = true,
+	-- 0.5.4: the live reload watches the local payload with these.
+	ChildAdded = true,
+	ChildRemoved = true,
+	DescendantAdded = true,
+	DescendantRemoving = true,
+}
 local firedToServer = {} -- 0.3.2 `--client`: every RemoteEvent:FireServer call ({ remote name, args... })
 local kicked = {} -- names of players Kick was called on
 local kickMessages = {} -- 0.3.6: name -> the Kick message
 local loadedCharacters = {} -- 0.3.6: names of players LoadCharacter was called on
+
+local fireTree
 
 local function newInstance(className: string, name: string?)
 	local self = setmetatable({}, instanceMeta)
@@ -235,11 +247,38 @@ instanceMeta.__index = function(self, key)
 	return nil
 end
 
+-- 0.5.4: ChildAdded/ChildRemoved on the parent, DescendantAdded/DescendantRemoving on every ancestor (for the
+-- instance and each of its descendants). Only signals someone asked for exist, so this costs nothing elsewhere.
+function fireTree(parent, childSignal: string, descendantSignal: string, instance)
+	local direct = internals[parent].signals[childSignal]
+	if direct then
+		direct:Fire(instance)
+	end
+	local moved = { instance }
+	for _, inner in instance:GetDescendants() do
+		table.insert(moved, inner)
+	end
+	local ancestor = parent
+	while ancestor do
+		local event = internals[ancestor].signals[descendantSignal]
+		if event then
+			for _, each in moved do
+				event:Fire(each)
+			end
+		end
+		ancestor = internals[ancestor].props.Parent
+	end
+end
+
 instanceMeta.__newindex = function(self, key, value)
 	local inner = internals[self]
 	if key == "Parent" then
 		local old = inner.props.Parent
+		if old == value then
+			return
+		end
 		if old then
+			fireTree(old, "ChildRemoved", "DescendantRemoving", self)
 			local siblings = internals[old].children
 			local index = table.find(siblings, self)
 			if index then
@@ -249,11 +288,16 @@ instanceMeta.__newindex = function(self, key, value)
 		inner.props.Parent = value
 		if value then
 			table.insert(internals[value].children, self)
+			fireTree(value, "ChildAdded", "DescendantAdded", self)
 		end
 		return
 	end
 	local was = inner.props[key]
 	inner.props[key] = value
+	local changed = inner.propertySignals and inner.propertySignals[key]
+	if changed and was ~= value then
+		changed:Fire()
+	end
 	if key == "Enabled" and value == true and was ~= true and inner.props.ClassName == "Script" then
 		onScriptEnabled(self)
 	elseif key == "Enabled" and value == false and was == true and inner.props.ClassName == "Script" then
@@ -370,6 +414,13 @@ function Methods.SetAttribute(self, name, value)
 	if changed and before ~= value then
 		changed:Fire()
 	end
+end
+
+function Methods.GetPropertyChangedSignal(self, name)
+	local inner = internals[self]
+	inner.propertySignals = inner.propertySignals or {}
+	inner.propertySignals[name] = inner.propertySignals[name] or signal()
+	return inner.propertySignals[name]
 end
 
 function Methods.GetAttributeChangedSignal(self, name)
@@ -2551,6 +2602,36 @@ if STUDIO_MODE then
 	local missing = SMOKE.kernel:reload(owner)
 	check("studio: Reload without a source fails cleanly", missing.ok == false and string.find(missing.error or "", "TypeTorchDev.Payload", 1, true) ~= nil and isLocalId(running()))
 	localSource.Parent = devFolder
+	-- 0.5.4: live reload. With TypeTorchDev's LiveReload attribute on (the Studio plugin sets it while Rojo syncs the
+	-- playtest), a change to the local payload remounts it once the changes settle; with it off, nothing happens.
+	local someModule
+	for _, each in localSource:GetDescendants() do
+		if each:IsA("ModuleScript") then
+			someModule = each
+			break
+		end
+	end
+	local bootsBefore = #SMOKE.boots
+	someModule.Source = "return 1 -- edited, LiveReload off"
+	task.wait(1)
+	check("studio: a payload change without LiveReload doesn't reload", #SMOKE.boots == bootsBefore)
+	devFolder:SetAttribute("LiveReload", true)
+	local liveBefore = status().generation.name
+	someModule.Source = "return 2 -- edited"
+	task.wait(0.1)
+	someModule.Source = "return 3 -- edited again"
+	local added = newInstance("ModuleScript", "AddedByRojo")
+	added.Parent = localSource.Shared
+	check("studio: LiveReload remounts once the changes settle", waitFor("live reload", function()
+		return #SMOKE.boots == bootsBefore + 1
+	end) and status().generation.name ~= liveBefore and isLocalId(running()) and said("live reload: the local payload changed"))
+	task.wait(1)
+	check("studio: one reload for a burst of changes", #SMOKE.boots == bootsBefore + 1)
+	added:Destroy()
+	check("studio: removing an instance reloads too", waitFor("live reload (removal)", function()
+		return #SMOKE.boots == bootsBefore + 2
+	end))
+	devFolder:SetAttribute("LiveReload", nil)
 	check("studio: fleet status and deploy reports on the API, nothing written", #sortedMapRequests == 0 and SMOKE.kernel:fleetStatus().t == "studio" and typeof(SMOKE.kernel:deployReports()) == "table")
 	finish()
 end
@@ -4676,7 +4757,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.5.3")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.5.4")
 
 -- 0.3.8: no settings record here (a game that never ran `typetorch settings push`): the defaults, reported as missing.
 do

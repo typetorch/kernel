@@ -50,6 +50,11 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   session never follows the branch head (deploy messages, the poll); Reload remounts a fresh clone, and pins or branch
   switches still load uploaded artifacts. Outside Studio the folder is ignored. The template's `studio.project.json`
   syncs it with Rojo (see the template README, "Testing in Studio").
+- Live reload in a Studio playtest (0.5.4): while `ServerStorage.TypeTorchDev` has the attribute `LiveReload = true`
+  (the TypeTorch Studio plugin sets it while it syncs Rojo into the playtest's server), a change to the local payload
+  (a script's `Source`, a name, an instance added or removed) reloads a fresh clone of it 0.4 s after the last change,
+  as Reload does. Changes made while the attribute is off are dropped. `lune run scripts/smoke-kernel.luau
+  --studio-local` covers it.
 - Bad deploys are safe (0.3.2):
   - **Health window:** a failed `onStart` (the framework reports it with `api:reportError`) or 3 errors from the new
     generation's own scripts within 30 s of ready roll the server back. Errors from outside the generation never
