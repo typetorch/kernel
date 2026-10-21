@@ -1,3 +1,5 @@
+<img src="https://raw.githubusercontent.com/typetorch/docs/main/brand/typetorch.svg" width="64" alt="TypeTorch logo">
+
 # @typetorch/kernel
 
 The small loader baked into the place. It is plain Luau (no compile step, no roblox-ts runtime), so it never
