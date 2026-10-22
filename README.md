@@ -3,20 +3,88 @@
 # @typetorch/kernel
 
 The small loader baked into the place. It is plain Luau (no compile step, no roblox-ts runtime), so it never
-shares a RuntimeLib with the payloads it loads. Changing it needs a server restart (`typetorch kernel deploy`).
+shares a RuntimeLib with the payloads it loads. It boots a server, picks its branch, loads the branch's build (a
+payload uploaded by `typetorch deploy`) with LoadAsset, mounts it side by side with the running one and swaps to it
+without a restart; it holds the stable remotes, the `/tt` chat commands, the signed settings and the fleet reports.
+Changing the kernel itself needs a place update and new servers (`typetorch kernel deploy`, or `tt kernel deploy`).
 
-- `src/server/` → `ServerScriptService.TypeTorchKernel`: boot, branch choice, LoadAsset + side-by-side mounting,
-  swaps with soft + hard stop, automatic rollback, registry (in-game DataStore heads + the signed settings), dev access,
-  stable transport, logs, the fleet API sender (`Fleet`), the fallbacks (`Fallback`), `/tt` chat commands. A place
-  project that maps these files one by one must map `Fleet` (0.3.2), `Fallback` (0.3.6), `Health` (0.3.7) and
+Version 0.5.4, kernel API 1 (`src/shared/Constants.luau`: `KERNEL_VERSION`, `KERNEL_API`).
+
+## Where it fits
+
+- **CLI** (`@typetorch/cli`, `typetorch` / `tt`): typetorch.json `"kernel"` names the kernel folder (the template and
+  `typetorch init` use `node_modules/@typetorch/kernel`). `typetorch kernel deploy` runs this package's
+  `scripts/check.luau`, checks that `package.json` `version` = `KERNEL_VERSION` and `typetorch.kernelApi` =
+  `KERNEL_API`, hashes `place.project.json` and `src/`, requires a clean git checkout tagged `v<version>` (unless
+  `--allow-dirty` / `--allow-untagged`; a packaged kernel is identified by version and hash), builds
+  `typetorch.placeProject` (`place.project.json`) with Rojo, stamps the identity (`KernelVersion`, `KernelHash`,
+  `KernelCommit`) and the trust roots (`KeyAssetId`, `FallbackPublicKey`, `BootstrapHeads`) on
+  `ServerScriptService.TypeTorchKernel`, adds the backup build (`ServerStorage.TypeTorchBackup`), and patches only the
+  kernel slots of the live place (or replaces the whole place with `--replace-place`, test places only). The CLI also
+  writes what the kernel reads: deploy messages and `heads` / `deployments` in the DataStore, the signed settings
+  (`typetorch settings`, `access push`, `backend setup`, `experiment`), signed pins (`typetorch pin`).
+- **Framework** (`@typetorch/framework`): a payload's `Server.boot.boot(kernel)` / `Client.boot.boot(kernel)` get the
+  generation API below and return a stop function (0.2.2 passes it what replaces the generation). The typed view is
+  `ServerKernel` / `ClientKernel` in the framework's `src/kernel.ts`; the framework's `TypeTorch` API, networking, dev
+  menu, analytics and devtools are built on it and feature-detect the additive methods. A payload declares the API it
+  needs with the `KernelApi` attribute; a kernel with a lower `KERNEL_API` refuses it.
+- **Studio plugin** (`typetorch/studio-plugin`): sets `LiveReload` on `ServerStorage.TypeTorchDev` while it syncs Rojo
+  into a playtest (see "Live reload in a Studio playtest" below).
+- **Backend** (`typetorch/backend`): receives heartbeats, deploy reports, alerts, error reports and debug bundles at the
+  signed settings' `backend` URL, and drives remote debug.
+
+Guides: [typetorch/docs](https://github.com/typetorch/docs) (runtime API, branches and channels, prod signing,
+settings, fleet and alerts, Studio testing).
+
+## Layout
+
+- `src/server/` → `ServerScriptService.TypeTorchKernel`: `Kernel` (boot, branch choice, LoadAsset + side-by-side
+  mounting, swaps with soft + hard stop, automatic rollback, `/tt`), `Api` (the server generation API), `Registry`
+  (in-game DataStore / MemoryStore heads), `Settings` (the signed settings), `Signing` (Ed25519 rules), `Access` (dev
+  access), `Transport` (stable remotes), `Logs`, `Fleet` (the fleet API sender), `Fallback`, `Health`, `Messaging`,
+  `Budget`, `Errors`, `RemoteDebug`, `Bundle`, `vendor/` and `Entry` (disabled template, cloned per generation). A
+  place project that maps these files one by one must map `Fleet` (0.3.2), `Fallback` (0.3.6), `Health` (0.3.7) and
   `Messaging` (0.3.8), `Budget` and `Errors` (0.4.0), `RemoteDebug` (0.5.0) and `Bundle` (0.5.3) too; without them the
   kernel boots without that part and says so.
-- `src/shared/` → `ReplicatedStorage.TypeTorchKernelShared`: constants, client API, ClientEntry template.
-- `src/client/` → `ReplicatedFirst.TypeTorchKernelClient`: follows `ActiveGeneration`, swaps client generations.
-- `place.project.json`: the whole place (kernel + baseplate + spawn, HTTP on). `rojo build place.project.json -o
-  build/place.rbxl`; the CLI publishes it.
-- Syntax check (Lune, pinned in `rokit.toml`): `rokit install`, then `lune run scripts/check.luau` compiles every
-  `.luau` file and exits non-zero on a parse error. Run it before every place publish.
+- `src/shared/` → `ReplicatedStorage.TypeTorchKernelShared`: `Constants`, `ClientApi` (the client generation API),
+  `ClientEntry` template.
+- `src/client/` → `ReplicatedFirst.TypeTorchKernelClient`: the holding screen, follows `ActiveGeneration`, swaps client
+  generations.
+- `place.project.json`: the whole place (kernel + baseplate + spawn, HTTP on, `LoadStringEnabled` off). `rojo build
+  place.project.json -o build/place.rbxl` builds it locally; `typetorch kernel deploy` builds and publishes it.
+- `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
+  [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.
+- The npm package ships `src`, `scripts/check.luau`, `place.project.json`, `rokit.toml`, `README.md` and `LICENSE`
+  (no tests or smoke vectors).
+
+## The generation API
+
+Both sides hand each generation a table with `kernelApi`, `kernelVersion`, `artifact` (the full identity),
+`generation`, `branch`, `channel` (the rules, kept for older frameworks), `rules`, `branchChannel`, `serverType` and
+`start` (how it started: boot or swap, reason, previous artifact, timings), plus `ready(stop)` / `failed(err)`. Methods
+use `:` (roblox-ts calls interface methods that way). Details of each are in the sections below and in
+`src/server/Api.luau` / `src/shared/ClientApi.luau`.
+
+- **Server** (`Api.luau`; `kernelBuild` too): `persist`, `isDev`, `devInfo`, `onMessage`, `send`, `broadcast`,
+  `sendUnreliable`, `broadcastUnreliable`, `status`, `logs`, `branches`, `reload`, `rollback`, `switchBranch`,
+  `artifacts`, `pinArtifact`, `newServer`, `pinned`, `onPending`, `onDevChanged`, `requestReload`, `experiment`,
+  `unpin`, `keys`, `reportError`, `onClose`, `fleetStatus`, `onDeployReport`, `deployReports`, `accessCode`,
+  `settings`, `settingsStatus`, `onSettingsChanged`, `messagingSubscribe`, `messagingPublish`, `messagingStatus`,
+  `onRollCall`, `runDetached`, `setAnalyticsId`, `budgetCount`, `budget`, `onRemoteDebug`.
+- **Client** (`ClientApi.luau`): `persist`, `onMessage`, `send`, `sendUnreliable`, `devStatus`, `onKernelEvent`,
+  `logs`, `pinned`, `onPending`, `onDevChanged`, `requestSwitch`, `onResync`.
+
+`ReplicatedStorage.TypeTorch` carries the live server state for clients (`ActiveGeneration`, `Channel` (the rules),
+`BranchChannel`, `Hold`, `HoldReason`, ...).
+
+## `/tt` chat commands
+
+For devs, and the way in when a generation is broken: `/tt status | branch <name> | new <branch> [assetId] | pin
+<assetId> | unpin | reload | rollback | bundle | dev` (`dev` opens the framework's dev menu). Owner-only rules are
+under "Owners and owner switches" below.
+
+## What it does, by version
+
 - Deployment history and pins (0.2.0): every deploy message is recorded in the DataStore key `deployments`;
   `api:artifacts()` lists it, `api:pinArtifact(player, assetId)` holds a server on a known artifact until its branch
   gets a newer deploy, and `api:newServer(player, branch, assetId?)` opens a reserved server pinned to one.
@@ -281,37 +349,61 @@ shares a RuntimeLib with the payloads it loads. Changing it needs a server resta
   `<key>`. A 404 (an older backend) stops bundles for the server's lifetime; no answer, 429 and 5xx are retried.
   `status().bundles` has the counters (never the URL or the key). Studio and servers without backend settings send
   nothing.
-- Tests (Lune): `lune run scripts/test-errors.luau` (0.4.0: templating, fingerprints, per-minute counts, limits, batches,
-  the sender, client batches, the dedup), `lune run scripts/test-budget.luau` (0.4.0: proxies, limits, the sliding
-  minute, callers, the summary; 0.4.2: TPS windows, the slowest second, physics FPS, the Lua heap fallback),
-  `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, the signing rules),
-  `lune run scripts/test-access.luau`, `lune run scripts/test-fleet.luau` (0.3.9: the fleet sender's backoff, hold and
-  log lines on a fake clock; 0.4.2: a `seq` heartbeat goes before queued reports),
-  `lune run scripts/test-remote-debug.luau` (0.5.0: allow-list, owners only, rate, secret scrub, plain data, the
-  session, client logs; 0.5.1: the wake: this JobId within a tick, other JobIds and malformed ignored, the local rate,
-  a forged wake costs one poll, no backend no poll), `lune run scripts/test-bundle.luau` (0.5.3: triggers and the id,
-  joining, the per-code and per-server limits, the close rule, parallel client logs and their timeout, the left
-  players' lines, trimming, the key scrub, retries and the 404 stop, the body against the contract) and
-  `lune run scripts/smoke-kernel.luau` (boots the real server kernel with stubbed services; also `--fallback`,
-  `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local`, `--health`,
-  `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, `--durable`, 0.3.6's `--hold`, `--hold-optout`,
-  `--peers`, `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`, `--client-fail`,
-  `--kernel-crash`, `--heads-cap`, `--access`, 0.3.7's `--health-config` and `--health-missing`, 0.3.8's
-  `--messaging`, `--messaging-studio`, `--messaging-missing`, `--client-boot`, `--client-own`, `--settings`,
-  `--settings-missing` and `--detached`, 0.3.9's `--rollback-prev`, 0.4.0's `--errors` (settings.backend, heartbeats with `bu`, a server error and a client
-  batch posted templated with the pid, the budget view), 0.4.2's `--perf` (heartbeat `pf` from Heartbeat frames, its
-  size, `bu.mem`, `status().perf`) and `--adopt` (a deploy's heartbeat before its report; the rollback drill: a local
-  health rollback, then the branch rollback naming the same build, adopted with no swap, also when it arrives mid
-  rollback and when only the poll finds it), 0.5.0's `--remote-debug` (the heartbeat's `rd` starts the poll, kernel and
-  framework ops, refusals, client logs, no secret in an answer; 0.5.1: a wake on `TypeTorch/deploy` starts it with
-  quiet heartbeats), 0.5.3's `--bundle` (a failed deploy's alert with `d.bundle`, then the bundle with that id,
-  players, client logs and the server log; `/tt bundle`; a closing bundle after the failure, none after a clean close),
-  and `--boot-budget`, which runs 26 boot scenarios (0.5.2 adds `deploy-during-boot`: a deploy that takes the swap lock mid boot)
-  with simulated slow or failing dependencies and
-  checks each one runs a generation within 15 s, or moves the waiting player at the budget when nothing can run).
-- `src/server/vendor/ed25519/`: Ed25519 verify and SHA-512/SHA-256 from
-  [rbx-cryptography](https://github.com/daily3014/rbx-cryptography) 3.1.4 (MIT, daily3014), see its `LICENSE`.
 
-Contract with payloads: `Server.boot.boot(kernel)` / `Client.boot.boot(kernel)` return a stop function (0.2.2 passes
-it what replaces the generation). The typed view
-of `kernel` is `ServerKernel` / `ClientKernel` in `@typetorch/framework`. Guides: [typetorch/docs](https://github.com/typetorch/docs).
+## Development
+
+- Tools (pinned in `rokit.toml`: Lune 0.10.5, Rojo 7.7.0-rc.1): `rokit install`.
+- Syntax check: `npm run check` (= `lune run scripts/check.luau`) compiles every `.luau` file and exits non-zero on a
+  parse error. `npm publish` runs it (`prepublishOnly`), and `typetorch kernel deploy` runs it before anything else.
+- Tests (Lune; there is no CI test job, run them before a release):
+  - `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, and the signing rules in
+    `scripts/test-signing.luau`), `lune run scripts/test-access.luau`.
+  - `lune run scripts/test-fleet.luau` (0.3.9: the fleet sender's backoff, hold and log lines on a fake clock; 0.4.2: a
+    `seq` heartbeat goes before queued reports).
+  - `lune run scripts/test-errors.luau` (0.4.0: templating, fingerprints, per-minute counts, limits, batches, the
+    sender, client batches, the dedup), `lune run scripts/test-budget.luau` (0.4.0: proxies, limits, the sliding minute,
+    callers, the summary; 0.4.2: TPS windows, the slowest second, physics FPS, the Lua heap fallback).
+  - `lune run scripts/test-remote-debug.luau` (0.5.0: allow-list, owners only, rate, secret scrub, plain data, the
+    session, client logs; 0.5.1: the wake: this JobId within a tick, other JobIds and malformed ignored, the local rate,
+    a forged wake costs one poll, no backend no poll), `lune run scripts/test-bundle.luau` (0.5.3: triggers and the id,
+    joining, the per-code and per-server limits, the close rule, parallel client logs and their timeout, the left
+    players' lines, trimming, the key scrub, retries and the 404 stop, the body against the contract).
+  - `lune run scripts/smoke-kernel.luau` boots the real server kernel with stubbed services (vectors in
+    `scripts/smoke-settings.json` and `scripts/smoke-signatures.json`; `--verbose` prints more). Modes: `--fallback`,
+    `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local` (0.5.4: live reload
+    too), `--health`, `--health-prod`, `--lkg-boot`, `--client`, `--fleet`, `--switch`, `--durable`, 0.3.6's `--hold`,
+    `--hold-optout`, `--peers`, `--peers-untrusted`, `--backup`, `--recover`, `--teleport`, `--bounce`, `--mid-swap`,
+    `--client-fail`, `--kernel-crash`, `--heads-cap`, `--access`, 0.3.7's `--health-config` and `--health-missing`,
+    0.3.8's `--messaging`, `--messaging-studio`, `--messaging-missing`, `--client-boot`, `--client-own`, `--settings`,
+    `--settings-missing` and `--detached`, 0.3.9's `--rollback-prev`, 0.4.0's `--errors` (settings.backend, heartbeats
+    with `bu`, a server error and a client batch posted templated with the pid, the budget view), 0.4.2's `--perf`
+    (heartbeat `pf` from Heartbeat frames, its size, `bu.mem`, `status().perf`) and `--adopt` (a deploy's heartbeat
+    before its report; the rollback drill: a local health rollback, then the branch rollback naming the same build,
+    adopted with no swap, also when it arrives mid rollback and when only the poll finds it), 0.5.0's `--remote-debug`
+    (the heartbeat's `rd` starts the poll, kernel and framework ops, refusals, client logs, no secret in an answer;
+    0.5.1: a wake on `TypeTorch/deploy` starts it with quiet heartbeats), 0.5.3's `--bundle` and `--bundle-clean` (a
+    failed deploy's alert with `d.bundle`, then the bundle with that id, players, client logs and the server log; `/tt
+    bundle`; a closing bundle after the failure, none after a clean close), and `--boot-budget`, which runs 26 boot
+    scenarios (0.5.2 adds `deploy-during-boot`: a deploy that takes the swap lock mid boot; `--boot-scenario <name>`
+    runs one) with simulated slow or failing dependencies and checks each one runs a generation within 15 s, or moves
+    the waiting player at the budget when nothing can run.
+
+## Releasing
+
+Pushing a version tag publishes; nothing else does (`.github/workflows/publish.yml`, the repo's only workflow).
+
+1. Bump the version in BOTH `package.json` and `src/shared/Constants.luau` (`KERNEL_VERSION`); bump `KERNEL_API` and
+   `package.json` `typetorch.kernelApi` together, and only on a breaking change to the generation contract (update
+   `ServerKernel` / `ClientKernel` in the framework with it).
+2. Run the check and the tests above, merge to `main`.
+3. Tag and push: `npm version <x.y.z> -m "release %s" && git push origin main --follow-tags` (or tag `v<x.y.z>` on the
+   bumped commit and push the tag).
+
+The workflow installs Lune, refuses a tag that doesn't match `package.json` or a version already on npm, runs
+`npm publish --provenance --access public` (which runs the syntax check first) and creates a GitHub release with
+generated notes. A prerelease version (`x.y.z-next.0`) goes to the `next` dist-tag and a prerelease GitHub release;
+anything else to `latest`. Auth is npm trusted publishing (OIDC, GitHub environment `npm`), no npm token needed once
+it is set up on npmjs.com (`@typetorch/kernel` > Settings > Trusted publishing: this repo, workflow `publish.yml`,
+environment `npm`); the workflow still passes an `NPM_TOKEN` secret, used only if one is set, until then.
+
+The `v<version>` tag is also what `typetorch kernel deploy` wants on a git checkout of the kernel.
