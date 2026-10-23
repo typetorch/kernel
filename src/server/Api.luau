@@ -256,7 +256,7 @@ function Api.forEntry(entry: Script)
 	function api:onClose(fn)
 		generation.closeHandler = if typeof(fn) == "function" then fn else nil
 	end
-	-- This server's fleet status: { t, b, c?, a?, n, m, s, u, p, k?, x?, v, q, g, h, e?, sv = 2 } (plans/01 "Fleet
+	-- This server's fleet status: { t, b, c?, a?, n, m, s, u, p, pv, k?, x?, v, q, g, h, e?, sv = 2 } (plans/01 "Fleet
 	-- status and deploy reports"). Cheap, no yield. The kernel writes it nowhere: the framework's analytics engine sends
 	-- it as a heartbeat and Manage > Servers' roll call answers with it. `k` (a reserved server's access code) is
 	-- server-only data: never send it to a client.

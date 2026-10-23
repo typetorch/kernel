@@ -1355,7 +1355,8 @@ Health.start()
 -- framework's Manage > Servers roll call answers with. Contract (plans/01 "Fleet status and deploy reports"):
 --   { t = server type, b = branch, c = channel? (0.3.9: the branch's channel; before, the rules), a = artifact id?,
 --     n = players, m = max players,
---     s = server start (unix s), u = now (unix s), p = place id, k = reserved access code (server-only data)?,
+--     s = server start (unix s), u = now (unix s), p = place id, pv = place version (0.5.6),
+--     k = reserved access code (server-only data)?,
 --     x = 1 during an A/B experiment?, v = kernel version, q = applied seq, g = generation number (0 = none),
 --     h = "ok" | "failed" | "unverified" | "degraded", e = last error (<= 200 bytes)?, sv = 2 }
 -- t..v are the fields the framework's own server heartbeat had before 0.3.2. `e` only while it is recent (15 min) or the
@@ -1379,6 +1380,8 @@ local function fleetStatus()
 		s = startedAt,
 		u = os.time(),
 		p = game.PlaceId,
+		-- 0.5.6: the place version this server runs; Roblox files the server's logs under it (the backend's Roblox logs).
+		pv = game.PlaceVersion,
 		k = if kind == "reserved" then ownAccessCode else nil,
 		x = if current and current.head.experiment then 1 else nil,
 		v = Constants.KERNEL_VERSION,
