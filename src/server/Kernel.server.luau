@@ -4380,10 +4380,21 @@ local function watchLocalPayload()
 	local function changed()
 		changedAt = os.clock()
 	end
+	-- 0.5.5: a game Script may not touch `Source` (GetPropertyChangedSignal("Source") and reading it both need the
+	-- PluginOrOpenCloud capability, so 0.5.4 warned "live reload is off" on every playtest), but `Changed` still
+	-- reports the property name: a script's Source and Name are watched through it, other instances through Name.
 	local function watch(instance: Instance)
-		table.insert(connections, instance:GetPropertyChangedSignal("Name"):Connect(changed))
 		if instance:IsA("LuaSourceContainer") then
-			table.insert(connections, instance:GetPropertyChangedSignal("Source"):Connect(changed))
+			table.insert(
+				connections,
+				instance.Changed:Connect(function(property)
+					if property == "Source" or property == "Name" then
+						changed()
+					end
+				end)
+			)
+		else
+			table.insert(connections, instance:GetPropertyChangedSignal("Name"):Connect(changed))
 		end
 	end
 	local function rewire()

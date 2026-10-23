@@ -207,6 +207,8 @@ local SIGNALS = {
 	ChildRemoved = true,
 	DescendantAdded = true,
 	DescendantRemoving = true,
+	-- 0.5.5: a script's Source is watched through Changed (a game Script may not use GetPropertyChangedSignal("Source"))
+	Changed = true,
 }
 local firedToServer = {} -- 0.3.2 `--client`: every RemoteEvent:FireServer call ({ remote name, args... })
 local kicked = {} -- names of players Kick was called on
@@ -297,6 +299,11 @@ instanceMeta.__newindex = function(self, key, value)
 	local changed = inner.propertySignals and inner.propertySignals[key]
 	if changed and was ~= value then
 		changed:Fire()
+	end
+	-- Roblox's Changed carries the property name; `Source` reaches a game Script only this way (0.5.5)
+	local anyChanged = inner.signals.Changed
+	if anyChanged and was ~= value then
+		anyChanged:Fire(key)
 	end
 	if key == "Enabled" and value == true and was ~= true and inner.props.ClassName == "Script" then
 		onScriptEnabled(self)

@@ -8,7 +8,7 @@ payload uploaded by `typetorch deploy`) with LoadAsset, mounts it side by side w
 without a restart; it holds the stable remotes, the `/tt` chat commands, the signed settings and the fleet reports.
 Changing the kernel itself needs a place update and new servers (`typetorch kernel deploy`, or `tt kernel deploy`).
 
-Version 0.5.4, kernel API 1 (`src/shared/Constants.luau`: `KERNEL_VERSION`, `KERNEL_API`).
+Version 0.5.5, kernel API 1 (`src/shared/Constants.luau`: `KERNEL_VERSION`, `KERNEL_API`).
 
 ## Where it fits
 
@@ -124,7 +124,9 @@ under "Owners and owner switches" below.
   (the TypeTorch Studio plugin sets it while it syncs Rojo into the playtest's server), a change to the local payload
   (a script's `Source`, a name, an instance added or removed) reloads a fresh clone of it 0.4 s after the last change,
   as Reload does. Changes made while the attribute is off are dropped. `lune run scripts/smoke-kernel.luau
-  --studio-local` covers it.
+  --studio-local` covers it. 0.5.5: the payload is watched through each script's `Changed` (property name) signal;
+  `GetPropertyChangedSignal("Source")` needs the PluginOrOpenCloud capability a game Script lacks, so 0.5.4 warned
+  "live reload is off" in every playtest.
 - Bad deploys are safe (0.3.2):
   - **Health window:** a failed `onStart` (the framework reports it with `api:reportError`) or 3 errors from the new
     generation's own scripts within 30 s of ready roll the server back. Errors from outside the generation never
