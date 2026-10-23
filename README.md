@@ -8,7 +8,7 @@ payload uploaded by `typetorch deploy`) with LoadAsset, mounts it side by side w
 without a restart; it holds the stable remotes, the `/tt` chat commands, the signed settings and the fleet reports.
 Changing the kernel itself needs a place update and new servers (`typetorch kernel deploy`, or `tt kernel deploy`).
 
-Version 0.5.5, kernel API 1 (`src/shared/Constants.luau`: `KERNEL_VERSION`, `KERNEL_API`).
+Version 0.5.6, kernel API 1 (`src/shared/Constants.luau`: `KERNEL_VERSION`, `KERNEL_API`).
 
 ## Where it fits
 
@@ -137,7 +137,8 @@ under "Owners and owner switches" below.
     `source`. A place project without the module boots with no health window and warns.
   - **Last known good:** this server's history, then the branch's deployments (prod: only verified ones, or heads
     this server already ran), skipping artifacts that failed here. Also at boot when the head fails to start.
-  - **Fleet status and deploy reports:** `api:fleetStatus()` (this server's heartbeat), `api:onDeployReport(fn)` (one
+  - **Fleet status and deploy reports:** `api:fleetStatus()` (this server's heartbeat; 0.5.6: with `pv`, the place
+    version, which the backend uses to read Roblox's own logs for the server), `api:onDeployReport(fn)` (one
     report per deploy outcome, the last 20 replayed) and `api:deployReports()`; the kernel writes nothing to
     MemoryStore for them. With the signed settings' `fleet` = `{url, token}` (0.3.8; the ConfigService key
     `TypeTorchFleet` before) the kernel also

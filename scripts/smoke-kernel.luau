@@ -3042,8 +3042,8 @@ if HEALTH_MODE then
 	end))
 	local hb = fleet()
 	check(
-		"P-O1: fleetStatus {t,b,c,a,n,m,s,u,p,k,v} plus q, g, h, sv = 2",
-		hb ~= nil and hb.t == "reserved" and hb.b == "dev" and hb.c == status().channel and hb.c ~= nil and hb.a == "ddddddd-444444" and hb.n == 0 and hb.m == 10 and typeof(hb.s) == "number" and typeof(hb.u) == "number" and hb.p == 42 and hb.k == "smoke-access-code" and hb.x == nil and hb.v == Constants.KERNEL_VERSION and hb.q == 5 and hb.g == 1 and hb.h == "ok" and hb.sv == 2
+		"P-O1: fleetStatus {t,b,c,a,n,m,s,u,p,pv,k,v} plus q, g, h, sv = 2",
+		hb ~= nil and hb.t == "reserved" and hb.b == "dev" and hb.c == status().channel and hb.c ~= nil and hb.a == "ddddddd-444444" and hb.n == 0 and hb.m == 10 and typeof(hb.s) == "number" and typeof(hb.u) == "number" and hb.p == 42 and hb.pv == 7 and hb.k == "smoke-access-code" and hb.x == nil and hb.v == Constants.KERNEL_VERSION and hb.q == 5 and hb.g == 1 and hb.h == "ok" and hb.sv == 2
 	)
 	check("api: accessCode() (from the private record)", SMOKE.kernel:accessCode() == "smoke-access-code")
 

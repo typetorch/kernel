@@ -6,7 +6,7 @@
 -- writes only and is never logged, printed or sent anywhere but the Authorization header). Studio sends nothing.
 --
 -- Requests (HttpService:RequestAsync, POST, JSON, `Authorization: Bearer <token>`); contract in plans/01 "Fleet API":
---   /v1/fleet/heartbeat  the fleet status { t, b, c?, a?, n, m, s, u, p, x?, v, q, g, h, e?, sv = 2 } plus j = JobId
+--   /v1/fleet/heartbeat  the fleet status { t, b, c?, a?, n, m, s, u, p, pv, x?, v, q, g, h, e?, sv = 2 } plus j = JobId
 --                        (never `k`, the reserved access code), every FLEET_HEARTBEAT_SECONDS and right after a change
 --   /v1/fleet/report     each deploy report { s, b, a, j, r, e?, d?, t, g, k, p }, at once
 --   /v1/fleet/alert      { level = "critical" | "warning", code, message (<= 300 bytes), j, b, a, s, t, g, k }, at once
