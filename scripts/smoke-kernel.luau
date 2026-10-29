@@ -2054,7 +2054,7 @@ local function finish()
 	end
 	check("the fleet token never appears in any output", not leaked)
 	for _, line in output do
-		if not BOOT_SCENARIO and not NOISY_MODE and line.kind == "warn" and string.find(line.text, "swap failed", 1, true) and not string.find(line.text, "eeeeeee", 1, true) and not string.find(line.text, "1006", 1, true) and not string.find(line.text, "ccccccc", 1, true) and not string.find(line.text, "Sneaky", 1, true) then
+		if not BOOT_SCENARIO and not NOISY_MODE and line.kind == "warn" and string.find(line.text, "swap failed", 1, true) and not string.find(line.text, "eeeeeee", 1, true) and not string.find(line.text, "1006", 1, true) and not string.find(line.text, "ccccccc", 1, true) and not string.find(line.text, "Sneaky", 1, true) and not string.find(line.text, "has no Server.boot", 1, true) then
 			check(`unexpected: {line.text}`, false)
 		end
 	end
@@ -2609,6 +2609,13 @@ if STUDIO_MODE then
 	local missing = SMOKE.kernel:reload(owner)
 	check("studio: Reload without a source fails cleanly", missing.ok == false and string.find(missing.error or "", "TypeTorchDev.Payload", 1, true) ~= nil and isLocalId(running()))
 	localSource.Parent = devFolder
+	-- 0.5.6: an empty Server (Rojo lost out/) is refused at load; the running generation stays.
+	local serverBoot = localSource.Server:FindFirstChild("boot")
+	serverBoot.Parent = nil
+	local emptyBefore, emptyBoots = status().generation.name, #SMOKE.boots
+	local empty = SMOKE.kernel:reload(owner)
+	check("studio: a local payload without Server.boot is refused at load, the old generation kept", empty.ok == false and string.find(empty.error or "", "has no Server.boot", 1, true) ~= nil and status().generation.name == emptyBefore and #SMOKE.boots == emptyBoots)
+	serverBoot.Parent = localSource.Server
 	-- 0.5.4: live reload. With TypeTorchDev's LiveReload attribute on (the Studio plugin sets it while Rojo syncs the
 	-- playtest), a change to the local payload remounts it once the changes settle; with it off, nothing happens.
 	local someModule

@@ -489,6 +489,21 @@ local function localHead()
 	return head
 end
 
+-- 0.5.6: the halves of a payload root that have no `boot` ModuleScript ("Server.boot", "Client.boot"), empty when both
+-- do. Entry / ClientEntry require them, so a payload without one would only fail after a 6 s ready wait and an
+-- "infinite yield" warning; it is refused at load instead, before the running generation is stopped.
+local function missingBoots(root: Instance): { string }
+	local missing = {}
+	for _, half in { "Server", "Client" } do
+		local folder = root:FindFirstChild(half)
+		local boot = folder and folder:FindFirstChild("boot")
+		if not (boot and boot:IsA("ModuleScript")) then
+			table.insert(missing, `{half}.boot`)
+		end
+	end
+	return missing
+end
+
 -- A fresh clone of the local payload, stamped with the head's id and the dev channel (the source keeps its own).
 local function loadLocalPayload(head): Instance
 	local source = localPayloadSource()
@@ -497,6 +512,13 @@ local function loadLocalPayload(head): Instance
 	end
 	if not (source:FindFirstChild("Server") and source:FindFirstChild("Client")) then
 		error("ServerStorage.TypeTorchDev.Payload has no Server/Client (build first: rbxtsc)")
+	end
+	-- 0.5.6: an empty Server or Client is never a build: usually Rojo lost out/ (deleted and recreated under it).
+	local missing = missingBoots(source)
+	if #missing > 0 then
+		error(
+			`ServerStorage.TypeTorchDev.Payload has no {table.concat(missing, " or ")}: the synced tree is empty or partial (Rojo lost out/? run: typetorch serve restart rojo)`
+		)
 	end
 	local payload = source:Clone()
 	if not payload then
@@ -933,6 +955,12 @@ end
 -- modulesOnly.
 local function mount(payload: Instance, head, policy)
 	local artifactId = payload:GetAttribute("ArtifactId")
+	-- 0.5.6: a build always has both boots (local payloads are checked at load with a friendlier line); refused here, in
+	-- the mount stage, so a broken asset is final rather than retried like a failed LoadAsset.
+	local missingBoot = missingBoots(payload)
+	if #missingBoot > 0 then
+		error(`{artifactId or "the payload"} has no {table.concat(missingBoot, " or ")}`)
+	end
 	if head.artifactId and artifactId ~= head.artifactId then
 		error(`asset {head.assetId} is artifact {artifactId}, expected {head.artifactId}`)
 	end
