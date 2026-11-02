@@ -1007,7 +1007,23 @@ local function mount(payload: Instance, head, policy)
 	end
 	-- Both trees keep the payload's root layout, so the compiled relative requires resolve in each of them.
 	payload.Shared:Clone().Parent = clientTree
-	payload.include:Clone().Parent = clientTree
+	local clientInclude = payload.include:Clone()
+	clientInclude.Parent = clientTree
+	-- 0.5.6: a framework with devtools/on-demand hands its devtools to each dev itself (runtime/devtools-loader), so
+	-- other players don't download them. An older framework imports them statically: its folder stays.
+	local found, onDemand = pcall(function()
+		local framework = clientInclude:FindFirstChild("node_modules")
+		for _, part in { "@typetorch", "framework", "out", "devtools" } do
+			framework = framework and framework:FindFirstChild(part)
+		end
+		return if framework and framework:FindFirstChild("on-demand") then framework else nil
+	end)
+	if found and onDemand then
+		onDemand:Destroy()
+		for _, tree in { serverTree, clientTree } do
+			tree:SetAttribute("DevtoolsOnDemand", true)
+		end
+	end
 	payload.Client.Parent = clientTree
 	payload.Server.Parent = serverTree
 	payload.Shared.Parent = serverTree
