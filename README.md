@@ -127,6 +127,9 @@ under "Owners and owner switches" below.
   --studio-local` covers it. 0.5.5: the payload is watched through each script's `Changed` (property name) signal;
   `GetPropertyChangedSignal("Source")` needs the PluginOrOpenCloud capability a game Script lacks, so 0.5.4 warned
   "live reload is off" in every playtest.
+- Devtools reach devs only (0.5.6): when the payload's framework has `devtools/on-demand`, the client tree is mounted
+  without `include/node_modules/@typetorch/framework/out/devtools`, and both trees get the `DevtoolsOnDemand` attribute;
+  the framework hands each dev a copy. Older frameworks keep the folder (`scripts/test-devtools-strip.luau`).
 - Empty payloads are refused (0.5.6): a payload (local or uploaded) whose `Server` or `Client` has no `boot`
   ModuleScript fails with one line ("... has no Server.boot"; local: at load, uploaded: at mount) before the running
   generation is stopped, so a live reload or Reload keeps the old one. It used to start, wait 6 s for ready and print
