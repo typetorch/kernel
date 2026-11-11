@@ -7,7 +7,7 @@ return {
 	-- The single version source: package.json "version" must match (typetorch kernel deploy checks). The build (git
 	-- commit) and content hash are stamped by kernel deploy as attributes on ServerScriptService.TypeTorchKernel
 	-- (KernelCommit, KernelHash); see status().kernelBuild.
-	KERNEL_VERSION = "0.5.6",
+	KERNEL_VERSION = "0.5.7",
 
 	-- The kernel's DataStore: durable heads, deployments, private records, events, and (0.3.8) the signed settings.
 	DATASTORE = "TypeTorch",
@@ -112,6 +112,10 @@ return {
 	FLEET_PLAYERS_GAP = 5,
 	-- Health and trusted-head changes are looked at this often (they send a heartbeat and maybe an alert).
 	FLEET_WATCH_SECONDS = 5,
+	-- 0.5.7: a worse health state (degraded / failed / unverified) alerts only once it held this many watch ticks in a
+	-- row, and no tick counts while a swap or a last-known-good restore holds the swap lock (no generation runs for a
+	-- moment then: a deploy, a branch switch or a slow boot used to raise a false critical health_failed).
+	HEALTH_ALERT_TICKS = 2,
 	-- A failed request (no answer, HTTP 429 or 5xx) is retried after these delays, then dropped; other 4xx: dropped.
 	FLEET_RETRY_DELAYS = { 1, 3, 9 },
 	-- 0.3.9 (NetFail errors from a dead quick tunnel, every server in lockstep): every wait gets +-FLEET_JITTER. A request

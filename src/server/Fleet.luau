@@ -503,6 +503,39 @@ function Fleet.alert(level: string, code: string, message: string, fields, force
 	heartbeat.due = true
 end
 
+-- 0.5.7: the kernel's health watch (Kernel.server.luau's fleet loop), pure so test-fleet.luau checks it. `tick(health,
+-- settling)` once per FLEET_WATCH_SECONDS: `settling` = a swap or a last-known-good restore holds the swap lock (no
+-- generation runs for a moment then, so the tick doesn't count). A better state (ok, backup) is taken at once; a worse
+-- one only after it held `need` ticks in a row (a one-tick blip never alerts). Returns `changed` (send a heartbeat) and
+-- the state it changed from when that change should alert (degraded / failed / unverified), else nil. Starts at "ok":
+-- a server that never mounts anything still alerts (health ok -> failed), `need` ticks after the boot settled.
+function Fleet.healthWatch(need: number?)
+	local required = math.max(1, need or Constants.HEALTH_ALERT_TICKS)
+	local watch = { last = "ok", pending = nil :: string?, ticks = 0 }
+	function watch.tick(health: string, settling: boolean?): (boolean, string?)
+		if settling or health == watch.last then
+			watch.pending, watch.ticks = nil, 0
+			return false, nil
+		end
+		local from = watch.last
+		if health == "ok" or health == "backup" then -- (0.3.6: the backup has its own alert, backup_build)
+			watch.last, watch.pending, watch.ticks = health, nil, 0
+			return true, nil
+		end
+		if watch.pending == health then
+			watch.ticks += 1
+		else
+			watch.pending, watch.ticks = health, 1
+		end
+		if watch.ticks < required then
+			return false, nil
+		end
+		watch.last, watch.pending, watch.ticks = health, nil, 0
+		return true, from
+	end
+	return watch
+end
+
 -- BindToClose: no more queueing; the closing request goes out now (yields up to `deadline` seconds, one retry).
 function Fleet.closing(deadline: number?)
 	if not Fleet.enabled() or closed then

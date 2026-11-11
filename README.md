@@ -8,7 +8,7 @@ payload uploaded by `typetorch deploy`) with LoadAsset, mounts it side by side w
 without a restart; it holds the stable remotes, the `/tt` chat commands, the signed settings and the fleet reports.
 Changing the kernel itself needs a place update and new servers (`typetorch kernel deploy`, or `tt kernel deploy`).
 
-Version 0.5.6, kernel API 1 (`src/shared/Constants.luau`: `KERNEL_VERSION`, `KERNEL_API`).
+Version 0.5.7, kernel API 1 (`src/shared/Constants.luau`: `KERNEL_VERSION`, `KERNEL_API`).
 
 ## Where it fits
 
@@ -135,6 +135,12 @@ under "Owners and owner switches" below.
   generation is stopped, so a live reload or Reload keeps the old one. It used to start, wait 6 s for ready and print
   Roblox's "infinite yield" warning. The usual cause is Rojo serving an empty tree after `out/` was deleted and
   recreated under it (`typetorch serve restart rojo`; serve 0.13.1+ restarts Rojo by itself).
+- No false health alerts during swaps (0.5.7): the fleet health watch (every 5 s) skips its tick while a swap or a
+  last-known-good restore holds the swap lock (no generation runs for a moment then), and a worse state (degraded,
+  failed, unverified) alerts only after it held 2 ticks in a row (`HEALTH_ALERT_TICKS`). Before, a tick that landed in a
+  deploy's swap gap, a branch switch or a slow boot's mount sent a critical `health_failed` ("health ok -> failed") that
+  nothing cleared. A server where nothing can run still alerts `health_failed` (critical), about 5 s later
+  (`Fleet.healthWatch`, `scripts/test-fleet.luau`; smoke `--fleet`: a deploy whose build takes 1 s to start).
 - Bad deploys are safe (0.3.2):
   - **Health window:** a failed `onStart` (the framework reports it with `api:reportError`) or 3 errors from the new
     generation's own scripts within 30 s of ready roll the server back. Errors from outside the generation never
