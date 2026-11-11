@@ -3009,6 +3009,25 @@ if FLEET_MODE then
 		return #httpRequests > quiet and status().fleet.enabled == true
 	end, 3))
 
+	-- 0.5.7: a normal deploy whose new generation takes 1 s to start (5 watch ticks with no generation running): no
+	-- health_failed alert (before, a tick in that gap sent a false critical "health ok -> failed").
+	task.wait(0.6) -- the watch sees the running build as ok first
+	mark = #httpRequests
+	SMOKE.startDelay = 1
+	publish("TypeTorch/deploy", { b = "dev", a = 1004, i = "ddddddd-444444", s = 9, c = "ddddddd", ch = "dev", t = nowMs() })
+	local slowSwapped = waitFor("slow swap", function()
+		return running() == "ddddddd-444444"
+	end, 6)
+	SMOKE.startDelay = nil
+	task.wait(0.8) -- a few more watch ticks after the swap
+	local healthAlerts = 0
+	for _, request in requests("alert", mark) do
+		if string.sub(request.body.code, 1, 7) == "health_" then
+			healthAlerts += 1
+		end
+	end
+	check("fleet: a deploy whose build takes 1 s to start (a slow swap) raises no health alert", slowSwapped and healthAlerts == 0 and status().health.state == "ok")
+
 	-- BindToClose: the closing request (a clean close, not a lost server).
 	local closeDone = false
 	task.spawn(function()

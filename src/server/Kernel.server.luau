@@ -3982,19 +3982,22 @@ end
 -- and failed / unverified / degraded (or no trusted head on a signed-only server) an alert.
 Fleet.start()
 task.spawn(function()
-	local lastHealth = "ok" -- a server that boots unhealthy alerts too
+	-- 0.5.7: Fleet.healthWatch: no tick counts while a swap / restore holds the lock (no generation runs mid-swap or
+	-- during a slow boot's mount), and a worse state alerts only after HEALTH_ALERT_TICKS ticks in a row. Starts at
+	-- "ok": a server that boots with nothing running still alerts.
+	local watch = Fleet.healthWatch(Constants.HEALTH_ALERT_TICKS)
 	local lastNoTrusted = false
 	while not closing do
 		task.wait(Constants.FLEET_WATCH_SECONDS)
 		if Fleet.enabled() then
 			local health = Health.state()
-			if health ~= lastHealth then
+			local changed, from = watch.tick(health, busy or restoring)
+			if changed then
 				Fleet.heartbeat("health")
-				if health ~= "ok" and health ~= "backup" then -- (0.3.6: the backup has its own alert, backup_build)
+				if from then
 					local detail = if current and current.health.lastError then `: {current.health.lastError}` else ""
-					fleetAlert(if health == "degraded" then "warning" else "critical", `health_{health}`, `health {lastHealth} -> {health}{detail}`, nil)
+					fleetAlert(if health == "degraded" then "warning" else "critical", `health_{health}`, `health {from} -> {health}{detail}`, nil)
 				end
-				lastHealth = health
 			end
 			local noTrusted = requiresSignatures(myBranch) and myBranch ~= nil and headFor(myBranch) == nil
 			if noTrusted and not lastNoTrusted then

@@ -323,5 +323,50 @@ Fleet.configure({
 Fleet.refreshSettings()
 check("a non-https backend is refused (no target)", Fleet.info().settings == "invalid" and Fleet.target() == nil and said("settings.backend) ignored") == 1)
 
+-- 0.5.7: the health watch (Fleet.healthWatch): no false critical health_failed during a swap or a slow boot.
+do
+	local function run(ticks: { { string | boolean } }, need: number?)
+		local watch = Fleet.healthWatch(need)
+		local alerts, beats = {}, 0
+		for _, tick in ticks do
+			local changed, from = watch.tick(tick[1] :: string, tick[2] == true)
+			if changed then
+				beats += 1
+			end
+			if from then
+				table.insert(alerts, `{from}->{tick[1]}`)
+			end
+		end
+		return alerts, beats, watch
+	end
+	check("health watch: needs HEALTH_ALERT_TICKS (2) by default", Constants.HEALTH_ALERT_TICKS == 2)
+	-- A swap: no generation for a moment (Health.state() = failed) while the swap lock is held.
+	local alerts, beats = run({ { "ok" }, { "failed", true }, { "failed", true }, { "failed", true }, { "ok" }, { "ok" } })
+	check("health watch: a swap (failed while the lock is held) raises no alert and no heartbeat", #alerts == 0 and beats == 0)
+	-- A slow boot: nothing mounted yet, the boot's swap holds the lock for several ticks, then it runs.
+	alerts = run({ { "failed", true }, { "failed", true }, { "failed", true }, { "failed", true }, { "ok" } })
+	check("health watch: a slow boot (failed while the boot's swap runs) raises no alert", #alerts == 0)
+	-- One tick in the gap without the lock (the lock just released, the generation not current yet): a one-tick blip.
+	alerts, beats = run({ { "ok" }, { "failed" }, { "ok" }, { "ok" } })
+	check("health watch: a one-tick blip raises no alert", #alerts == 0 and beats == 0)
+	-- Nothing could run (lkg_exhausted): failed holds once the swaps are over: critical health ok -> failed, once.
+	alerts, beats = run({ { "ok" }, { "failed", true }, { "failed" }, { "failed" }, { "failed" }, { "failed" } })
+	check("health watch: nothing runs after the swaps: alert ok->failed after 2 ticks, once", #alerts == 1 and alerts[1] == "ok->failed" and beats == 1)
+	alerts = run({ { "failed" }, { "failed" } })
+	check("health watch: a server that boots with nothing running still alerts (starts at ok)", #alerts == 1 and alerts[1] == "ok->failed")
+	-- A real degradation alerts (2 ticks); recovery to ok is taken at once (a heartbeat, no alert).
+	alerts, beats = run({ { "ok" }, { "degraded" }, { "degraded" }, { "ok" } })
+	check("health watch: degraded held 2 ticks alerts; recovery heartbeats at once", #alerts == 1 and alerts[1] == "ok->degraded" and beats == 2)
+	-- A switch between worse states needs its own 2 ticks; a different worse state resets the count.
+	alerts = run({ { "degraded" }, { "failed" }, { "degraded" }, { "failed" }, { "failed" } })
+	check("health watch: failed and degraded alternating: only a state that held 2 ticks alerts", #alerts == 1 and alerts[1] == "ok->failed")
+	-- backup: taken at once, no health alert (it has its own backup_build alert).
+	alerts, beats = run({ { "backup" }, { "ok" } })
+	check("health watch: backup and back to ok: heartbeats, no health alert", #alerts == 0 and beats == 2)
+	-- need = 1 is the old behaviour (minus the lock): an alert on the first tick.
+	alerts = run({ { "failed" } }, 1)
+	check("health watch: need 1 alerts on the first tick", #alerts == 1)
+end
+
 print(`fleet: {passed} passed, {failed} failed`)
 process.exit(if failed == 0 then 0 else 1)
