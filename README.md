@@ -30,11 +30,11 @@ Version 0.5.7, kernel API 1 (`src/shared/Constants.luau`: `KERNEL_VERSION`, `KER
   needs with the `KernelApi` attribute; a kernel with a lower `KERNEL_API` refuses it.
 - **Studio plugin** (`typetorch/studio-plugin`): sets `LiveReload` on `ServerStorage.TypeTorchDev` while it syncs Rojo
   into a playtest (see "Live reload in a Studio playtest" below).
-- **Backend** (`typetorch/backend`): receives heartbeats, deploy reports, alerts, error reports and debug bundles at the
-  signed settings' `backend` URL, and drives remote debug.
+- **Backend** (`typetorch/backend`): receives heartbeats, deploy reports, alerts, error reports, debug bundles and live
+  debug streams at the signed settings' `backend` URL, and drives remote debug and the live map.
 
 Guides: [typetorch/docs](https://github.com/typetorch/docs) (runtime API, branches and channels, prod signing,
-settings, fleet and alerts, Studio testing).
+settings, fleet and alerts, cross-server messages, loading screens, Studio testing).
 
 ## Layout
 
@@ -42,10 +42,10 @@ settings, fleet and alerts, Studio testing).
   mounting, swaps with soft + hard stop, automatic rollback, `/tt`), `Api` (the server generation API), `Registry`
   (in-game DataStore / MemoryStore heads), `Settings` (the signed settings), `Signing` (Ed25519 rules), `Access` (dev
   access), `Transport` (stable remotes), `Logs`, `Fleet` (the fleet API sender), `Fallback`, `Health`, `Messaging`,
-  `Budget`, `Errors`, `RemoteDebug`, `Bundle`, `vendor/` and `Entry` (disabled template, cloned per generation). A
-  place project that maps these files one by one must map `Fleet` (0.3.2), `Fallback` (0.3.6), `Health` (0.3.7) and
-  `Messaging` (0.3.8), `Budget` and `Errors` (0.4.0), `RemoteDebug` (0.5.0) and `Bundle` (0.5.3) too; without them the
-  kernel boots without that part and says so.
+  `Budget`, `Errors`, `RemoteDebug`, `LiveDebug`, `Bundle`, `vendor/` and `Entry` (disabled template, cloned per
+  generation). A place project that maps these files one by one must map `Fleet` (0.3.2), `Fallback` (0.3.6), `Health`
+  (0.3.7) and `Messaging` (0.3.8), `Budget` and `Errors` (0.4.0), `RemoteDebug` (0.5.0), `Bundle` (0.5.3) and
+  `LiveDebug` (0.5.7) too; without them the kernel boots without that part and says so.
 - `src/shared/` → `ReplicatedStorage.TypeTorchKernelShared`: `Constants`, `ClientApi` (the client generation API),
   `ClientEntry` template.
 - `src/client/` → `ReplicatedFirst.TypeTorchKernelClient`: the holding screen, follows `ActiveGeneration`, swaps client
@@ -80,8 +80,8 @@ use `:` (roblox-ts calls interface methods that way). Details of each are in the
 
 ## `/tt` chat commands
 
-For devs, and the way in when a generation is broken: `/tt status | branch <name> | new <branch> [assetId] | pin
-<assetId> | unpin | reload | rollback | bundle | dev` (`dev` opens the framework's dev menu). Owner-only rules are
+For devs, and the way in when a generation is broken:
+`/tt status | branch <name> | new <branch> [assetId] | pin <assetId> | unpin | reload | rollback | bundle | dev` (`dev` opens the framework's dev menu). Owner-only rules are
 under "Owners and owner switches" below.
 
 ## What it does, by version
@@ -372,7 +372,7 @@ under "Owners and owner switches" below.
   `status().remoteDebug` has the counters (never a command, the URL or the key).
   - How it learns it is watched: a heartbeat reply `{ ok, rd = 1 }` (up to one heartbeat, 30 s), or (0.5.1, **instant
     wake**) a wake message `{ k = "rd", j = <JobId> }` on `TypeTorch/deploy` that a backend with
-    `TYPETORCH_MESSAGING_KEY` publishes through Open Cloud when the watch starts: the named server starts polling at
+    `OPENCLOUD_API_KEY` and `TYPETORCH_UNIVERSE_ID` publishes through Open Cloud when the watch starts: the named server starts polling at
     once. No new subscription (the kernel's control topic already carries the settings ping and the peers' ask). The
     wake is unsigned and only does what `rd = 1` does: the first poll asks the backend, which says whether the job is
     really watched, so a forged wake costs one poll. Another JobId's or a malformed wake is ignored, one per
@@ -416,10 +416,11 @@ under "Owners and owner switches" below.
   - `lune run scripts/test-remote-debug.luau` (0.5.0: allow-list, owners only, rate, secret scrub, plain data, the
     session, client logs; 0.5.1: the wake: this JobId within a tick, other JobIds and malformed ignored, the local rate,
     a forged wake costs one poll, no backend no poll), `lune run scripts/test-live-debug.luau` (0.5.7: declarations
-    and the hash, heartbeats' xh / x / cv / xq and the columns gap, failing and yielding getters, `game.*` routing,
+    and the hash, heartbeats' xh / xd / cv / xq and the columns gap, failing and yielding getters, `game.*` routing,
     stream rates, batching and caps, the stop rules, live map mode and its lapse), `lune run scripts/test-bundle.luau` (0.5.3: triggers and the id,
     joining, the per-code and per-server limits, the close rule, parallel client logs and their timeout, the left
-    players' lines, trimming, the key scrub, retries and the 404 stop, the body against the contract).
+    players' lines, trimming, the key scrub, retries and the 404 stop, the body against the contract),
+    `lune run scripts/test-devtools-strip.luau` (0.5.6: the devtools folder left off the shared client tree).
   - `lune run scripts/smoke-kernel.luau` boots the real server kernel with stubbed services (vectors in
     `scripts/smoke-settings.json` and `scripts/smoke-signatures.json`; `--verbose` prints more). Modes: `--fallback`,
     `--dev`, `--vip`, `--bootstrap`, `--bootstrap-only`, `--blind`, `--empty`, `--studio-local` (0.5.4: live reload
