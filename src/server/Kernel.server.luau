@@ -64,6 +64,10 @@
 -- 0.5.3 (debug bundles; Bundle.luau): a failing server posts what happened to the backend by itself: every critical
 -- alert (its d.bundle names the bundle), a generation that fails to start, Fallback moving players and /tt bundle
 -- trigger one (~3 s later, limited); BindToClose sends one only after a failure in the last 10 minutes.
+-- 0.5.7 (plans/34, live debug; LiveDebug.luau): the game declares fleet columns (their values ride the heartbeat as
+-- `cv`, the declarations as `xh` / `xd`), read-only commands (op `game.<name>` through remote debug's checks) and streams
+-- (sampled with the built-in `positions` and posted to /v1/fleet/streams while the server is watched); a live map wake
+-- { k = "lm" } on TypeTorch/deploy or a heartbeat reply's lm = 1 posts positions every 3 s (the explorer's /live).
 
 -- 0.3.2 (boot budget): every boot wait and cap counts from here.
 local kernelStartedAt = os.clock()
@@ -210,7 +214,7 @@ end
 -- TypeTorch makes, per minute and per caller) and the error reports (Errors.luau: templated, fingerprinted, counted,
 -- posted to the backend's /v1/errors). A place project that lists the kernel's files one by one and doesn't map them yet
 -- still boots, without them, and says so.
-local Budget, Errors, RemoteDebug, Bundle
+local Budget, Errors, RemoteDebug, Bundle, LiveDebug
 do
 	local function optional(name: string, what: string)
 		local module = script.Parent:FindFirstChild(name)
@@ -259,6 +263,22 @@ do
 			missing = true,
 			info = function()
 				return { state = "off", missing = true }
+			end,
+		}, {
+			__index = function()
+				return noop
+			end,
+		})
+	-- 0.5.7 (plans/34): live debug. Without the module the API has no debugDeclare (the framework's calls do nothing),
+	-- heartbeats carry no declarations and nothing streams.
+	LiveDebug = optional("LiveDebug", "live debug (game columns, commands, streams, live map)")
+		or setmetatable({
+			missing = true,
+			info = function()
+				return { state = "off", missing = true }
+			end,
+			onWake = function()
+				return false
 			end,
 		}, {
 			__index = function()
@@ -2177,6 +2197,12 @@ local function onDeployMessage(message)
 		RemoteDebug.onWake(data)
 		return
 	end
+	-- 0.5.7 (plans/34): the backend's live map wake ({ k = "lm" }; unsigned, every server, rate-limited here): post
+	-- positions every LM_INTERVAL s while the replies say lm. Older kernels ignore it (no branch).
+	if data.k == "lm" then
+		LiveDebug.onWake(data)
+		return
+	end
 	lastMessage = {
 		data = data,
 		receivedMs = DateTime.now().UnixTimestampMillis,
@@ -3311,6 +3337,10 @@ local function status()
 		-- refused, failed, timeouts, redacted, lastPollAt?, lastCommandAt?, lastOp?, lastError?; 0.5.1: wakes,
 		-- wakesIgnored, lastWakeAt? }; never a command's contents, the URL or the key).
 		remoteDebug = RemoteDebug.info(),
+		-- 0.5.7 (plans/34): live debug ({ state = "off" | "watch" | "lm" | "held", declared? { hash, columns, commands,
+		-- streams }, column and stream counters, posts, failed, dropped, oversize, lmWakes, lmIgnored, lastPostAt?,
+		-- lastMode?, stopReason?, lastError? }; never a value, the URL or the key).
+		liveDebug = LiveDebug.info(),
 		-- 0.5.3: debug bundles ({ enabled, stopped?, triggered, max, pending?, sent, failed, skipped, trimmed, lastId?,
 		-- lastCode?, lastAt?, lastBytes?, lastError?, lastStatus?, closingId?, lastFailureAt? }; never the URL or the key).
 		bundles = Bundle.info(),
@@ -3497,6 +3527,8 @@ Api.init({
 	KERNEL_VERSION = Constants.KERNEL_VERSION,
 	-- 0.3.8: nil when the place doesn't map Messaging.luau (the API then has no messaging methods).
 	Messaging = if Messaging.missing then nil else Messaging,
+	-- 0.5.7: nil when the place doesn't map LiveDebug.luau (the API then has no debugDeclare & co.).
+	LiveDebug = if LiveDebug.missing then nil else LiveDebug,
 	-- 0.3.8 (plans/20): the signed settings, server only.
 	settings = function()
 		return Registry.settings.copy()
@@ -3641,6 +3673,14 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 		framework = function()
 			return current and current.remoteDebugHandler
 		end,
+		-- 0.5.7: the running generation's declared `game.*` commands and its handler (api:onDebugCommand).
+		gameCommands = function()
+			if current and current.debug then
+				return current.debug.commands, current.debugCommandHandler
+			end
+			return nil, nil
+		end,
+		onSession = LiveDebug.onPoll,
 		isOwner = Access.isOwnerUserId,
 		spawn = spawnOnKernel,
 		kernelSend = Transport.kernelSend,
@@ -3648,8 +3688,62 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 		print = print,
 	})
 	Transport.onKernel(Constants.CHANNEL_RDLOGS, RemoteDebug.onClientLogs)
-	-- A watched server's heartbeat reply carries `rd = 1`: start polling.
-	Fleet.configure({ onHeartbeatReply = RemoteDebug.wake })
+	-- 0.5.7 (plans/34): live debug's streams go to the same backend, counted as "debug" too.
+	LiveDebug.configure({
+		http = Budget.wrap(HttpService, "kernel", "http", "debug"),
+		jobId = game.JobId,
+		active = game.JobId ~= "" and serverType() ~= "studio",
+		target = function()
+			return if Fleet.target then Fleet.target() else nil
+		end,
+		encode = function(value)
+			return HttpService:JSONEncode(value)
+		end,
+		decode = function(text)
+			return HttpService:JSONDecode(text)
+		end,
+		generation = function()
+			return current
+		end,
+		players = function()
+			return Players:GetPlayers()
+		end,
+		-- Custom stream values are scrubbed like remote debug answers (the settings' and remote-claude secrets, the key).
+		scrub = function(text)
+			local list = {}
+			RemoteDebug.collectSecrets(Registry.settings.copy(), list)
+			RemoteDebug.collectSecrets(Api.persistPeek("remoteClaude"), list, 5, true)
+			local target = Fleet.target and Fleet.target()
+			if target then
+				table.insert(list, target.token)
+			end
+			table.sort(list, function(a, b)
+				return #a > #b
+			end)
+			return RemoteDebug.scrub(text, list)
+		end,
+		toPlain = RemoteDebug.toPlain,
+		heartbeat = Fleet.heartbeat,
+		pollRunning = RemoteDebug.running,
+		pollSession = RemoteDebug.session,
+		-- A stream reply says "watched" while the poll doesn't run: as if a heartbeat reply said rd = 1.
+		watchHint = function()
+			RemoteDebug.wake({ rd = 1 })
+		end,
+		spawn = spawnOnKernel,
+		warn = warn,
+		print = print,
+	})
+	-- A watched server's heartbeat reply carries `rd = 1`: start polling. 0.5.7: `lm = 1`: live map mode; the
+	-- heartbeats carry the declarations and the column values.
+	Fleet.configure({
+		onHeartbeatReply = function(reply)
+			RemoteDebug.wake(reply)
+			LiveDebug.onReply(reply)
+		end,
+		declarations = LiveDebug.declarations,
+		columnValues = LiveDebug.columnValues,
+	})
 end
 
 -- 0.5.3 DEBUG BUNDLES (Bundle.luau) ----------------------------------------------------------------------------------
@@ -4025,8 +4119,9 @@ do -- (scoped: the main chunk is near Luau's 200-local limit)
 		task.spawn(Fleet.closing, 3)
 		-- 0.4.0: the last error reports go out too.
 		task.spawn(Errors.closing)
-		-- 0.5.0: no new remote debug polls.
+		-- 0.5.0: no new remote debug polls (0.5.7: and no stream posts).
 		RemoteDebug.close()
+		LiveDebug.close()
 		-- 0.3.6 (plans/17): closing in the middle of a swap (the old generation stopped, the next not ready yet): the
 		-- starting generation's handler if it installed one, else the stopped generation's (its last flush).
 		local generation = current

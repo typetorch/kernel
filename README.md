@@ -70,7 +70,8 @@ use `:` (roblox-ts calls interface methods that way). Details of each are in the
   `artifacts`, `pinArtifact`, `newServer`, `pinned`, `onPending`, `onDevChanged`, `requestReload`, `experiment`,
   `unpin`, `keys`, `reportError`, `onClose`, `fleetStatus`, `onDeployReport`, `deployReports`, `accessCode`,
   `settings`, `settingsStatus`, `onSettingsChanged`, `messagingSubscribe`, `messagingPublish`, `messagingStatus`,
-  `onRollCall`, `runDetached`, `setAnalyticsId`, `budgetCount`, `budget`, `onRemoteDebug`.
+  `onRollCall`, `runDetached`, `setAnalyticsId`, `budgetCount`, `budget`, `onRemoteDebug`, `debugDeclare`,
+  `onDebugCommand`, `onDebugColumn`, `onDebugStream`, `debugColumnsChanged`.
 - **Client** (`ClientApi.luau`): `persist`, `onMessage`, `send`, `sendUnreliable`, `devStatus`, `onKernelEvent`,
   `logs`, `pinned`, `onPending`, `onDevChanged`, `requestSwitch`, `onResync`.
 
@@ -141,6 +142,38 @@ under "Owners and owner switches" below.
   deploy's swap gap, a branch switch or a slow boot's mount sent a critical `health_failed` ("health ok -> failed") that
   nothing cleared. A server where nothing can run still alerts `health_failed` (critical), about 5 s later
   (`Fleet.healthWatch`, `scripts/test-fleet.luau`; smoke `--fleet`: a deploy whose build takes 1 s to start).
+- Live debug (0.5.7, plans/34; `src/server/LiveDebug.luau`, optional): the game's own fleet columns, read-only
+  commands and streams for the backend explorer, plus a live player map. Additive API (`debugDeclare` doubles as the
+  feature test; left out when the place doesn't map `LiveDebug.luau`):
+  - `api:debugDeclare({ columns = { { name, label?, type? } }, commands = { { name, label?, description? } }, streams
+    = { { name, hz, kind?, label? } } })` replaces the generation's declarations (names `^[a-z][a-z0-9_]{0,31}$`; at
+    most 16 columns, 32 commands, 8 streams; labels 40 characters, descriptions 200; `type` "string" | "number" |
+    "bool"; `kind` "points" | "json"; `hz` clamped to 0.2..4; bad entries dropped and counted) and returns `{ ok,
+    hash?, columns, commands, streams, dropped }`. `api:onDebugCommand(fn(name, args, caller))`,
+    `api:onDebugColumn(fn(name))`, `api:onDebugStream(fn(name))` install the generation's handlers;
+    `api:debugColumnsChanged()` asks for a heartbeat.
+  - Heartbeats (Fleet.luau) carry `xh` (a 16-hex hash of the declarations) whenever something is declared, `xd` (the
+    wire form; not `x`, the A/B experiment flag: `{ c = { { n, l?, t? } }, cmd = { { n, l?, d? } }, st = { { n, hz, k?, l? } } }`) on the first one,
+    after a change, for a new backend and after a reply's `xq = 1`, and `cv` = `{ <column> = string (64 characters)
+    | number | bool | null }`, each getter on a kernel thread under pcall (all within 0.25 s; failing, yielding or
+    odd values are null). A declaration change, `xq` and `debugColumnsChanged` send a coalesced heartbeat, at most one
+    per `FLEET_COLUMNS_GAP` (10 s). The closing request carries none of them.
+  - Commands: op `game.<name>` from the explorer runs `fn(name, args, caller)` only when the running generation
+    declared `name` (else refused like an op off the allow-list), with remote debug's rate limit, owner check,
+    deadline, 200 KB cap and secret scrubbing; args at most 2 KB of JSON. Read-only is the game's promise.
+  - Streams: while the remote debug poll runs, the built-in `positions` (`{ players = { { u, n, x?, y?, z?, yaw?,
+    hp?, st } } }`: the HumanoidRootPart to 1 decimal, yaw 0 = facing -Z, Humanoid health, st "alive" | "dead" |
+    "none") at 2 Hz and each declared stream (`game.<name>`) at its rate are sampled on a kernel thread (a sampler
+    gets 0.1 s) and posted every second to `POST <url>/v1/fleet/streams { j, frames = { { t, s } } }`: a value at
+    most 16 KB of JSON (else dropped, counted), a body at most 64 KB (the oldest frames go), custom values scrubbed of
+    secrets. They stop when a reply says neither `watch` nor `lm`, with the poll, or after 3 failed posts in a row (a
+    401/403/404 holds them off 300 s).
+  - Live map mode: a wake `{ k = "lm" }` on `TypeTorch/deploy` (every server; one acted on per 10 s; unsigned, so
+    the first post asks the backend) or a heartbeat reply's `lm = 1` posts `positions` only, one frame every
+    `LM_INTERVAL` (3 s), while the replies say `lm` (or `watch` with no poll running, which also wakes the poll),
+    until 60 s pass without one or a reply says neither. Older kernels ignore the wake.
+  - Counted in the budget view as HTTP `debug`; `status().liveDebug` has the counters (never a value, the URL or the
+    key). Studio and servers without a backend never post.
 - Bad deploys are safe (0.3.2):
   - **Health window:** a failed `onStart` (the framework reports it with `api:reportError`) or 3 errors from the new
     generation's own scripts within 30 s of ready roll the server back. Errors from outside the generation never
@@ -382,7 +415,9 @@ under "Owners and owner switches" below.
     callers, the summary; 0.4.2: TPS windows, the slowest second, physics FPS, the Lua heap fallback).
   - `lune run scripts/test-remote-debug.luau` (0.5.0: allow-list, owners only, rate, secret scrub, plain data, the
     session, client logs; 0.5.1: the wake: this JobId within a tick, other JobIds and malformed ignored, the local rate,
-    a forged wake costs one poll, no backend no poll), `lune run scripts/test-bundle.luau` (0.5.3: triggers and the id,
+    a forged wake costs one poll, no backend no poll), `lune run scripts/test-live-debug.luau` (0.5.7: declarations
+    and the hash, heartbeats' xh / x / cv / xq and the columns gap, failing and yielding getters, `game.*` routing,
+    stream rates, batching and caps, the stop rules, live map mode and its lapse), `lune run scripts/test-bundle.luau` (0.5.3: triggers and the id,
     joining, the per-code and per-server limits, the close rule, parallel client logs and their timeout, the left
     players' lines, trimming, the key scrub, retries and the 404 stop, the body against the contract).
   - `lune run scripts/smoke-kernel.luau` boots the real server kernel with stubbed services (vectors in
@@ -398,7 +433,8 @@ under "Owners and owner switches" below.
     before its report; the rollback drill: a local health rollback, then the branch rollback naming the same build,
     adopted with no swap, also when it arrives mid rollback and when only the poll finds it), 0.5.0's `--remote-debug`
     (the heartbeat's `rd` starts the poll, kernel and framework ops, refusals, client logs, no secret in an answer;
-    0.5.1: a wake on `TypeTorch/deploy` starts it with quiet heartbeats), 0.5.3's `--bundle` and `--bundle-clean` (a
+    0.5.1: a wake on `TypeTorch/deploy` starts it with quiet heartbeats; 0.5.7: live debug through the real kernel:
+    the declarations on heartbeats, a `game.*` command, streams while watched, the `lm` wake), 0.5.3's `--bundle` and `--bundle-clean` (a
     failed deploy's alert with `d.bundle`, then the bundle with that id, players, client logs and the server log; `/tt
     bundle`; a closing bundle after the failure, none after a clean close), and `--boot-budget`, which runs 26 boot
     scenarios (0.5.2 adds `deploy-during-boot`: a deploy that takes the swap lock mid boot; `--boot-scenario <name>`

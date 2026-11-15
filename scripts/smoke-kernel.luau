@@ -1037,7 +1037,7 @@ end
 
 local kernelFolder = newInstance("Folder", "TypeTorchKernel")
 kernelFolder.Parent = services.ServerScriptService
-for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Messaging = "Messaging.luau", Budget = "Budget.luau", Errors = "Errors.luau", RemoteDebug = "RemoteDebug.luau", Bundle = "Bundle.luau", Settings = "Settings.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
+for name, file in { Kernel = "Kernel.server.luau", Api = "Api.luau", Access = "Access.luau", Logs = "Logs.luau", Registry = "Registry.luau", Fleet = "Fleet.luau", Fallback = "Fallback.luau", Health = "Health.luau", Messaging = "Messaging.luau", Budget = "Budget.luau", Errors = "Errors.luau", RemoteDebug = "RemoteDebug.luau", LiveDebug = "LiveDebug.luau", Bundle = "Bundle.luau", Settings = "Settings.luau", Transport = "Transport.luau", Signing = "Signing.luau" } do
 	sourceInstance(if name == "Kernel" then "Script" else "ModuleScript", name, `src/server/{file}`).Parent = kernelFolder
 end
 local entryTemplate = sourceInstance("Script", "Entry", "src/server/Entry.server.luau")
@@ -1895,6 +1895,7 @@ if MODES38.remoteDebug then
 	Constants.FLEET_SETTINGS_SECONDS = 0.5
 	Constants.RD_POLL_GAP = 0.1
 	Constants.RD_COMMANDS_BURST = 30 -- the rate limit has its own test (scripts/test-remote-debug.luau)
+	Constants.LM_INTERVAL = 0.3 -- 0.5.7 live map mode (scripts/test-live-debug.luau has the real timings)
 end
 if MODES38.errors or MODES38.perf then
 	dataStore.data.settings = deepCopy(SMOKE.settings.backend)
@@ -4497,10 +4498,13 @@ end
 if MODES38.remoteDebug then
 	local BASE = "https://backend.example.test/api"
 	-- quietHeartbeats (0.5.1): heartbeat replies never say rd (a heartbeat 30 s away): only a wake can start the poll.
-	local rd = { watched = false, queue = {}, gets = 0, quietHeartbeats = false }
+	local rd = { watched = false, queue = {}, gets = 0, quietHeartbeats = false, streams = 0, lm = false }
 	httpScript.respond = function(entry)
 		if entry.url == BASE .. "/v1/fleet/heartbeat" then
 			return if rd.watched and not rd.quietHeartbeats then '{"ok":true,"rd":1}' else '{"ok":true}'
+		elseif entry.url == BASE .. "/v1/fleet/streams" then
+			rd.streams += 1
+			return serde.encode("json", { ok = true, watch = rd.watched, lm = rd.lm })
 		elseif string.find(entry.url, BASE .. "/v1/fleet/commands", 1, true) == 1 then
 			rd.gets += 1
 			local commands = rd.queue
@@ -4650,6 +4654,78 @@ if MODES38.remoteDebug then
 	gets = rd.gets
 	task.wait(1.5)
 	check("remote debug wake: 'not watched' stops the woken session too", rd.gets == gets)
+	-- 0.5.7 LIVE DEBUG (plans/34; LiveDebug.luau): the API, the heartbeat's xh / x / cv, a game command, the streams
+	-- while watched and the live map wake, all through the real kernel.
+	check("live debug: the API has debugDeclare & co.", typeof(SMOKE.kernel.debugDeclare) == "function" and typeof(SMOKE.kernel.debugColumnsChanged) == "function")
+	local declared = SMOKE.kernel:debugDeclare({ columns = { { name = "current_map", label = "Map", type = "string" } }, commands = { { name = "round_state", label = "Round" } }, streams = { { name = "loot", hz = 4, kind = "points" } } })
+	SMOKE.kernel:onDebugColumn(function(name)
+		return if name == "current_map" then "Lobby" else nil
+	end)
+	SMOKE.kernel:onDebugCommand(function(name, args)
+		return { kind = "kv", items = { command = name, n = args.n } }
+	end)
+	SMOKE.kernel:onDebugStream(function()
+		return { points = { { x = 1, y = 2, z = 3 } } }
+	end)
+	local function declaredBeat()
+		for index = #httpRequests, 1, -1 do
+			local entry = httpRequests[index]
+			if entry.url == BASE .. "/v1/fleet/heartbeat" and entry.body and entry.body.xh == declared.hash then
+				return entry
+			end
+		end
+		return nil
+	end
+	check("live debug: heartbeats carry xh, x (the first time) and cv", waitFor("declared heartbeat", function()
+		local beat = declaredBeat()
+		return beat ~= nil and beat.body.cv ~= nil and beat.body.cv.current_map == "Lobby"
+	end, 3) and (function()
+		for _, entry in httpRequests do
+			if entry.url == BASE .. "/v1/fleet/heartbeat" and entry.body and entry.body.xh == declared.hash and entry.body.xd then
+				return entry.body.xd.cmd[1].n == "round_state" and entry.body.xd.st[1].k == "points"
+			end
+		end
+		return false
+	end)())
+	local streamsBefore = rd.streams
+	rd.watched = true
+	rd.queue = { command("g1", "game.round_state", { n = 3 }), command("g2", "game.not_declared") }
+	check("live debug: a declared game.* command runs the generation's handler; an undeclared one is refused", waitFor("game answers", function()
+		return answer("g1") ~= nil and answer("g2") ~= nil
+	end, 4) and decoded("g1").items.command == "round_state" and decoded("g1").items.n == 3 and answer("g2").ok == false)
+	check("live debug: streams post while the poll runs (positions and game.loot)", waitFor("stream posts", function()
+		return rd.streams >= streamsBefore + 2
+	end, 4) and (function()
+		for index = #httpRequests, 1, -1 do
+			local entry = httpRequests[index]
+			if entry.url == BASE .. "/v1/fleet/streams" and entry.body and entry.body.frames then
+				local positions, loot = nil, nil
+				for _, frame in entry.body.frames do
+					positions = positions or frame.s.positions
+					loot = loot or frame.s["game.loot"]
+				end
+				return entry.body.j == JOB and positions ~= nil and positions.players[1].u == 424242424 and positions.players[1].st == "none" and loot ~= nil
+			end
+		end
+		return false
+	end)())
+	rd.watched = false
+	task.wait(2.5)
+	local stoppedAt = rd.streams
+	task.wait(1.2)
+	check("live debug: the streams stop with the poll", rd.streams == stoppedAt and status().liveDebug.state == "off")
+	rd.lm = true
+	publish("TypeTorch/deploy", { k = "lm" })
+	check("live debug: a { k = lm } wake posts positions (live map mode)", waitFor("lm posts", function()
+		return rd.streams >= stoppedAt + 2
+	end, 3) and status().liveDebug.state == "lm" and status().liveDebug.lmWakes == 1)
+	local lastMessage = status().lastMessage
+	check("live debug: the lm wake is not a deploy message", lastMessage == nil or lastMessage.data == nil or lastMessage.data.k ~= "lm")
+	rd.lm = false
+	task.wait(0.8)
+	local lmStopped = rd.streams
+	task.wait(1)
+	check("live debug: a reply saying neither watch nor lm ends live map mode", rd.streams == lmStopped and status().liveDebug.state == "off")
 	local info = status().remoteDebug
 	check("remote debug: status().remoteDebug counts (sessions, commands, refused) and says off", info ~= nil and info.state == "off" and info.sessions >= 2 and info.commands >= 10 and info.refused >= 2 and info.redacted >= 1)
 	local labels = {}
@@ -4790,7 +4866,7 @@ if FALLBACK_MODE then
 	finish()
 end
 
-check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == "0.5.4")
+check("status: signed only, key asset mode, build stamped", s.signedOnly == true and s.signing.mode == "key asset" and s.kernelBuild == "abc1234" and s.kernelVersion == Constants.KERNEL_VERSION)
 
 -- 0.3.8: no settings record here (a game that never ran `typetorch settings push`): the defaults, reported as missing.
 do

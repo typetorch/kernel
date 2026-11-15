@@ -359,6 +359,52 @@ function Api.forEntry(entry: Script)
 		generation.remoteDebugHandler = if typeof(fn) == "function" then fn else nil
 	end
 
+	-- Kernel 0.5.7 (additive; plans/34): LIVE DEBUG (LiveDebug.luau). Left out when the place doesn't map LiveDebug.luau;
+	-- `debugDeclare` doubles as the feature test. The generation declares its custom fleet columns, read-only commands
+	-- (the explorer's op `game.<name>`) and streams; the kernel reads them through the handlers below. Read-only commands
+	-- and no player names / ids in columns are the game's promise (the kernel can't check either).
+	local LiveDebug = services.LiveDebug
+	if LiveDebug and not LiveDebug.missing then
+		-- Replaces this generation's declarations: { columns = { { name, label?, type? } }, commands = { { name, label?,
+		-- description? } }, streams = { { name, hz, kind?, label? } } }; names ^[a-z][a-z0-9_]{0,31}$, at most 16 columns,
+		-- 32 commands and 8 streams, type "string" | "number" | "bool", kind "points" | "json", hz 0.2..4 (clamped). Bad
+		-- entries are dropped. Returns { ok, hash?, columns, commands, streams, dropped }.
+		function api:debugDeclare(declarations: any)
+			local previous = generation.debug and generation.debug.xh
+			local record, dropped = LiveDebug.normalize(declarations)
+			generation.debug = record
+			LiveDebug.declared(generation, previous)
+			return {
+				ok = true,
+				hash = if record then record.xh else nil,
+				columns = if record then #record.columns else 0,
+				commands = if record then #record.x.cmd else 0,
+				streams = if record then #record.streams else 0,
+				dropped = dropped,
+			}
+		end
+		-- fn(name, args, caller) answers a declared command (op `game.<name>`) after the kernel checked the declaration,
+		-- the rate and that `caller` is an owner; on a kernel thread, with RemoteDebug's deadline, size cap and scrubbing.
+		function api:onDebugCommand(fn)
+			generation.debugCommandHandler = if typeof(fn) == "function" then fn else nil
+		end
+		-- fn(name) -> string | number | boolean | nil: a declared column's value, read when a heartbeat is built (pcall,
+		-- a short deadline; anything else is null).
+		function api:onDebugColumn(fn)
+			generation.debugColumnHandler = if typeof(fn) == "function" then fn else nil
+		end
+		-- fn(name) -> any: a declared stream's sample, at its rate while the explorer watches this server (pcall, a short
+		-- deadline; at most 16 KB of JSON).
+		function api:onDebugStream(fn)
+			generation.debugStreamHandler = if typeof(fn) == "function" then fn else nil
+		end
+		-- The column values changed: a heartbeat soon (coalesced, at most one per FLEET_COLUMNS_GAP s). Returns whether
+		-- one was asked for (false: not the running generation, or no columns declared).
+		function api:debugColumnsChanged(): boolean
+			return LiveDebug.columnsChanged(generation)
+		end
+	end
+
 	-- Entry-only (not on the TS interface).
 	function api.ready(stop: () -> ())
 		generation.stop = stop

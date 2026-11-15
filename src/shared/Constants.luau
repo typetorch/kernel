@@ -28,7 +28,8 @@ return {
 	DETACHED_SLOW = 60,
 	-- Fast path for deploys; the poll below is the backup (MessagingService delivery is best-effort). The kernel's one
 	-- control topic: it also carries the settings ping ({ k = "settings", s }, 0.3.8), the peers' roll call ask
-	-- ({ rc = 1, ... }, 0.3.6) and the remote debug wake ({ k = "rd", j = JobId }, 0.5.1, RD_WAKE_GAP), none a deploy.
+	-- ({ rc = 1, ... }, 0.3.6), the remote debug wake ({ k = "rd", j = JobId }, 0.5.1, RD_WAKE_GAP) and (0.5.7) the
+	-- live map wake ({ k = "lm" }, LD_LM_WAKE_GAP), none a deploy.
 	DEPLOY_TOPIC = "TypeTorch/deploy",
 	-- 0.2.3: remote experiment pins (A/B) from Manage > Servers: { j?, pct?, a?, b, by, t, unpin? }.
 	PIN_TOPIC = "TypeTorch/pin",
@@ -136,6 +137,12 @@ return {
 	FLEET_SPIKE_GAP = 300,
 	-- An error spike: this many errors from the running generation's scripts within 60 s.
 	FLEET_ERROR_SPIKE = 20,
+	-- 0.5.7 (plans/34): api:debugColumnsChanged() (the game's fleet column values changed) and a declaration change
+	-- send a coalesced heartbeat, at most one per FLEET_COLUMNS_GAP s (so does a reply's `xq = 1`). A column whose
+	-- getter failed goes out as JSON null: FLEET_NULL stands for it in the body until it is encoded (longer than any
+	-- column string, so a game value can't be it).
+	FLEET_COLUMNS_GAP = 10,
+	FLEET_NULL = "__typetorch_json_null__________________________________________________________________",
 	-- Old client trees stay this long after a swap so clients can stop their old generation first.
 	CLIENT_TREE_GRACE = 30,
 	-- Random delay before a public server fetches a new deploy, so all servers don't hit LoadAsset at once.
@@ -365,6 +372,42 @@ return {
 	RD_CLIENT_LOGS_TIMEOUT = 5,
 	RD_CLIENT_LOGS_MAX = 200,
 	RD_CLIENT_LOGS_BYTES = 64000,
+
+	-- 0.5.7 LIVE DEBUG (plans/34; src/server/LiveDebug.luau). The game's declarations (api:debugDeclare): fleet columns,
+	-- read-only commands (op `game.<name>`, through RemoteDebug's checks) and streams. Names ^[a-z][a-z0-9_]{0,31}$; at
+	-- most LD_COLUMNS_MAX columns, LD_COMMANDS_MAX commands, LD_STREAMS_MAX streams; labels LD_LABEL_MAX characters,
+	-- descriptions LD_DESCRIPTION_MAX, a column's string value LD_VALUE_TEXT_MAX; stream rates LD_HZ_MIN..LD_HZ_MAX.
+	LD_COLUMNS_MAX = 16,
+	LD_COMMANDS_MAX = 32,
+	LD_STREAMS_MAX = 8,
+	LD_LABEL_MAX = 40,
+	LD_DESCRIPTION_MAX = 200,
+	LD_VALUE_TEXT_MAX = 64,
+	LD_HZ_MIN = 0.2,
+	LD_HZ_MAX = 4,
+	-- Column getters (all at once) get LD_COLUMNS_DEADLINE s when a heartbeat is built, each stream sampler
+	-- LD_STREAM_DEADLINE s; past it the value is null (columns) or left out (streams). A `game.*` command's args at
+	-- most RD_GAME_ARGS_MAX bytes of JSON.
+	LD_COLUMNS_DEADLINE = 0.25,
+	LD_STREAM_DEADLINE = 0.1,
+	RD_GAME_ARGS_MAX = 2048,
+	-- Streams, while the remote debug poll runs: the built-in `positions` at LD_POSITIONS_HZ, the game's at their rate,
+	-- posted to LD_STREAMS_PATH every LD_POST_SECONDS; a value at most LD_VALUE_MAX bytes of JSON (else dropped), a body
+	-- at most LD_BODY_MAX (the oldest frames go). LD_FAILURES_MAX failed posts in a row end it; a 401/403/404 holds
+	-- streams off LD_AUTH_HOLD s.
+	LD_STREAMS_PATH = "/v1/fleet/streams",
+	LD_POSITIONS_HZ = 2,
+	LD_POST_SECONDS = 1,
+	LD_VALUE_MAX = 16384,
+	LD_BODY_MAX = 65536,
+	LD_FAILURES_MAX = 3,
+	LD_AUTH_HOLD = 300,
+	-- Live map mode (`lm`: a heartbeat reply's lm = 1, or the wake { k = "lm" } on DEPLOY_TOPIC, at most one acted on
+	-- per LD_LM_WAKE_GAP s): positions only, one frame every LM_INTERVAL s, until LM_IDLE_SECONDS pass without a reply
+	-- saying lm (or watch).
+	LM_INTERVAL = 3,
+	LM_IDLE_SECONDS = 60,
+	LD_LM_WAKE_GAP = 10,
 
 	-- 0.5.3 DEBUG BUNDLES (Bundle.luau): a failing server posts what happened to BUNDLE_PATH on the backend (the settings'
 	-- backend key). A trigger (a critical alert, a generation that fails to start, Fallback moving players, /tt bundle)
