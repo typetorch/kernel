@@ -152,8 +152,8 @@ under "Owners and owner switches" below.
     hash?, columns, commands, streams, dropped }`. `api:onDebugCommand(fn(name, args, caller))`,
     `api:onDebugColumn(fn(name))`, `api:onDebugStream(fn(name))` install the generation's handlers;
     `api:debugColumnsChanged()` asks for a heartbeat.
-  - Heartbeats (Fleet.luau) carry `xh` (a 16-hex hash of the declarations) whenever something is declared, `x` (the
-    wire form `{ c = { { n, l?, t? } }, cmd = { { n, l?, d? } }, st = { { n, hz, k?, l? } } }`) on the first one,
+  - Heartbeats (Fleet.luau) carry `xh` (a 16-hex hash of the declarations) whenever something is declared, `xd` (the
+    wire form; not `x`, the A/B experiment flag: `{ c = { { n, l?, t? } }, cmd = { { n, l?, d? } }, st = { { n, hz, k?, l? } } }`) on the first one,
     after a change, for a new backend and after a reply's `xq = 1`, and `cv` = `{ <column> = string (64 characters)
     | number | bool | null }`, each getter on a kernel thread under pcall (all within 0.25 s; failing, yielding or
     odd values are null). A declaration change, `xq` and `debugColumnsChanged` send a coalesced heartbeat, at most one

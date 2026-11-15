@@ -6,7 +6,7 @@
 -- writes only and is never logged, printed or sent anywhere but the Authorization header). Studio sends nothing.
 --
 -- Requests (HttpService:RequestAsync, POST, JSON, `Authorization: Bearer <token>`); contract in plans/01 "Fleet API":
---   /v1/fleet/heartbeat  the fleet status { t, b, c?, a?, n, m, s, u, p, pv, x?, v, q, g, h, e?, sv = 2 } plus j = JobId
+--   /v1/fleet/heartbeat  the fleet status { t, b, c?, a?, n, m, s, u, p, pv, x?, xh?, xd?, cv?, v, q, g, h, e?, sv = 2 } plus j = JobId
 --                        (never `k`, the reserved access code), every FLEET_HEARTBEAT_SECONDS and right after a change
 --   /v1/fleet/report     each deploy report { s, b, a, j, r, e?, d?, t, g, k, p }, at once
 --   /v1/fleet/alert      { level = "critical" | "warning", code, message (<= 300 bytes), j, b, a, s, t, g, k }, at once
@@ -34,7 +34,7 @@
 -- read, and only as JSON; anything else is ignored.
 -- 0.5.7 (plans/34, live debug): when the running generation declared fleet columns, commands or streams
 -- (api:debugDeclare, LiveDebug.luau), every heartbeat carries `xh` (their short hash) and `cv` (the column values, read
--- as the body is built: { <name> = string | number | bool | null }); `x` (the declarations) rides the first heartbeat,
+-- as the body is built: { <name> = string | number | bool | null }); `xd` (the declarations; not `x`, the A/B experiment flag) rides the first heartbeat,
 -- the first after a change, and the next one after a reply asked (`xq = 1`). Fleet.heartbeat("columns") (the game's
 -- values changed, the declarations changed, or `xq`) is coalesced: at most one per FLEET_COLUMNS_GAP s. The closing
 -- request carries none of them.
@@ -61,7 +61,7 @@ local deps = {
 	end,
 	-- 0.5.0: (reply: table) -> (): a heartbeat's decoded JSON reply (remote debug's `rd`; 0.5.7: live map's `lm`).
 	onHeartbeatReply = function(_reply) end,
-	-- 0.5.7: () -> (xh, x)?: the running generation's declarations (LiveDebug.declarations).
+	-- 0.5.7: () -> (xh, xd)?: the running generation's declarations (LiveDebug.declarations).
 	declarations = function()
 		return nil, nil
 	end,
@@ -86,7 +86,7 @@ local settingsReadAt = -math.huge
 local queue = {} -- { path, body, attempts, nextAt }, oldest first
 -- `urgent` (0.4.2): a "seq" heartbeat is due; it goes before the queue.
 local heartbeat = { due = false, urgent = false, attempts = 0, nextAt = 0, lastAt = -math.huge, lastPlayersAt = -math.huge, columnsAt = nil :: number?, lastColumnsAt = -math.huge }
--- 0.5.7: the declarations' hash the backend got `x` for (a heartbeat that carried it succeeded), and whether it asked
+-- 0.5.7: the declarations' hash the backend got `xd` for (a heartbeat that carried it succeeded), and whether it asked
 -- again (`xq`).
 local declarationsSent: string? = nil
 local declarationsAsked = false
@@ -334,7 +334,7 @@ local function post(path: string, body): (boolean, boolean, number?, string?, st
 end
 
 -- The heartbeat body: the fleet status without `k` (a reserved server's access code stays in the universe), plus j.
--- 0.5.7: plus the live debug fields (xh, x?, cv?) unless `closing`.
+-- 0.5.7: plus the live debug fields (xh, xd?, cv?) unless `closing`.
 local function heartbeatBody(closing: boolean?)
 	local ok, status = pcall(deps.status)
 	local body = if ok and typeof(status) == "table" then table.clone(status) else { sv = 2 }
@@ -355,7 +355,7 @@ local function heartbeatBody(closing: boolean?)
 		if declaredOk and typeof(hash) == "string" and typeof(x) == "table" then
 			body.xh = hash
 			if hash ~= declarationsSent or declarationsAsked then
-				body.x = x
+				body.xd = x
 			end
 			local valuesOk, values = pcall(deps.columnValues)
 			if valuesOk and typeof(values) == "table" and next(values) ~= nil then
@@ -433,14 +433,14 @@ local function step(): boolean
 	end
 	local body = heartbeatBody()
 	local ok, retry, code, errorText, reply = post("/v1/fleet/heartbeat", body)
-	if ok and body.x ~= nil then
+	if ok and body.xd ~= nil then
 		declarationsSent, declarationsAsked = body.xh, false
 	end
 	if ok and reply and #reply > 0 and #reply < 4096 and deps.decode then
 		-- 0.5.0: the reply may ask for a remote debug session (`rd`); a bad reply is ignored.
 		local decodedOk, decoded = pcall(deps.decode, reply)
 		if decodedOk and typeof(decoded) == "table" then
-			-- 0.5.7: the backend doesn't hold this job's declarations (`xq`): the next heartbeat carries `x`, soon.
+			-- 0.5.7: the backend doesn't hold this job's declarations (`xq`): the next heartbeat carries `xd`, soon.
 			if (decoded.xq == 1 or decoded.xq == true) and body.xh ~= nil then
 				declarationsAsked = true
 				Fleet.heartbeat("columns")

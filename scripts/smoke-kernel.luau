@@ -4681,8 +4681,8 @@ if MODES38.remoteDebug then
 		return beat ~= nil and beat.body.cv ~= nil and beat.body.cv.current_map == "Lobby"
 	end, 3) and (function()
 		for _, entry in httpRequests do
-			if entry.url == BASE .. "/v1/fleet/heartbeat" and entry.body and entry.body.xh == declared.hash and entry.body.x then
-				return entry.body.x.cmd[1].n == "round_state" and entry.body.x.st[1].k == "points"
+			if entry.url == BASE .. "/v1/fleet/heartbeat" and entry.body and entry.body.xh == declared.hash and entry.body.xd then
+				return entry.body.xd.cmd[1].n == "round_state" and entry.body.xd.st[1].k == "points"
 			end
 		end
 		return false

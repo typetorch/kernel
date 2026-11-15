@@ -5,8 +5,8 @@
 --   * DECLARATIONS (api:debugDeclare): the running generation's custom fleet COLUMNS, read-only COMMANDS (op
 --     `game.<name>`) and STREAMS. Normalized here (names ^[a-z][a-z0-9_]{0,31}$, at most LD_COLUMNS_MAX /
 --     LD_COMMANDS_MAX / LD_STREAMS_MAX, labels LD_LABEL_MAX, descriptions LD_DESCRIPTION_MAX, rates LD_HZ_MIN..LD_HZ_MAX)
---     into the heartbeat's wire form `x` = { c = { { n, l?, t? } }, cmd = { { n, l?, d? } }, st = { { n, hz, k?, l? } } }
---     and its short hash `xh`. Fleet.luau puts `xh` on every heartbeat and `x` on the first one, after a change and when
+--     into the heartbeat's wire form `xd` = { c = { { n, l?, t? } }, cmd = { { n, l?, d? } }, st = { { n, hz, k?, l? } } }
+--     and its short hash `xh`. Fleet.luau puts `xh` on every heartbeat and `xd` on the first one, after a change and when
 --     the backend asked (`xq = 1`).
 --   * COLUMN VALUES (`cv`, read when a heartbeat is built): each declared column's getter (api:onDebugColumn) runs on a
 --     kernel thread under pcall; one that fails, yields past LD_COLUMNS_DEADLINE or returns something else than a
@@ -159,7 +159,7 @@ local function canonical(x): string
 	return table.concat(parts, ",")
 end
 
--- The short hash of a wire declaration `x` (16 hex characters).
+-- The short hash of a wire declaration `xd` (16 hex characters).
 function LiveDebug.hash(x): string
 	local text = canonical(x)
 	return string.format("%08x%08x", fnv(text, 2166136261), fnv(text, 3432918353))
@@ -235,7 +235,7 @@ function LiveDebug.declarations()
 	return record.xh, record.x
 end
 
--- Api.luau: `generation` declared (again). A change on the running generation asks for a heartbeat (it carries `x`).
+-- Api.luau: `generation` declared (again). A change on the running generation asks for a heartbeat (it carries `xd`).
 function LiveDebug.declared(generation, previousHash: string?)
 	local record = generation and generation.debug
 	local hash = if record then record.xh else nil

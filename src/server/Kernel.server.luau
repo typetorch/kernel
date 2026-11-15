@@ -65,7 +65,7 @@
 -- alert (its d.bundle names the bundle), a generation that fails to start, Fallback moving players and /tt bundle
 -- trigger one (~3 s later, limited); BindToClose sends one only after a failure in the last 10 minutes.
 -- 0.5.7 (plans/34, live debug; LiveDebug.luau): the game declares fleet columns (their values ride the heartbeat as
--- `cv`, the declarations as `xh` / `x`), read-only commands (op `game.<name>` through remote debug's checks) and streams
+-- `cv`, the declarations as `xh` / `xd`), read-only commands (op `game.<name>` through remote debug's checks) and streams
 -- (sampled with the built-in `positions` and posted to /v1/fleet/streams while the server is watched); a live map wake
 -- { k = "lm" } on TypeTorch/deploy or a heartbeat reply's lm = 1 posts positions every 3 s (the explorer's /live).
 

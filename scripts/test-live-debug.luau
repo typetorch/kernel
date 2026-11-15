@@ -193,7 +193,7 @@ Fleet.configure({
 		return true, { url = BASE, key = KEY }, "backend"
 	end,
 	status = function()
-		return { sv = 2, t = "public", n = #players }
+		return { sv = 2, t = "public", n = #players, x = 1 }
 	end,
 	encode = encode,
 	decode = decode,
@@ -388,13 +388,14 @@ Fleet.start()
 advance(1)
 do
 	local first = lastHeartbeat()
-	check("heartbeat: the first carries xh and x", first and first.body.xh == gen.debug.xh and first.body.x and #first.body.x.c == 3 and #first.body.x.cmd == 1 and #first.body.x.st == 2)
+	check("heartbeat: the A/B flag x = 1 rides next to the declarations (xd), never replaced", first and first.body.x == 1)
+	check("heartbeat: the first carries xh and xd", first and first.body.xh == gen.debug.xh and first.body.xd and #first.body.xd.c == 3 and #first.body.xd.cmd == 1 and #first.body.xd.st == 2)
 	local cv = first and first.body.cv
 	check("cv: values read at heartbeat time; strings cut to 64 characters", cv and cv.in_round == true and cv.current_map == string.sub("HedgeMaze " .. string.rep("x", 100), 1, 64))
 	check("cv: a failing getter is JSON null (the key is there)", first and string.find(first.raw, '"score":null', 1, true) ~= nil and not string.find(first.raw, "__typetorch_json_null", 1, true), first and first.raw)
 	advance(31)
 	local second = lastHeartbeat()
-	check("heartbeat: the next carries xh but not x", second ~= first and second.body.xh == gen.debug.xh and second.body.x == nil and second.body.cv ~= nil)
+	check("heartbeat: the next carries xh but not x", second ~= first and second.body.xh == gen.debug.xh and second.body.xd == nil and second.body.cv ~= nil)
 
 	-- A yielding getter (past LD_COLUMNS_DEADLINE), NaN and a table are null; the heartbeat isn't held up.
 	columnValues.current_map = function()
@@ -445,9 +446,9 @@ do
 	api:debugColumnsChanged()
 	advance(12)
 	local asked = ofPath("/v1/fleet/heartbeat", mark)
-	check("xq: the reply's xq = 1 makes the next heartbeat (within the gap) re-send x", #asked == 2 and asked[1].body.x == nil and asked[2].body.x ~= nil and asked[2].body.xh == gen.debug.xh, #asked)
+	check("xq: the reply's xq = 1 makes the next heartbeat (within the gap) re-send x", #asked == 2 and asked[1].body.xd == nil and asked[2].body.xd ~= nil and asked[2].body.xh == gen.debug.xh, #asked)
 	advance(31)
-	check("xq: once sent, x isn't repeated", lastHeartbeat().body.x == nil)
+	check("xq: once sent, x isn't repeated", lastHeartbeat().body.xd == nil)
 
 	-- A declaration change: a heartbeat soon with the new x.
 	advance(12)
@@ -455,7 +456,7 @@ do
 	local changed = api:debugDeclare({ columns = { { name = "current_map" } }, commands = { { name = "round_state" }, { name = "secret_probe" }, { name = "no_handler" } }, streams = { { name = "loot", hz = 2, kind = "points" }, { name = "big", hz = 1 } } })
 	advance(1)
 	local after = ofPath("/v1/fleet/heartbeat", mark)
-	check("declare again: a heartbeat soon carries the new x and xh", #after == 1 and after[1].body.xh == changed.hash and after[1].body.x and #after[1].body.x.c == 1 and #after[1].body.x.cmd == 3)
+	check("declare again: a heartbeat soon carries the new x and xh", #after == 1 and after[1].body.xh == changed.hash and after[1].body.xd and #after[1].body.xd.c == 1 and #after[1].body.xd.cmd == 3)
 	check("Fleet.info().declarationsSent: the acknowledged hash", Fleet.info().declarationsSent == changed.hash)
 
 	-- Not the running generation: columnsChanged does nothing.
@@ -467,7 +468,7 @@ do
 	other.debug = nil
 	advance(31)
 	local none = lastHeartbeat()
-	check("no declarations: heartbeats carry no xh, x or cv", none.body.xh == nil and none.body.x == nil and none.body.cv == nil)
+	check("no declarations: heartbeats carry no xh, x or cv", none.body.xh == nil and none.body.xd == nil and none.body.cv == nil)
 	current = gen
 	advance(31)
 end
@@ -772,7 +773,7 @@ do
 	Fleet.closing(2)
 	advance(1)
 	local closing = ofPath("/v1/fleet/closing")
-	check("closing: no xh, x or cv (the generation may be gone)", #closing == 1 and closing[1].body.xh == nil and closing[1].body.cv == nil and closing[1].body.x == nil)
+	check("closing: no xh, x or cv (the generation may be gone)", #closing == 1 and closing[1].body.xh == nil and closing[1].body.cv == nil and closing[1].body.xd == nil)
 	local leaked = false
 	for _, line in output do
 		leaked = leaked or string.find(line, KEY, 1, true) ~= nil
