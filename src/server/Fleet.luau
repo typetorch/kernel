@@ -32,6 +32,12 @@
 -- 0.5.0 (plans/25, remote debug): a heartbeat's reply is read: `{ ok, rd = 1 }` means the explorer watches this server,
 -- and deps.onHeartbeatReply hands it to RemoteDebug.luau (which then polls for commands). Only heartbeat replies are
 -- read, and only as JSON; anything else is ignored.
+-- 0.5.7 (plans/34, live debug): when the running generation declared fleet columns, commands or streams
+-- (api:debugDeclare, LiveDebug.luau), every heartbeat carries `xh` (their short hash) and `cv` (the column values, read
+-- as the body is built: { <name> = string | number | bool | null }); `x` (the declarations) rides the first heartbeat,
+-- the first after a change, and the next one after a reply asked (`xq = 1`). Fleet.heartbeat("columns") (the game's
+-- values changed, the declarations changed, or `xq`) is coalesced: at most one per FLEET_COLUMNS_GAP s. The closing
+-- request carries none of them.
 
 local Constants = require(game:GetService("ReplicatedStorage"):WaitForChild("TypeTorchKernelShared"):WaitForChild("Constants"))
 
@@ -53,8 +59,17 @@ local deps = {
 	heartbeatExtra = function()
 		return nil
 	end,
-	-- 0.5.0: (reply: table) -> (): a heartbeat's decoded JSON reply (remote debug's `rd`).
+	-- 0.5.0: (reply: table) -> (): a heartbeat's decoded JSON reply (remote debug's `rd`; 0.5.7: live map's `lm`).
 	onHeartbeatReply = function(_reply) end,
+	-- 0.5.7: () -> (xh, x)?: the running generation's declarations (LiveDebug.declarations).
+	declarations = function()
+		return nil, nil
+	end,
+	-- 0.5.7: () -> { [string]: any }?: the column values, Constants.FLEET_NULL for null (LiveDebug.columnValues; may
+	-- yield briefly on this sender thread).
+	columnValues = function()
+		return nil
+	end,
 	encode = nil, -- (table) -> string
 	decode = nil, -- (string) -> any
 	warn = warn,
@@ -70,7 +85,11 @@ local settingsReadAt = -math.huge
 
 local queue = {} -- { path, body, attempts, nextAt }, oldest first
 -- `urgent` (0.4.2): a "seq" heartbeat is due; it goes before the queue.
-local heartbeat = { due = false, urgent = false, attempts = 0, nextAt = 0, lastAt = -math.huge, lastPlayersAt = -math.huge }
+local heartbeat = { due = false, urgent = false, attempts = 0, nextAt = 0, lastAt = -math.huge, lastPlayersAt = -math.huge, columnsAt = nil :: number?, lastColumnsAt = -math.huge }
+-- 0.5.7: the declarations' hash the backend got `x` for (a heartbeat that carried it succeeded), and whether it asked
+-- again (`xq`).
+local declarationsSent: string? = nil
+local declarationsAsked = false
 local started = false
 local closed = false
 local tokens, tokensAt = 10, os.clock()
@@ -181,6 +200,7 @@ function Fleet.refreshSettings()
 	if first then
 		deps.print(`[TypeTorch] backend: {parsed.host} (settings.{source})`)
 		heartbeat.due = true
+		declarationsSent = nil -- 0.5.7: a new backend gets the declarations again
 	end
 end
 
@@ -280,6 +300,10 @@ local function post(path: string, body): (boolean, boolean, number?, string?, st
 		warnOnce("encode", `[TypeTorch] fleet {path}: the body can't be encoded: {scrub(encoded, 200)}`)
 		return false, false
 	end
+	if typeof(body) == "table" and typeof(body.cv) == "table" then
+		-- 0.5.7: a failed column getter is JSON null (a Luau table can't hold nil).
+		encoded = string.gsub(encoded, '"' .. Constants.FLEET_NULL .. '"', "null")
+	end
 	local ok, response = pcall(deps.http.RequestAsync, deps.http, {
 		Url = current.url .. path,
 		Method = "POST",
@@ -310,7 +334,8 @@ local function post(path: string, body): (boolean, boolean, number?, string?, st
 end
 
 -- The heartbeat body: the fleet status without `k` (a reserved server's access code stays in the universe), plus j.
-local function heartbeatBody()
+-- 0.5.7: plus the live debug fields (xh, x?, cv?) unless `closing`.
+local function heartbeatBody(closing: boolean?)
 	local ok, status = pcall(deps.status)
 	local body = if ok and typeof(status) == "table" then table.clone(status) else { sv = 2 }
 	body.k = nil
@@ -322,6 +347,19 @@ local function heartbeatBody()
 		for key, value in extra do
 			if body[key] == nil then
 				body[key] = value
+			end
+		end
+	end
+	if not closing then
+		local declaredOk, hash, x = pcall(deps.declarations)
+		if declaredOk and typeof(hash) == "string" and typeof(x) == "table" then
+			body.xh = hash
+			if hash ~= declarationsSent or declarationsAsked then
+				body.x = x
+			end
+			local valuesOk, values = pcall(deps.columnValues)
+			if valuesOk and typeof(values) == "table" and next(values) ~= nil then
+				body.cv = values
 			end
 		end
 	end
@@ -357,7 +395,8 @@ local function step(): boolean
 		end
 	end
 	local periodic = now - heartbeat.lastAt >= Constants.FLEET_HEARTBEAT_SECONDS
-	local heartbeatReady = (heartbeat.due or periodic) and heartbeat.nextAt <= now
+	local columnsDue = heartbeat.columnsAt ~= nil and now >= heartbeat.columnsAt -- 0.5.7
+	local heartbeatReady = (heartbeat.due or periodic or columnsDue) and heartbeat.nextAt <= now
 	if not index and not heartbeatReady then
 		return false
 	end
@@ -385,11 +424,27 @@ local function step(): boolean
 	end
 	heartbeat.due, heartbeat.urgent = false, false
 	heartbeat.lastAt = now
-	local ok, retry, code, errorText, reply = post("/v1/fleet/heartbeat", heartbeatBody())
+	if heartbeat.columnsAt ~= nil then
+		-- 0.5.7: this heartbeat carries the current values (and declarations): a pending "columns" one is done.
+		if columnsDue then
+			heartbeat.lastColumnsAt = now
+		end
+		heartbeat.columnsAt = nil
+	end
+	local body = heartbeatBody()
+	local ok, retry, code, errorText, reply = post("/v1/fleet/heartbeat", body)
+	if ok and body.x ~= nil then
+		declarationsSent, declarationsAsked = body.xh, false
+	end
 	if ok and reply and #reply > 0 and #reply < 4096 and deps.decode then
 		-- 0.5.0: the reply may ask for a remote debug session (`rd`); a bad reply is ignored.
 		local decodedOk, decoded = pcall(deps.decode, reply)
 		if decodedOk and typeof(decoded) == "table" then
+			-- 0.5.7: the backend doesn't hold this job's declarations (`xq`): the next heartbeat carries `x`, soon.
+			if (decoded.xq == 1 or decoded.xq == true) and body.xh ~= nil then
+				declarationsAsked = true
+				Fleet.heartbeat("columns")
+			end
 			pcall(deps.onHeartbeatReply, decoded)
 		end
 	end
@@ -426,9 +481,17 @@ function Fleet.start()
 end
 
 -- A heartbeat now (coalesced). `reason` "players": at most once per FLEET_PLAYERS_GAP seconds; "seq" (0.4.2: the
--- applied seq moved): ahead of the queued reports.
+-- applied seq moved): ahead of the queued reports; "columns" (0.5.7: the game's column values or declarations changed,
+-- or a reply's `xq`): at most once per FLEET_COLUMNS_GAP seconds, deferred (not dropped) inside the gap.
 function Fleet.heartbeat(reason: string?)
 	if not accepting() then
+		return
+	end
+	if reason == "columns" then
+		local at = math.max(os.clock(), heartbeat.lastColumnsAt + (Constants.FLEET_COLUMNS_GAP or 10))
+		if heartbeat.columnsAt == nil or at < heartbeat.columnsAt then
+			heartbeat.columnsAt = at
+		end
 		return
 	end
 	if reason == "players" then
@@ -544,7 +607,7 @@ function Fleet.closing(deadline: number?)
 	end
 	closed = true
 	local stop = os.clock() + (deadline or 3)
-	local body = heartbeatBody()
+	local body = heartbeatBody(true)
 	body.closing = true
 	local ok, retry = post("/v1/fleet/closing", body)
 	if not ok and retry and os.clock() + 1 < stop then
@@ -574,6 +637,8 @@ function Fleet.info()
 		retryIn = if outage.untilAt > os.clock() then math.ceil(outage.untilAt - os.clock()) else nil,
 		-- 0.4.0: "backend" | "fleet": the settings field the URL and key came from (nil without settings).
 		source = settingsSource,
+		-- 0.5.7: the declarations' hash the backend acknowledged (nil: none declared, or not sent yet).
+		declarationsSent = declarationsSent,
 	}
 end
 

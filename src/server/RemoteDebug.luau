@@ -30,6 +30,13 @@
 --     at least 12 characters long, is replaced with "<redacted>" before it is posted; answers over RD_RESULT_MAX bytes
 --     are refused, not cut.
 -- Every poll and post is counted in the budget view (HTTP label "debug"; the kernel wraps deps.http).
+--
+-- 0.5.7 (plans/34, live debug): GAME-DEFINED COMMANDS. An op `game.<name>` runs the running generation's handler
+-- (api:onDebugCommand) as handler(name, args, caller), only when that generation declared `name` (api:debugDeclare;
+-- anything else is refused like an op off the allow-list), with the same rate limit, owner check, deadline, size limit
+-- and secret scrubbing as every op; args at most RD_GAME_ARGS_MAX bytes of JSON. Read-only is the game's promise: the
+-- kernel can't check what a game's handler does. While a session polls, LiveDebug.luau samples and posts the streams
+-- (deps.onSession tells it when a session starts and stops).
 
 local Constants = require(game:GetService("ReplicatedStorage"):WaitForChild("TypeTorchKernelShared"):WaitForChild("Constants"))
 
@@ -55,6 +62,13 @@ local deps = {
 	framework = function()
 		return nil
 	end,
+	-- 0.5.7: () -> (declared: { [name]: true }?, handler: ((name, args, caller) -> result)?): the running generation's
+	-- declared `game.*` commands and its api:onDebugCommand handler.
+	gameCommands = function()
+		return nil, nil
+	end,
+	-- 0.5.7: (running: boolean) -> (): a session started or stopped (LiveDebug.onPoll).
+	onSession = function(_running) end,
 	-- (userId) -> boolean: an owner by the kernel's rule (Access.isOwnerUserId). May yield (a cached web call).
 	isOwner = function(_userId)
 		return false
@@ -378,7 +392,16 @@ function RemoteDebug.run(command: any)
 		stats.refused += 1
 		return { id = id, ok = false, error = why, ms = 0 }
 	end
-	if typeof(op) ~= "string" or not (KERNEL_OPS[op] or FRAMEWORK_OPS[op]) then
+	-- 0.5.7: `game.<name>`: allowed only when the running generation declared that command.
+	local gameName = if typeof(op) == "string" then string.match(op, "^game%.([a-z][a-z0-9_]*)$") else nil
+	local gameHandler = nil
+	if gameName then
+		local declaredOk, declared, handler = pcall(deps.gameCommands)
+		if #gameName > 32 or not declaredOk or typeof(declared) ~= "table" or declared[gameName] ~= true then
+			return refuse(`op_not_allowed: {clean(op, 40)} is not declared by the running build`)
+		end
+		gameHandler = handler
+	elseif typeof(op) ~= "string" or not (KERNEL_OPS[op] or FRAMEWORK_OPS[op]) then
 		return refuse(`op_not_allowed: {clean(op, 40)} (read-only ops only)`)
 	end
 	if typeof(command.exp) == "number" and command.exp / 1000 < deps.time() - 30 then
@@ -396,7 +419,16 @@ function RemoteDebug.run(command: any)
 	stats.lastCommandAt = deps.time()
 	stats.lastOp = op
 	local ok, result
-	if KERNEL_OPS[op] then
+	if gameName then
+		if typeof(gameHandler) ~= "function" then
+			return refuse(`not_supported: the running build declared {op} but has no command handler`)
+		end
+		local argsOk, encodedArgs = pcall(deps.encode, args)
+		if not argsOk or typeof(encodedArgs) ~= "string" or #encodedArgs > (Constants.RD_GAME_ARGS_MAX or 2048) then
+			return refuse(`bad_args: at most {Constants.RD_GAME_ARGS_MAX or 2048} bytes of JSON`)
+		end
+		ok, result = pcall(gameHandler, gameName, args, caller)
+	elseif KERNEL_OPS[op] then
 		local handler = deps.ops[op]
 		if not handler then
 			return refuse(`not_supported: {op} is missing from this kernel`)
@@ -534,6 +566,7 @@ end
 local function sessionLoop()
 	state.running = true
 	stats.sessions += 1
+	pcall(deps.onSession, true) -- 0.5.7: the streams start
 	local first = deps.target()
 	deps.print(`[TypeTorch] remote debug: the explorer is watching this server; polling {if first then first.host else "?"}`)
 	local failures = 0
@@ -594,6 +627,7 @@ local function sessionLoop()
 		end
 	end
 	state.running = false
+	pcall(deps.onSession, false)
 	deps.print(`[TypeTorch] remote debug: stopped polling ({why})`)
 end
 
@@ -643,6 +677,14 @@ function RemoteDebug.onWake(message: any): boolean
 	stats.wakes += 1
 	stats.lastWakeAt = deps.time()
 	return true
+end
+
+-- 0.5.7 (LiveDebug.luau): whether a session polls now, and its number (sessions so far).
+function RemoteDebug.running(): boolean
+	return state.running
+end
+function RemoteDebug.session(): number
+	return stats.sessions
 end
 
 -- BindToClose: no new polls.
