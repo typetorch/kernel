@@ -323,6 +323,62 @@ Fleet.configure({
 Fleet.refreshSettings()
 check("a non-https backend is refused (no target)", Fleet.info().settings == "invalid" and Fleet.target() == nil and said("settings.backend) ignored") == 1)
 
+-- 0.5.8: `region` (game.ServerRegion): only a trimmed uppercase 3-letter code, read in a pcall, re-read until valid.
+do
+	check("region: IAD kept", Fleet.regionCode("IAD") == "IAD")
+	check("region: trimmed", Fleet.regionCode("  SYD\n") == "SYD")
+	check("region: empty / lowercase / wrong length / digits / non-strings refused", Fleet.regionCode("") == nil
+		and Fleet.regionCode("iad") == nil and Fleet.regionCode("IA") == nil and Fleet.regionCode("IADX") == nil
+		and Fleet.regionCode("I4D") == nil and Fleet.regionCode(nil) == nil and Fleet.regionCode(7) == nil
+		and Fleet.regionCode("I AD") == nil)
+	Fleet.configure({
+		readSettings = function()
+			return true, { url = "https://fleet.example.test", token = TOKEN }, "fleet"
+		end,
+	})
+	Fleet.refreshSettings()
+	answer = "ok"
+	advance(40)
+	local raw: any = nil
+	local reads = 0
+	local function lastHeartbeat()
+		local beat = nil
+		for index = #requests, 1, -1 do
+			if requests[index].path == "/v1/fleet/heartbeat" then
+				beat = serde.decode("json", requests[index].body)
+				break
+			end
+		end
+		return beat
+	end
+	local function beatNow()
+		advance(40)
+		Fleet.heartbeat()
+		advance(1)
+		return lastHeartbeat()
+	end
+	Fleet.configure({ serverRegion = function()
+		reads += 1
+		if raw == "error" then
+			error("ServerRegion is not a valid member of DataModel")
+		end
+		return raw
+	end })
+	raw = "error"
+	local beat = beatNow()
+	check("region: a missing property (error) leaves the field out, the heartbeat still goes", beat ~= nil and beat.region == nil and beat.j == "job-1")
+	raw = ""
+	beat = beatNow()
+	check("region: \"\" (Studio, not filled in yet) leaves the field out", beat ~= nil and beat.region == nil)
+	raw = " LHR "
+	beat = beatNow()
+	check("region: filled in later: the next heartbeat carries it at the top level", beat ~= nil and beat.region == "LHR" and Fleet.info().region == "LHR")
+	local readsBefore = reads
+	raw = "error"
+	beat = beatNow()
+	check("region: kept once valid (not read again)", beat ~= nil and beat.region == "LHR" and reads == readsBefore)
+end
+
 -- 0.5.7: the health watch (Fleet.healthWatch): no false critical health_failed during a swap or a slow boot.
 do
 	local function run(ticks: { { string | boolean } }, need: number?)

@@ -7,6 +7,7 @@
 --
 -- Requests (HttpService:RequestAsync, POST, JSON, `Authorization: Bearer <token>`); contract in plans/01 "Fleet API":
 --   /v1/fleet/heartbeat  the fleet status { t, b, c?, a?, n, m, s, u, p, pv, x?, xh?, xd?, cv?, v, q, g, h, e?, sv = 2 } plus j = JobId
+--                        and region? (0.5.8, game.ServerRegion)
 --                        (never `k`, the reserved access code), every FLEET_HEARTBEAT_SECONDS and right after a change
 --   /v1/fleet/report     each deploy report { s, b, a, j, r, e?, d?, t, g, k, p }, at once
 --   /v1/fleet/alert      { level = "critical" | "warning", code, message (<= 300 bytes), j, b, a, s, t, g, k }, at once
@@ -38,6 +39,12 @@
 -- the first after a change, and the next one after a reply asked (`xq = 1`). Fleet.heartbeat("columns") (the game's
 -- values changed, the declarations changed, or `xq`) is coalesced: at most one per FLEET_COLUMNS_GAP s. The closing
 -- request carries none of them.
+-- 0.5.8: every heartbeat (and the closing request) carries `region` at the top level: the Roblox data center this
+-- server runs in, game.ServerRegion (an uppercase 3-letter IATA airport code such as "IAD", "SYD", "LHR"; open-ended,
+-- so not checked against a list). Read through deps.serverRegion in a pcall (an engine without the property must not
+-- break a heartbeat), trimmed, sent only when it matches ^[A-Z]{3}$ (else the field is left out: "" in Studio, before
+-- the engine filled it in, or on an older engine). Re-read on every heartbeat until a valid code was seen, then kept.
+-- The backend prefers it over its IP geolocation of the heartbeat.
 
 local Constants = require(game:GetService("ReplicatedStorage"):WaitForChild("TypeTorchKernelShared"):WaitForChild("Constants"))
 
@@ -70,6 +77,10 @@ local deps = {
 	columnValues = function()
 		return nil
 	end,
+	-- 0.5.8: () -> any: game.ServerRegion (may error: an older engine without the property).
+	serverRegion = function()
+		return nil
+	end,
 	encode = nil, -- (table) -> string
 	decode = nil, -- (string) -> any
 	warn = warn,
@@ -91,6 +102,7 @@ local heartbeat = { due = false, urgent = false, attempts = 0, nextAt = 0, lastA
 local declarationsSent: string? = nil
 local declarationsAsked = false
 local started = false
+local regionCode: string? = nil -- 0.5.8: the first valid game.ServerRegion read (it never changes for a server)
 local closed = false
 local tokens, tokensAt = 10, os.clock()
 local stats = { sent = 0, failed = 0, dropped = 0, lastOkAt = nil, lastError = nil, lastErrorAt = nil, lastStatus = nil, alerts = 0 }
@@ -333,6 +345,29 @@ local function post(path: string, body): (boolean, boolean, number?, string?, st
 	return false, retry, if typeof(code) == "number" then code else nil, stats.lastError
 end
 
+-- 0.5.8: a game.ServerRegion value as the heartbeat's `region`: trimmed, and only an uppercase 3-letter code; else nil.
+function Fleet.regionCode(raw: any): string?
+	if typeof(raw) ~= "string" or #raw > 64 then
+		return nil
+	end
+	local trimmed = string.match(raw, "^%s*(.-)%s*$")
+	if trimmed and string.match(trimmed, "^[A-Z][A-Z][A-Z]$") then
+		return trimmed
+	end
+	return nil
+end
+
+-- 0.5.8: this server's region code, or nil (read again next time until one is valid).
+local function serverRegion(): string?
+	if regionCode == nil then
+		local ok, raw = pcall(deps.serverRegion)
+		if ok then
+			regionCode = Fleet.regionCode(raw)
+		end
+	end
+	return regionCode
+end
+
 -- The heartbeat body: the fleet status without `k` (a reserved server's access code stays in the universe), plus j.
 -- 0.5.7: plus the live debug fields (xh, xd?, cv?) unless `closing`.
 local function heartbeatBody(closing: boolean?)
@@ -340,6 +375,7 @@ local function heartbeatBody(closing: boolean?)
 	local body = if ok and typeof(status) == "table" then table.clone(status) else { sv = 2 }
 	body.k = nil
 	body.j = deps.jobId
+	body.region = serverRegion() -- 0.5.8: nil (left out) until game.ServerRegion holds a valid code
 	-- 0.4.0: the budget summary (`bu`) and anything else the kernel adds; only on what goes to the backend (the roll
 	-- call and the analytics engine use api:fleetStatus() without it).
 	local extraOk, extra = pcall(deps.heartbeatExtra)
@@ -639,6 +675,8 @@ function Fleet.info()
 		source = settingsSource,
 		-- 0.5.7: the declarations' hash the backend acknowledged (nil: none declared, or not sent yet).
 		declarationsSent = declarationsSent,
+		-- 0.5.8: the `region` heartbeats carry (game.ServerRegion), nil while unknown.
+		region = regionCode,
 	}
 end
 
