@@ -1481,6 +1481,11 @@ Fleet.configure({
 	heartbeatExtra = function()
 		return { bu = Budget.summary(), pf = Budget.perfWindow() }
 	end,
+	-- 0.5.8: the data center's IATA code ("IAD"; "" in Studio). Fleet.luau reads it in a pcall (older engines lack it)
+	-- and sends it as the heartbeat's `region`.
+	serverRegion = function()
+		return (game :: any).ServerRegion
+	end,
 	encode = function(value)
 		return HttpService:JSONEncode(value)
 	end,
