@@ -794,6 +794,7 @@ local GAME_ROOT_PROPS = {
 	JobId = "smoke-job-0001",
 	PlaceId = 42,
 	PlaceVersion = 7,
+	ServerRegion = " IAD", -- 0.5.8: the heartbeat's `region` (trimmed)
 	PrivateServerId = "",
 	PrivateServerOwnerId = 0,
 	CreatorType = Enum.CreatorType.User,
@@ -4126,6 +4127,10 @@ if MODES38.errors then
 		local body = list[#list].body
 		return body.bu ~= nil and body.bu.ds.lr == 60 + 40 * #fakePlayers and body.bu.h.l == 500 and body.bu.by.k ~= nil
 	end))
+	check("errors: heartbeats carry region (0.5.8: game.ServerRegion, trimmed) at the top level", (function()
+		local list = posts("/v1/fleet/heartbeat")
+		return #list > 0 and list[#list].body.region == "IAD" and status().fleet.region == "IAD"
+	end)())
 	local rider = joinPlayer(424242424, "Rider", nil, false)
 	rider.DisplayName = "Speedy"
 	services.Players.PlayerAdded:Fire(rider)

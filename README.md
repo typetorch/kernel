@@ -195,7 +195,11 @@ under "Owners and owner switches" below.
     every retry is jittered (+-25%), and after a request's retries all failed the sender backs off (30 s doubling to
     300 s); a 401/403/404 holds it off about 5 minutes; one success resets it. One warning line a minute at most, with
     the reason, and one "heartbeats work again" line after an outage; `status().fleet` adds `failures` (failed
-    requests in a row) and `retryIn`.
+    requests in a row) and `retryIn`. 0.5.8: every heartbeat (and the closing notice) carries `region` at the top
+    level: `game.ServerRegion`, the data center's IATA airport code (`"IAD"`, `"SYD"`, `"LHR"`; open-ended, not checked
+    against a list), read in a pcall, trimmed and sent only when it matches `^[A-Z]{3}$` (left out in Studio, before
+    the engine filled it in, or on an engine without the property); re-read each heartbeat until valid, then kept.
+    The backend shows it in place of its IP geolocation. `status().fleet.region` has it too.
   - **Boot budget:** a new server runs a playable generation within 15 s of start in every path (about 2 s
     normally): the boot reads run in parallel behind one 3 s gate, the key asset gets 3 s, and boot attempts get short
     load and ready caps; a head that runs out of boot time is retried in the background and swapped to when it works.
@@ -409,7 +413,7 @@ under "Owners and owner switches" below.
   - `lune run scripts/test-ed25519.luau` (RFC 8032 vectors, SHA-512/256, and the signing rules in
     `scripts/test-signing.luau`), `lune run scripts/test-access.luau`.
   - `lune run scripts/test-fleet.luau` (0.3.9: the fleet sender's backoff, hold and log lines on a fake clock; 0.4.2: a
-    `seq` heartbeat goes before queued reports).
+    `seq` heartbeat goes before queued reports; 0.5.8: `region` from game.ServerRegion, its checks and re-reads).
   - `lune run scripts/test-errors.luau` (0.4.0: templating, fingerprints, per-minute counts, limits, batches, the
     sender, client batches, the dedup), `lune run scripts/test-budget.luau` (0.4.0: proxies, limits, the sliding minute,
     callers, the summary; 0.4.2: TPS windows, the slowest second, physics FPS, the Lua heap fallback).
